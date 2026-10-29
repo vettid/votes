@@ -492,3 +492,32 @@ func TestServiceListStrict(t *testing.T) {
 		}
 	}
 }
+
+// A new service list must extend the published one.
+func TestExtends(t *testing.T) {
+	f := loadFixture(t)
+	prev := f.list()
+	prevData, _ := json.Marshal(prev)
+	prevData, _ = vote.Canonicalize(prevData)
+	next := f.list()
+	next.Version, next.Previous = 2, sha(prevData)
+	next.Services = append(next.Services, Service{ServiceID: ServiceID(bytes.Repeat([]byte{7}, 32)), Name: "Another",
+		IKs: [][]byte{bytes.Repeat([]byte{7}, 32)}, AnchorKeys: []AnchorKey{}})
+	if err := Extends(prev, prevData, next); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*ServiceList){
+		"the same version":    func(l *ServiceList) { l.Version = 1 },
+		"another previous":    func(l *ServiceList) { l.Previous = make([]byte, 32) },
+		"a dropped service":   func(l *ServiceList) { l.Services = l.Services[1:] },
+		"a lost anchor key":   func(l *ServiceList) { l.Services[0].AnchorKeys = []AnchorKey{} },
+		"a lost identity key": func(l *ServiceList) { l.Services[0].IKs = [][]byte{bytes.Repeat([]byte{8}, 32)} },
+	} {
+		n := f.list()
+		n.Version, n.Previous = 2, sha(prevData)
+		mutate(n)
+		if Extends(prev, prevData, n) == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}

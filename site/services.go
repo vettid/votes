@@ -132,3 +132,42 @@ func (l *ServiceList) ByIK(ik []byte) *Service {
 }
 
 func sha(b []byte) []byte { h := sha256.Sum256(b); return h[:] }
+
+// Extends reports whether next is a valid next version of prev, whose
+// bytes are prevData (BALLOT-PROTOCOL §3.3): a higher version, prev's
+// hash as its previous, and every service, identity key and anchor key
+// prev had, under the same service.
+func Extends(prev *ServiceList, prevData []byte, next *ServiceList) error {
+	if next.Version <= prev.Version {
+		return errors.New("site: the version isn't higher")
+	}
+	if !bytes.Equal(next.Previous, sha(prevData)) {
+		return errors.New("site: previous isn't the published list's hash")
+	}
+	for _, ps := range prev.Services {
+		var ns *Service
+		for i := range next.Services {
+			if next.Services[i].ServiceID == ps.ServiceID {
+				ns = &next.Services[i]
+			}
+		}
+		if ns == nil {
+			return fmt.Errorf("site: service %s was dropped", ps.ServiceID)
+		}
+		for _, k := range ps.IKs {
+			if !ns.hasIK(k) {
+				return fmt.Errorf("site: service %s lost an identity key", ps.ServiceID)
+			}
+		}
+		for _, a := range ps.AnchorKeys {
+			found := false
+			for _, b := range ns.AnchorKeys {
+				found = found || bytes.Equal(a.Key, b.Key)
+			}
+			if !found {
+				return fmt.Errorf("site: service %s lost an anchor key", ps.ServiceID)
+			}
+		}
+	}
+	return nil
+}
