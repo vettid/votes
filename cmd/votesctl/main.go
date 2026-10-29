@@ -6,6 +6,12 @@
 //	    signs the service list and publishes it, if it extends the one
 //	    published: a higher version, the previous one's hash, and every
 //	    service, identity key and anchor key it had (BALLOT-PROTOCOL §3.3)
+//	votesctl check -site-key <base64> [-site https://votes.vettid.org]
+//	        [-sigstore production|staging] [-trusted-root <file>] <proposal_id>
+//	    checks a vote from what the site serves, as an observer
+//	    (BALLOT-PROTOCOL §8.4): every document is put through the upload
+//	    API's own checks, each at its anchor's time, and the results
+//	    against the rows; prints a JSON report, or fails
 //
 // The site's key is derived from its Secrets Manager secret as
 // Ed25519(seed = SHA-256(secret string)).
@@ -54,6 +60,20 @@ func main() {
 		in := fs.String("in", "services.json", "the service list")
 		_ = fs.Parse(os.Args[2:])
 		err = publish(ctx, *secret, *bucket, *in)
+	case "check":
+		fs := flag.NewFlagSet("check", flag.ExitOnError)
+		base := fs.String("site", "https://votes.vettid.org", "the site")
+		key := fs.String("site-key", "", "the site's public key (base64), from its release config")
+		instance := fs.String("sigstore", site.Production, "the Sigstore instance the votes are anchored in")
+		rootFile := fs.String("trusted-root", "", "a Sigstore trusted root file, instead of fetching it")
+		_ = fs.Parse(os.Args[2:])
+		if fs.NArg() != 1 {
+			usage()
+		}
+		var anchors *site.Anchors
+		if anchors, err = anchorsFor(*instance, *rootFile); err == nil {
+			err = checkVote(ctx, os.Stdout, httpFetcher(*base, noRedirects()), anchors, *key, fs.Arg(0))
+		}
 	default:
 		usage()
 	}
@@ -64,7 +84,8 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: votesctl site-key -secret <arn> | publish-services -secret <arn> -bucket <name> -in <file>")
+	fmt.Fprintln(os.Stderr, "usage: votesctl site-key -secret <arn> | publish-services -secret <arn> -bucket <name> -in <file>\n"+
+		"       votesctl check -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] <proposal_id>")
 	os.Exit(2)
 }
 

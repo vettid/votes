@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-The public record of VettID votes. Every proposal, pool, extension and
+The public record of VettID votes. Every proposal, extension and
 result of a vote run through a
 [VettID service vault](https://github.com/vettid/service-vault) is
 published here, anchored in Sigstore's Rekor transparency log, and never
@@ -17,6 +17,30 @@ The protocol is
 The upload API (`site/`, `cmd/votes-api`), its storage on S3, the
 operator's `votesctl` and the CDK stack (`cdk/`) are written; nothing is
 deployed yet.
+
+## Checking a vote
+
+Anyone can check a vote from what the site serves (BALLOT-PROTOCOL
+§8.4), with the site's public key (in the member vaults' release config):
+
+```sh
+go build -o votesctl ./cmd/votesctl
+./votesctl check -site-key <base64> <proposal_id>
+# staging: -site https://votes.staging.vettid.org -sigstore staging
+```
+
+It fetches the service list, the proposal, its extensions and the
+results with their rows, signatures and Sigstore bundles, and puts each
+document, in order, through the upload API's own checks on an empty
+store, at the time its anchor shows. So it checks every signature, each
+anchor in Rekor under the service's registered anchor key, the timing
+(the proposal and each extension before the close they precede, the
+results after collection ended), the published extensions against the
+results', and the results against the rows and the tags. It prints a
+JSON report (`ok`, the times, the tally and counts, `results: null`
+while the vote is open) or fails with the first check that didn't hold.
+`-trusted-root <file>` uses a Sigstore trusted root file instead of
+fetching it.
 
 ## Deployment
 
