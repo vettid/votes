@@ -1,0 +1,115 @@
+# votes.vettid.org
+
+**Status:** 0.2.0 (2026-10-29), draft. The protocol this site serves is
+[BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
+(0.10.0); its §3.3 is this site's contract and §8.5 has the document
+schemas. Where this document and the protocol differ, the protocol wins
+and this document is corrected.
+
+## 1. What it is for
+
+- Members' apps learn of proposals here, without the organisation's
+  service.
+- Every document of a vote (the proposal, any extensions, the results)
+  is here, the same for every reader, and never changes once published.
+- Observers check a vote from here alone (BALLOT-PROTOCOL §8.4).
+
+The site is run by VettID, separately from every service vault. It holds
+no keys that sign votes, no member data and no sessions, and keeps no
+record of who reads what. It can withhold a document, but not alter
+one: the service's signature and the Rekor anchor catch that.
+
+## 2. Architecture
+
+| Part | What it is |
+|---|---|
+| Bucket | Private S3 bucket, versioned, blocking public access. Read only through CloudFront (origin access control). Written only by the upload function, which cannot delete. |
+| CloudFront | `votes.vettid.org`. Serves `/v1/*` from the bucket and `/api/*` from the API. Security headers as vettid.org's sites. No access logs. |
+| Upload API | API Gateway HTTP API → Lambda `votes-api` (Go, arm64). |
+| Service list | `services.json` in this repository, changed only by PR, signed at deploy with the site's Ed25519 key (BALLOT-PROTOCOL §3.3). |
+| Stack | CDK (TypeScript), `VotesSite-staging` and `VotesSite-prod`, as member-service. |
+
+**(chosen; not in the spec:** Lambda rather than an ECS service, because
+uploads are a few per vote. The function's zip is built in CI with
+attested build provenance, like the images.)
+
+**Write-once** is the bucket's conditional write: every document is put
+with `If-None-Match: *`. A `412` means the path exists: the function
+compares the bytes and answers `200` if they are equal and `409` if not.
+
+## 3. Paths
+
+All under `https://votes.vettid.org/v1/`.
+
+| Path | Contents | Cache |
+|---|---|---|
+| `services.json`, `.sig` | The service list and the site's signature (BALLOT-PROTOCOL §3.3, §8.5) | 5 min |
+| `index.json` | Proposals open or closed within the last 30 days: `[{proposal_id, service_id, proposal_hash, opens_at, closes_at, extended, published}]`, by `opens_at` | 60 s |
+| `archive/<YYYY-MM>.json` | Every proposal by the month of `opens_at`, same entries | 60 s |
+| `p/<proposal_id>/proposal.json`, `.sig`, `.sigstore.json` | The proposal, `proposal_sig` (raw 64 bytes), its anchor bundle | 1 year, immutable |
+| `p/<proposal_id>/extension-<n>.json`, `.sig`, `.sigstore.json` | An extension | 1 year, immutable |
+| `p/<proposal_id>/results.json`, `.sig`, `.sigstore.json` | The results | 1 year, immutable |
+| `p/<proposal_id>/rows.json` | The rows, which `results.json` names by hash | 1 year, immutable |
+
+## 4. Upload API
+
+`POST https://votes.vettid.org/api/v1/p/<proposal_id>/<name>`, where
+`<name>` is `proposal`, `extension-<n>` or `results`. The body is JSON
+`{doc: b64, sig: b64, bundle: <Sigstore bundle JSON>, rows?: b64}`, with
+`rows` for the results only. There is no other
+credential: the service's signature is the authentication.
+
+**Checks, in order** (each failure is `422` with an error code):
+1. **Service:** for a proposal, its `service` key is on the service
+   list; for anything else, the proposal is already here.
+2. **Bytes:** the document is canonical JCS and matches its schema; its
+   `proposal_id` is the path's.
+3. **Signature:** under the proposal's `service` key, with the
+   document's label (BALLOT-PROTOCOL §3.1, §8.5, §7).
+4. **Anchor:** the bundle's `hashedrekord` entry names the document's
+   hash and one of the service's listed anchor keys, its signature and
+   inclusion proof verify against the pinned Sigstore trusted root, and
+   its timestamp verifies.
+5. **Order and fields:**
+   - a proposal: before its `opens_at`;
+   - an extension: `n` is the next number, its timestamp is before the
+     `closes_at` it extends, and the total is within 24 h;
+   - results: after the final `closes_at`; they contain the published
+     proposal and extensions byte for byte, and `rows` hashes to their
+     `rows_hash`.
+6. **Write-once** (§2).
+
+Then the function updates `index.json` and the archive with a
+conditional write on their ETag, retrying on a conflict.
+
+**Answers:** `201` published, `200` already published with the same
+bytes, `409` a different document is published there, `422` a check
+failed, `413` too large.
+
+**Size:** a request is at most 6 MB (Lambda's limit). A results row is
+about 250 bytes, so that holds about 20,000 eligible members. Larger
+votes need a two-step upload through the bucket; not in 0.2.0.
+
+**Limits:** API Gateway throttling per route, and AWS WAF's rate rule on
+`/api/*`.
+
+## 5. What the site keeps about readers
+
+Nothing. CloudFront access logs are off. API Gateway access logs carry
+the route, status, size and latency, never the source address. The
+function logs ids, types, sizes and error codes.
+
+## 6. Deployment
+
+- The domain: an ACM certificate and an alias record in the vettid.org
+  hosted zone, which the vettid.org stacks own.
+- Deploys need the owner's go, as for the service vault and
+  member-service.
+
+## Changes
+
+- **0.2.0 (2026-10-29):** follows BALLOT-PROTOCOL 0.10.0: results in two
+  parts, and the service list signed by the site's key. Pools, rosters,
+  closings, mix lists, the Rekor monitor, mirrors, OpenTimestamps and
+  reports are gone. The service list is signed and anchored.
+- **0.1.0 (2026-10-29):** first draft.
