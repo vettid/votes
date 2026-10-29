@@ -79,7 +79,7 @@ func TestCheckCommand(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, ok := store.Objects[strings.TrimPrefix(r.URL.Path, "/")]
 		if !ok {
-			http.Error(w, "", http.StatusForbidden) // as CloudFront without LIST
+			http.NotFound(w, r) // the site's answer for a missing object
 			return
 		}
 		_, _ = w.Write(b)
@@ -87,30 +87,30 @@ func TestCheckCommand(t *testing.T) {
 	defer srv.Close()
 	key := base64.StdEncoding.EncodeToString(sk.Public().(ed25519.PublicKey))
 	var out bytes.Buffer
-	if err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID); err != nil {
+	if err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	var rep report
 	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
 		t.Fatal(err)
 	}
-	if !rep.OK || rep.Extensions != 1 || rep.Results == nil || rep.Results.Eligible != p.Eligible || len(rep.Anchored) != 3 {
+	if !rep.OK || rep.Status != "counted" || len(rep.Hashes) != 4 || rep.Extensions != 1 || rep.Results == nil || rep.Results.Eligible != p.Eligible || len(rep.Anchored) != 3 {
 		t.Fatalf("report %s", out.Bytes())
 	}
 
 	// Another site key, or a changed row, fails the check.
 	other := base64.StdEncoding.EncodeToString(make([]byte, 32))
-	if err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, other, p.ProposalID); err == nil {
+	if err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, other, p.ProposalID, time.Now()); err == nil {
 		t.Fatal("checked under another site key")
 	}
 	rows := "v1/p/" + p.ProposalID + "/rows.json"
 	store.Objects[rows] = append(bytes.Clone(store.Objects[rows]), '\n')
-	if err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID); err == nil {
+	if err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, time.Now()); err == nil {
 		t.Fatal("checked with a changed row")
 	}
 }
 
-// The fetcher takes 403 and 404 as absent, refuses a redirect and an
+// The fetcher takes a 404 as absent, refuses a redirect, a 403 and an
 // error status.
 func TestHTTPFetcher(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -119,6 +119,8 @@ func TestHTTPFetcher(t *testing.T) {
 			_, _ = w.Write([]byte("x"))
 		case "/v1/gone":
 			http.NotFound(w, r)
+		case "/v1/denied":
+			http.Error(w, "", http.StatusForbidden)
 		case "/v1/moved":
 			http.Redirect(w, r, "https://elsewhere.example/", http.StatusFound)
 		default:
@@ -133,7 +135,7 @@ func TestHTTPFetcher(t *testing.T) {
 	if b, err := fetch(ctx, "v1/gone"); err != nil || b != nil {
 		t.Fatalf("gone: %q %v", b, err)
 	}
-	for _, p := range []string{"v1/moved", "v1/broken"} {
+	for _, p := range []string{"v1/moved", "v1/denied", "v1/broken"} {
 		if _, err := fetch(ctx, p); err == nil {
 			t.Fatalf("%s: no error", p)
 		}

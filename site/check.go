@@ -12,10 +12,11 @@ import (
 
 // An observer's check of a published vote (BALLOT-PROTOCOL §8.4): the
 // documents the site serves are fetched and put, in the order they were
-// published, through the upload API's own checks on an empty store, each
-// with the clock at its anchor's time, as the site saw it. A vote that
-// passes is one the site would accept again from nothing but its
-// published files, the service list and the site's key.
+// published, through the upload API's document checks on an empty store,
+// each with the clock at its anchor's time. Timing is so checked as
+// anchored (timestamped) time, which is what the files can show; that a
+// document was also uploaded in time is the live site's word. The
+// request-level limits of the upload API (sizes) are not re-checked.
 
 // Fetcher reads one published object by path (v1/...): nil, nil when it
 // isn't published.
@@ -36,6 +37,12 @@ type Report struct {
 	Anchored map[string]time.Time
 	// Results are the checked results; nil while none are published.
 	Results *vote.Results
+	// Hashes are each document's SHA-256 by name, and rows', for readers
+	// to compare what they were served.
+	Hashes map[string][]byte
+	// Partial names documents whose signature, bundle or rows are
+	// published without the document: an upload not finished.
+	Partial []string
 
 	serviceIK []byte
 }
@@ -65,7 +72,7 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 	if err != nil {
 		return nil, err
 	}
-	rep := &Report{ProposalID: id, Anchored: map[string]time.Time{}}
+	rep := &Report{ProposalID: id, Anchored: map[string]time.Time{}, Hashes: map[string][]byte{}}
 	// put fetches a document's parts and puts it as the site would have
 	// at its anchor's time; found is false when the document isn't there.
 	put := func(name string, rows bool, f func(*Upload) (bool, error)) (found bool, err error) {
@@ -80,6 +87,9 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 			}
 		}
 		if u.Doc == nil {
+			if u.Sig != nil || u.Bundle != nil {
+				rep.Partial = append(rep.Partial, name)
+			}
 			return false, nil
 		}
 		if u.Sig == nil || u.Bundle == nil {
@@ -105,6 +115,10 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 			return true, fmt.Errorf("%s: %w", name, err)
 		}
 		rep.Anchored[name] = ts
+		rep.Hashes[name] = sha(u.Doc)
+		if u.Rows != nil {
+			rep.Hashes["rows"] = sha(u.Rows)
+		}
 		return true, nil
 	}
 	found, err := put("proposal", false, func(u *Upload) (bool, error) { return s.putProposal(ctx, id, u) })
@@ -120,14 +134,28 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 	}
 	rep.ServiceID, rep.ServiceName, rep.Title, rep.serviceIK = svc.ServiceID, svc.Name, p.Title, p.Service
 	rep.Eligible, rep.OpensAt, rep.ClosesAt = p.Eligible, p.OpensAt, p.ClosesAt
-	for n := 1; ; n++ {
+	// Every number the site allows is looked at: an extension after a
+	// gap, or past the bound, is one the site should have refused.
+	gap := 0
+	for n := 1; n <= maxExtensions+1; n++ {
 		name := "extension-" + strconv.Itoa(n)
+		if gap != 0 || n > maxExtensions {
+			if b, err := fetch(ctx, docPath(id, name)); err != nil {
+				return nil, err
+			} else if b != nil && gap != 0 {
+				return nil, fmt.Errorf("%s: published, but extension-%d isn't", name, gap)
+			} else if b != nil {
+				return nil, fmt.Errorf("%s: past the %d extensions allowed", name, maxExtensions)
+			}
+			continue
+		}
 		found, err := put(name, false, func(u *Upload) (bool, error) { return s.putExtension(ctx, id, n, u) })
 		if err != nil {
 			return nil, err
 		}
 		if !found {
-			break
+			gap = n
+			continue
 		}
 		e, _ := vote.ParseExtension(mem.Objects[docPath(id, name)])
 		rep.Extensions, rep.ClosesAt = n, e.ClosesAt

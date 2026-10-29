@@ -49,6 +49,9 @@ func TestCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(rep.Hashes) != 4 || rep.Partial != nil {
+		t.Fatalf("hashes %v, partial %v", rep.Hashes, rep.Partial)
+	}
 	if rep.Title != f.p.Title || rep.Extensions != 1 || rep.ClosesAt != f.e.ClosesAt || rep.Results == nil ||
 		rep.Results.Counts.Eligible != f.p.Eligible || len(rep.Anchored) != 3 || rep.ServiceName != "Test service" {
 		t.Fatalf("report %+v", rep)
@@ -65,6 +68,13 @@ func TestCheck(t *testing.T) {
 			o[docPath(testID, "proposal")+".sig"] = sig
 		},
 		"service list unsigned": func(o map[string][]byte) { delete(o, "v1/services.json.sig") },
+		"extension after a gap": func(o map[string][]byte) { o[docPath(testID, "extension-3")] = o[docPath(testID, "extension-1")] },
+		"extension past the limit": func(o map[string][]byte) {
+			o[docPath(testID, "extension-25")] = o[docPath(testID, "extension-1")]
+		},
+		"bundles swapped": func(o map[string][]byte) {
+			o[docPath(testID, "results")+".sigstore.json"] = o[docPath(testID, "proposal")+".sigstore.json"]
+		},
 	} {
 		o := maps.Clone(objs)
 		change(o)
@@ -82,6 +92,13 @@ func TestCheckOpenAndUnknown(t *testing.T) {
 	rep, err := check(t, f, objs, testID)
 	if err != nil || rep.Results != nil || rep.Extensions != 1 {
 		t.Fatalf("an open vote: %+v %v", rep, err)
+	}
+	// An upload of the results that wrote its signature but not the
+	// document yet is reported, not counted.
+	o := maps.Clone(objs)
+	o[docPath(testID, "results")+".sig"] = []byte("x")
+	if rep, err := check(t, f, o, testID); err != nil || rep.Results != nil || len(rep.Partial) != 1 || rep.Partial[0] != "results" {
+		t.Fatalf("partial results: %+v %v", rep, err)
 	}
 	if _, err := check(t, f, objs, "01KC0000000000000000000002"); !errors.Is(err, ErrNotPublished) {
 		t.Fatalf("unknown: %v", err)

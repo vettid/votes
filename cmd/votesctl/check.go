@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,8 +24,9 @@ import (
 const maxObject = 16 << 20
 
 // httpFetcher reads published objects from a site's base URL. It follows
-// no redirect and takes a 403 or 404 as not published (CloudFront
-// answers either for a missing object).
+// no redirect and takes only a 404 as not published: the site answers
+// 404 for a missing object, so a 403 (WAF, access) is an error, not an
+// absent document.
 func httpFetcher(base string, c *http.Client) site.Fetcher {
 	base = strings.TrimRight(base, "/")
 	return func(ctx context.Context, path string) ([]byte, error) {
@@ -39,7 +41,7 @@ func httpFetcher(base string, c *http.Client) site.Fetcher {
 		defer resp.Body.Close()
 		switch resp.StatusCode {
 		case http.StatusOK:
-		case http.StatusNotFound, http.StatusForbidden:
+		case http.StatusNotFound:
 			return nil, nil
 		default:
 			return nil, fmt.Errorf("%s: %s", path, resp.Status)
@@ -72,7 +74,13 @@ type report struct {
 	ClosesAt    int64             `json:"closes_at"`
 	Extensions  int               `json:"extensions"`
 	Anchored    map[string]string `json:"anchored"`
-	Results     *results          `json:"results"` // null while none are published
+	// Status: open (before the close in force, plus the minute collection
+	// takes), closed (after it, with no results published yet: the
+	// service hasn't published them, or is withholding them), or counted.
+	Status  string            `json:"status"`
+	Results *results          `json:"results"` // null until counted
+	Hashes  map[string]string `json:"hashes"`  // hex SHA-256, to compare with other readers
+	Partial []string          `json:"partial,omitempty"`
 }
 
 type results struct {
@@ -83,7 +91,7 @@ type results struct {
 }
 
 // checkVote checks one proposal on a site and writes the report.
-func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *site.Anchors, siteKeyB64, id string) error {
+func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *site.Anchors, siteKeyB64, id string, now time.Time) error {
 	key, err := base64.StdEncoding.DecodeString(siteKeyB64)
 	if err != nil || len(key) != ed25519.PublicKeySize {
 		return errors.New("-site-key: the site's public key, base64 of 32 bytes")
@@ -94,9 +102,20 @@ func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *si
 	}
 	out := report{OK: true, ProposalID: rep.ProposalID, ServiceID: rep.ServiceID, ServiceName: rep.ServiceName,
 		Title: rep.Title, Eligible: rep.Eligible, OpensAt: rep.OpensAt, ClosesAt: rep.ClosesAt,
-		Extensions: rep.Extensions, Anchored: map[string]string{}}
+		Extensions: rep.Extensions, Anchored: map[string]string{}, Hashes: map[string]string{}, Partial: rep.Partial}
 	for name, ts := range rep.Anchored {
 		out.Anchored[name] = ts.UTC().Format(time.RFC3339)
+	}
+	for name, h := range rep.Hashes {
+		out.Hashes[name] = hex.EncodeToString(h)
+	}
+	switch {
+	case rep.Results != nil:
+		out.Status = "counted"
+	case now.Before(time.Unix(rep.ClosesAt, 0).Add(site.CollectMargin)):
+		out.Status = "open"
+	default:
+		out.Status = "closed"
 	}
 	if r := rep.Results; r != nil {
 		out.Results = &results{Tally: r.Tally, Eligible: r.Counts.Eligible, Ballots: r.Counts.Ballots, Removed: r.Counts.Removed}

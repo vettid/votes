@@ -27,6 +27,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -72,7 +73,7 @@ func main() {
 		}
 		var anchors *site.Anchors
 		if anchors, err = anchorsFor(*instance, *rootFile); err == nil {
-			err = checkVote(ctx, os.Stdout, httpFetcher(*base, noRedirects()), anchors, *key, fs.Arg(0))
+			err = checkVote(ctx, os.Stdout, httpFetcher(*base, noRedirects()), anchors, *key, fs.Arg(0), time.Now())
 		}
 	default:
 		usage()
