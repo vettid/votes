@@ -74,6 +74,17 @@ describe('upload function', () => {
     expect(actions.filter((a: string) => a.startsWith('secretsmanager:'))).toEqual([]);
   });
 
+  test('its own role: no managed policy, logs only to its log group', () => {
+    const roles = Object.values(t.findResources('AWS::IAM::Role')) as any[];
+    expect(roles).toHaveLength(1);
+    expect(roles[0].Properties.ManagedPolicyArns).toBeUndefined();
+    const res = fnStatements().flatMap((s) => asList(s.Resource));
+    expect(res).not.toContain('*');
+    const logs = fnStatements().filter((s) => asList(s.Action).some((a: string) => a.startsWith('logs:')));
+    expect(logs).toHaveLength(1);
+    expect(JSON.stringify(logs[0].Resource)).toContain('ApiLogs');
+  });
+
   test('writes only documents, the index and the archive: never the service list', () => {
     const w = fnStatements().filter((s) => asList(s.Action).includes('s3:PutObject'));
     const res = JSON.stringify(w.map((s) => s.Resource));
