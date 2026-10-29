@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+# The site's test vote (site/testdata/vote.json): a service seed derived
+# from a fixed, public phrase, public keys and signatures, and Sigstore
+# bundles from its public staging log. Nothing in it is a secret.
+[[allowlists]]
+description = "the site's public test vote"
+paths = ['''^site/testdata/vote\.json$''', '''^site/testdata/staging_trusted_root\.json$''']
