@@ -9,7 +9,7 @@ anyone can check a vote's results from here alone.
 
 The protocol is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
-(§3.5 is this site's contract). The site's design is
+(§3.3 is this site's contract). The site's design is
 [docs/VOTES-SITE.md](docs/VOTES-SITE.md).
 
 ## Status

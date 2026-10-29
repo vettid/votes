@@ -5,8 +5,8 @@ Guidance for Claude Code working in this repository.
 ## What this is
 
 `votes.vettid.org`: a write-once public store of ballot documents
-(BALLOT-PROTOCOL §3.5), with an upload API that verifies each document
-and its Rekor anchor, and a monitor. The design is
+(BALLOT-PROTOCOL §3.3), with an upload API that verifies each document
+and its Rekor anchor. The design is
 [docs/VOTES-SITE.md](docs/VOTES-SITE.md). It holds no signing keys, no
 member data and no sessions, and keeps no record of readers.
 
