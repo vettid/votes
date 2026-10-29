@@ -122,7 +122,17 @@ export class VotesStack extends cdk.Stack {
       retention: logs.RetentionDays.THREE_MONTHS,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
+    // The function's own role, with no managed policy: it may write its
+    // log group and touch its bucket, and nothing else in the account.
+    const role = new iam.Role(this, 'ApiRole', {
+      roleName: `${prefix}-api`,
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+    });
+    role.addToPolicy(new iam.PolicyStatement({
+      sid: 'Logs', actions: ['logs:CreateLogStream', 'logs:PutLogEvents'], resources: [`${logGroup.logGroupArn}:*`],
+    }));
     this.fn = new lambda.Function(this, 'Api', {
+      role,
       functionName: `${prefix}-api`,
       runtime: lambda.Runtime.PROVIDED_AL2023,
       architecture: lambda.Architecture.ARM_64,
@@ -133,8 +143,6 @@ export class VotesStack extends cdk.Stack {
       logGroup,
       environment: {
         VOTES_BUCKET: this.bucket.bucketName,
-        // Bundles are checked against the instance the service vaults
-        // anchor in: staging outside production.
         VOTES_SIGSTORE: props.sigstore,
         VOTES_SITE_KEY: props.siteKey ?? '',
       },
