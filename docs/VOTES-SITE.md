@@ -73,17 +73,30 @@ credential: the service's signature is the authentication.
    listed anchor keys, the Rekor entry and its inclusion proof, and one
    RFC 3161 timestamp.
 5. **Order and fields:**
-   - a proposal: anchored, and uploaded, before its `closes_at`;
-   - an extension: `n` is the next number, its timestamp is before the
-     `closes_at` it extends, and the total is within 24 h;
-   - results: after the final `closes_at`; they contain the published
-     proposal and extensions byte for byte, and `rows` hashes to their
-     `rows_hash`.
+   - a proposal: anchored, and uploaded, before its `closes_at`; the
+     same proposal again is accepted at any time (a retry);
+   - an extension: `n` is the next number, it is anchored and uploaded
+     before the `closes_at` it extends, never once results are
+     published, and the total is within 24 h;
+   - results: uploaded at least a minute after the final `closes_at`
+     and anchored after it; they pass the observer's check (BALLOT-
+     PROTOCOL §8.4) and contain the published proposal and extensions
+     byte for byte, and `rows` hashes to their `rows_hash`.
 6. **Write-once** (§2): the signature, the bundle and any rows go up
    first and the document last, so a document is never there without
-   them; a retry fills in what a failed upload left out. A bundle already
-   there for the same document is kept: another anchor of the same bytes
-   is the same document.
+   them; a retry fills in what a failed upload left out. Anything an
+   earlier upload left at those paths must belong to this document: the
+   same signature and rows, or a bundle that verifies for it (another
+   anchor of the same bytes is the same document); anything else is
+   `409`.
+
+Before these, the request is refused if it is over the size for its
+kind (a proposal 64 KiB, an extension 4 KiB, results 256 KiB, a bundle
+64 KiB), and the bundle must be in the protocol's profile: v0.3, a
+SHA-256 message signature under a public key, exactly one `hashedrekord`
+0.0.1 entry and exactly one RFC 3161 timestamp. Documents nest at most 8
+deep. The index is updated on every accepted upload, retries included,
+so that one a failure left undone is finished.
 
 Then the function updates `index.json` and the archive with a
 conditional write on their ETag, retrying on a conflict.
@@ -115,8 +128,10 @@ function logs ids, types, sizes and error codes.
 ## Changes
 
 - **0.2.1 (2026-10-29):** the code's rules: bundles are checked with
-  Sigstore's own verifier; a proposal may be published until its close;
-  the write order.
+  Sigstore's own verifier and held to the profile; a proposal may be
+  published until its close; extensions not after their close or the
+  results; results a minute after the close and anchored after it;
+  write order and leftovers; size caps.
 - **0.2.0 (2026-10-29):** follows BALLOT-PROTOCOL 0.10.0: results in two
   parts, and the service list signed by the site's key. Pools, rosters,
   closings, mix lists, the Rekor monitor, mirrors, OpenTimestamps and

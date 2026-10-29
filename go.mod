@@ -7,7 +7,7 @@ toolchain go1.26.10
 require (
 	github.com/sigstore/sigstore v1.10.8
 	github.com/sigstore/sigstore-go v1.3.0
-	github.com/vettid/service-vault v0.0.0-20261029182049-e9c6989eecce
+	github.com/vettid/service-vault v0.0.0-20261029185643-1319b2caa0b0
 	github.com/vettid/vettid-vault v0.0.0-20261028202841-fd1af0a51da3
 )
 

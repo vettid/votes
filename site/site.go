@@ -25,6 +25,20 @@ import (
 // MaxUpload bounds a request: Lambda's 6 MB, less the JSON around it.
 const MaxUpload = 6<<20 - 64<<10
 
+// Size caps per document (§4): a proposal's text is at most 16 KiB; an
+// extension is a few hundred bytes; results carry the proposal, the
+// extensions, roots and the tally; rows grow with the eligible members.
+const (
+	maxProposal  = 64 << 10
+	maxExtension = 4 << 10
+	maxResults   = 256 << 10
+	maxBundle    = 64 << 10
+)
+
+// CollectMargin is how long after the final close the results may be
+// published (BALLOT-PROTOCOL §7: collection ends a minute after it).
+const CollectMargin = time.Minute
+
 // IndexWindow keeps a closed proposal in the index this long (§3.3).
 const IndexWindow = 30 * 24 * time.Hour
 
@@ -80,8 +94,16 @@ func (s *Site) upload(w http.ResponseWriter, r *http.Request) {
 	var u Upload
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
-	if dec.Decode(&u) != nil || len(u.Doc) == 0 || len(u.Sig) == 0 || len(u.Bundle) == 0 {
+	if dec.Decode(&u) != nil || len(u.Doc) == 0 || len(u.Sig) != vote.SigLen || len(u.Bundle) == 0 || len(u.Bundle) > maxBundle {
 		writeError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	limit := map[bool]int{true: maxProposal, false: maxExtension}[name == "proposal"]
+	if name == "results" {
+		limit = maxResults
+	}
+	if len(u.Doc) > limit || (name != "results" && u.Rows != nil) {
+		writeError(w, http.StatusRequestEntityTooLarge, "too_large")
 		return
 	}
 	var created bool
@@ -97,7 +119,7 @@ func (s *Site) upload(w http.ResponseWriter, r *http.Request) {
 	var rf *refusal
 	switch {
 	case errors.As(err, &rf):
-		s.log().Info("upload refused", "proposal_id", id, "name", name, "code", rf.code, "why", rf.why)
+		s.log().Info("upload refused", "proposal_id", id, "name", name, "code", rf.code)
 		writeError(w, rf.status, rf.code)
 	case err != nil:
 		s.log().Error("upload", "proposal_id", id, "name", name, "err", err.Error())
@@ -135,6 +157,9 @@ func (s *Site) services(ctx context.Context) (*ServiceList, error) {
 // anchor checks u's bundle under one of svc's anchor keys and returns the
 // timestamp's time.
 func (s *Site) anchor(svc *Service, u *Upload) (time.Time, error) {
+	if err := checkProfile(u.Bundle); err != nil {
+		return time.Time{}, refuse(http.StatusUnprocessableEntity, "bad_anchor", err.Error())
+	}
 	var last error = errors.New("no anchor key")
 	for _, k := range svc.AnchorKeys {
 		ts, err := s.Anchors.Verify(u.Bundle, u.Doc, k.Key)
@@ -203,11 +228,15 @@ func (s *Site) putProposal(ctx context.Context, id string, u *Upload) (bool, err
 		return false, err
 	}
 	// Published before the vote closes: members vote only under a
-	// published proposal (BALLOT-PROTOCOL §3.3, §6).
-	if !ts.Before(time.Unix(p.ClosesAt, 0)) || !s.Now().Before(time.Unix(p.ClosesAt, 0)) {
+	// published proposal (BALLOT-PROTOCOL §3.3, §6). The same proposal
+	// again (a retry) is accepted whenever, so that an index update a
+	// failure left undone is finished.
+	if prev, err := s.published(ctx, docPath(id, "proposal")); err != nil {
+		return false, err
+	} else if !bytes.Equal(prev, u.Doc) && (!ts.Before(time.Unix(p.ClosesAt, 0)) || !s.Now().Before(time.Unix(p.ClosesAt, 0))) {
 		return false, refuse(http.StatusUnprocessableEntity, "too_late", "the vote has closed")
 	}
-	created, err := s.write(ctx, id, "proposal", u, nil)
+	created, err := s.write(ctx, id, "proposal", u, nil, svc)
 	if err != nil {
 		return false, err
 	}
@@ -240,10 +269,9 @@ func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload) (b
 	if vote.Verify(p.Service, vote.LabelExtended, m, u.Sig) != nil {
 		return false, refuse(http.StatusUnprocessableEntity, "bad_signature", "extension")
 	}
-	if prev, err := s.published(ctx, docPath(id, "extension-"+strconv.Itoa(n))); err != nil {
+	prev, err := s.published(ctx, docPath(id, "extension-"+strconv.Itoa(n)))
+	if err != nil {
 		return false, err
-	} else if prev != nil {
-		return s.write(ctx, id, "extension-"+strconv.Itoa(n), u, nil) // the same bytes again, or 409
 	}
 	closes, err := s.closeInForce(ctx, id, p, n)
 	if err != nil {
@@ -253,6 +281,19 @@ func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload) (b
 	if err != nil {
 		return false, err
 	}
+	if prev == nil {
+		// Published and anchored before the close it extends, and never
+		// once results are out (BALLOT-PROTOCOL §10.2): an extension kept
+		// back and published after a look at the tally is refused.
+		if res, err := s.published(ctx, docPath(id, "results")); err != nil {
+			return false, err
+		} else if res != nil {
+			return false, refuse(http.StatusUnprocessableEntity, "too_late", "the results are published")
+		}
+		if !s.Now().Before(time.Unix(closes, 0)) {
+			return false, refuse(http.StatusUnprocessableEntity, "too_late", "the close it extends has passed")
+		}
+	}
 	switch {
 	case !ts.Before(time.Unix(closes, 0)):
 		return false, refuse(http.StatusUnprocessableEntity, "too_late", "anchored after the close it extends")
@@ -261,7 +302,7 @@ func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload) (b
 	case e.ClosesAt-p.ClosesAt > vote.MaxExtension:
 		return false, refuse(http.StatusUnprocessableEntity, "bad_document", "extensions over 24 h")
 	}
-	created, err := s.write(ctx, id, "extension-"+strconv.Itoa(n), u, nil)
+	created, err := s.write(ctx, id, "extension-"+strconv.Itoa(n), u, nil, svc)
 	if err != nil {
 		return false, err
 	}
@@ -331,13 +372,18 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 		e, _ := vote.ParseExtension(ext)
 		closes = e.ClosesAt
 	}
-	if s.Now().Before(time.Unix(closes, 0)) {
+	end := time.Unix(closes, 0).Add(CollectMargin)
+	if s.Now().Before(end) {
 		return false, refuse(http.StatusUnprocessableEntity, "too_early", "the vote hasn't closed")
 	}
-	if _, err := s.anchor(svc, u); err != nil {
+	ts, err := s.anchor(svc, u)
+	if err != nil {
 		return false, err
 	}
-	created, err := s.write(ctx, id, "results", u, u.Rows)
+	if ts.Before(time.Unix(closes, 0)) {
+		return false, refuse(http.StatusUnprocessableEntity, "bad_anchor", "results anchored before the close")
+	}
+	created, err := s.write(ctx, id, "results", u, u.Rows, svc)
 	if err != nil {
 		return false, err
 	}
@@ -357,7 +403,7 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 // different document at the path is refused. A bundle already there for
 // the same document is kept: another anchor of the same bytes is the
 // same document (§8.5 "Rekor profile").
-func (s *Site) write(ctx context.Context, id, name string, u *Upload, rows []byte) (bool, error) {
+func (s *Site) write(ctx context.Context, id, name string, u *Upload, rows []byte, svc *Service) (bool, error) {
 	path := docPath(id, name)
 	if prev, err := s.published(ctx, path); err != nil {
 		return false, err
@@ -378,9 +424,29 @@ func (s *Site) write(ctx context.Context, id, name string, u *Upload, rows []byt
 			data        []byte
 		}{"v1/p/" + id + "/rows.json", "application/json", rows})
 	}
-	for _, p := range parts {
-		if err := s.Store.PutOnce(ctx, p.path, p.data, p.ctype); err != nil && !errors.Is(err, ErrExists) {
+	for i, p := range parts {
+		err := s.Store.PutOnce(ctx, p.path, p.data, p.ctype)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, ErrExists) {
 			return false, err
+		}
+		// Something is already there (an earlier upload): it must belong
+		// to this document. The signature and the rows must be the same
+		// bytes; a bundle may be another anchor of the same document, and
+		// is kept only if it verifies for this one.
+		prev, err := s.published(ctx, p.path)
+		if err != nil {
+			return false, err
+		}
+		same := bytes.Equal(prev, p.data)
+		if !same && i == 1 {
+			_, err := s.anchor(svc, &Upload{Doc: u.Doc, Bundle: prev})
+			same = err == nil
+		}
+		if !same {
+			return false, refuse(http.StatusConflict, "differs", "an earlier upload left another document's "+p.path)
 		}
 	}
 	err := s.Store.PutOnce(ctx, path, u.Doc, "application/json")
@@ -492,4 +558,47 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, code string) {
 	writeJSON(w, status, map[string]string{"error": code})
+}
+
+// checkProfile holds a bundle to the protocol's Rekor profile (§8.5):
+// v0.3, a SHA-256 message signature, exactly one hashedrekord 0.0.1 log
+// entry and exactly one RFC 3161 timestamp, so that what is published is
+// exactly what was verified.
+func checkProfile(raw []byte) error {
+	var b struct {
+		MediaType            string `json:"mediaType"`
+		VerificationMaterial struct {
+			PublicKey   *struct{} `json:"publicKey"`
+			TlogEntries []struct {
+				KindVersion struct {
+					Kind    string `json:"kind"`
+					Version string `json:"version"`
+				} `json:"kindVersion"`
+			} `json:"tlogEntries"`
+			TimestampVerificationData struct {
+				RFC3161Timestamps []json.RawMessage `json:"rfc3161Timestamps"`
+			} `json:"timestampVerificationData"`
+		} `json:"verificationMaterial"`
+		MessageSignature *struct {
+			MessageDigest struct {
+				Algorithm string `json:"algorithm"`
+			} `json:"messageDigest"`
+		} `json:"messageSignature"`
+		DSSEEnvelope json.RawMessage `json:"dsseEnvelope"`
+	}
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return errors.New("bundle: not JSON")
+	}
+	vm := b.VerificationMaterial
+	switch {
+	case b.MediaType != "application/vnd.dev.sigstore.bundle.v0.3+json":
+		return errors.New("bundle: not v0.3")
+	case vm.PublicKey == nil || b.MessageSignature == nil || b.DSSEEnvelope != nil || b.MessageSignature.MessageDigest.Algorithm != "SHA2_256":
+		return errors.New("bundle: not a key-based SHA-256 message signature")
+	case len(vm.TlogEntries) != 1 || vm.TlogEntries[0].KindVersion.Kind != "hashedrekord" || vm.TlogEntries[0].KindVersion.Version != "0.0.1":
+		return errors.New("bundle: not exactly one hashedrekord 0.0.1 entry")
+	case len(vm.TimestampVerificationData.RFC3161Timestamps) != 1:
+		return errors.New("bundle: not exactly one RFC 3161 timestamp")
+	}
+	return nil
 }

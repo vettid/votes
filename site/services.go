@@ -61,9 +61,29 @@ func ParseServiceList(data, sig []byte, siteKey ed25519.PublicKey) (*ServiceList
 	if err := dec.Decode(&l); err != nil || l.V != 1 || l.Version < 1 || len(l.Previous) != vote.HashLen {
 		return nil, errors.New("site: the service list's fields")
 	}
+	// encoding/json matches names case-insensitively and leaves missing
+	// fields zero: the round trip refuses both, and any other form.
+	again, err := json.Marshal(&l)
+	if err != nil {
+		return nil, err
+	}
+	if again, err = vote.Canonicalize(again); err != nil || !bytes.Equal(again, data) {
+		return nil, errors.New("site: the service list isn't in its exact form")
+	}
+	ids, iks := map[string]bool{}, map[string]bool{}
 	for _, s := range l.Services {
 		if err := s.check(); err != nil {
 			return nil, err
+		}
+		if ids[s.ServiceID] {
+			return nil, fmt.Errorf("site: service %s listed twice", s.ServiceID)
+		}
+		ids[s.ServiceID] = true
+		for _, k := range s.IKs {
+			if iks[string(k)] {
+				return nil, fmt.Errorf("site: an identity key of service %s is listed twice", s.ServiceID)
+			}
+			iks[string(k)] = true
 		}
 	}
 	return &l, nil
