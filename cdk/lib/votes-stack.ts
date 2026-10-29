@@ -103,8 +103,8 @@ export class VotesStack extends cdk.Stack {
     }));
     this.bucket.addToResourcePolicy(new iam.PolicyStatement({
       sid: 'PublishedNeverDeleted', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()],
-      actions: ['s3:DeleteObject', 's3:DeleteObjectVersion', 's3:PutObjectRetention', 's3:PutLifecycleConfiguration'],
-      resources: [this.bucket.arnForObjects('v1/p/*'), this.bucket.bucketArn],
+      actions: ['s3:DeleteObject', 's3:DeleteObjectVersion'],
+      resources: [this.bucket.arnForObjects('v1/p/*')],
     }));
 
     // The site's signing key for the service list: a generated secret the
@@ -129,7 +129,7 @@ export class VotesStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
     });
     role.addToPolicy(new iam.PolicyStatement({
-      sid: 'Logs', actions: ['logs:CreateLogStream', 'logs:PutLogEvents'], resources: [`${logGroup.logGroupArn}:*`],
+      sid: 'Logs', actions: ['logs:CreateLogStream', 'logs:PutLogEvents'], resources: [logGroup.logGroupArn], // its Arn ends in :*, covering its streams
     }));
     this.fn = new lambda.Function(this, 'Api', {
       role,
