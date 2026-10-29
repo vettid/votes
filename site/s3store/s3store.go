@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 
@@ -66,8 +67,12 @@ func (s *Store) PutOnce(ctx context.Context, path string, data []byte, contentTy
 	switch c := code(err); {
 	case err == nil:
 		return nil
-	case c == "PreconditionFailed" || c == "ConditionalRequestConflict":
+	case c == "PreconditionFailed":
 		return site.ErrExists
+	case c == "ConditionalRequestConflict":
+		// A concurrent write to the same key: whether anything is there
+		// isn't known yet, so this is a temporary failure, not "exists".
+		return fmt.Errorf("s3store: %s: a concurrent write, retry: %w", path, err)
 	default:
 		return err
 	}

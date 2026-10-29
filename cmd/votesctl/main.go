@@ -100,11 +100,21 @@ func publish(ctx context.Context, secret, bucket, in string) error {
 	if err != nil {
 		return err
 	}
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return err
+	}
+	return publishList(ctx, s3.NewFromConfig(cfg), bucket, key, raw)
+}
+
+// publishList signs raw and publishes it on c's bucket (publish's work,
+// apart from the key and the client).
+func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.PrivateKey, raw []byte) error {
 	data, err := vote.Canonicalize(raw)
 	if err != nil {
 		return err
 	}
-	sig, err := suite.Sign(key, vote.LabelServiceList, sum(data))
+	sig, err := signList(key, data)
 	if err != nil {
 		return err
 	}
@@ -112,62 +122,93 @@ func publish(ctx context.Context, secret, bucket, in string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.LoadDefaultConfig(ctx)
+	pub := key.Public().(ed25519.PublicKey)
+	cur, err := get(ctx, c, bucket, "v1/services.json")
 	if err != nil {
 		return err
 	}
-	c := s3.NewFromConfig(cfg)
-	prevData, prevSig, err := get(ctx, c, bucket)
+	curSig, err := get(ctx, c, bucket, "v1/services.json.sig")
 	if err != nil {
 		return err
 	}
-	if prevData != nil {
-		prev, err := site.ParseServiceList(prevData, prevSig, key.Public().(ed25519.PublicKey))
+	// Both objects are written conditionally, the signature first, so two
+	// publishes can't interleave; one that stopped between the two writes
+	// is finished by running it again with the same file.
+	resuming := curSig.data != nil && bytes.Equal(curSig.data, sig)
+	switch {
+	case cur.data == nil && curSig.data == nil:
+		if next.Version != 1 || !bytes.Equal(next.Previous, make([]byte, 32)) {
+			return errors.New("the first list is version 1 with an all-zero previous")
+		}
+	case resuming && (cur.data == nil || bytes.Equal(next.Previous, sum(cur.data))):
+		// An interrupted publish of this same list: only the list is left.
+	case cur.data == nil || curSig.data == nil:
+		return errors.New("the bucket holds a service list or a signature without the other: restore the pair from the bucket's object versions")
+	default:
+		prev, err := site.ParseServiceList(cur.data, curSig.data, pub)
 		if err != nil {
-			return fmt.Errorf("the published list: %w", err)
+			return fmt.Errorf("the published list doesn't verify (%w): restore the pair from the bucket's object versions", err)
 		}
-		if err := site.Extends(prev, prevData, next); err != nil {
+		if err := site.Extends(prev, cur.data, next); err != nil {
 			return err
 		}
-	} else if next.Version != 1 || !bytes.Equal(next.Previous, make([]byte, 32)) {
-		return errors.New("the first list is version 1 with an all-zero previous")
 	}
-	// The signature first: a reader that finds the new list finds its
-	// signature (an old list with a new signature fails, and is retried).
-	for _, o := range []struct {
-		key  string
-		data []byte
-		ct   string
-	}{{"v1/services.json.sig", sig, "application/octet-stream"}, {"v1/services.json", data, "application/json"}} {
-		if _, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String(o.key), Body: bytes.NewReader(o.data),
-			ContentType: aws.String(o.ct), CacheControl: aws.String("public, max-age=300")}); err != nil {
+	if !resuming {
+		if err := put(ctx, c, bucket, "v1/services.json.sig", sig, "application/octet-stream", curSig.tag); err != nil {
 			return err
 		}
+	}
+	if err := put(ctx, c, bucket, "v1/services.json", data, "application/json", cur.tag); err != nil {
+		return err
 	}
 	fmt.Printf("published service list version %d (%d services)\n", next.Version, len(next.Services))
 	return nil
 }
 
-func get(ctx context.Context, c *s3.Client, bucket string) ([]byte, []byte, error) {
-	var out [2][]byte
-	for i, k := range []string{"v1/services.json", "v1/services.json.sig"} {
-		o, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(k)})
-		if err != nil {
-			var nf interface{ ErrorCode() string }
-			if errors.As(err, &nf) && nf.ErrorCode() == "NoSuchKey" {
-				return nil, nil, nil
-			}
-			return nil, nil, err
+type object struct {
+	data []byte
+	tag  string // its ETag, or "" when absent
+}
+
+func get(ctx context.Context, c *s3.Client, bucket, key string) (object, error) {
+	o, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+	if err != nil {
+		var nf interface{ ErrorCode() string }
+		if errors.As(err, &nf) && nf.ErrorCode() == "NoSuchKey" {
+			return object{}, nil
 		}
-		var b bytes.Buffer
-		_, err = b.ReadFrom(o.Body)
-		o.Body.Close()
-		if err != nil {
-			return nil, nil, err
-		}
-		out[i] = b.Bytes()
+		return object{}, err
 	}
-	return out[0], out[1], nil
+	defer o.Body.Close()
+	var b bytes.Buffer
+	if _, err := b.ReadFrom(o.Body); err != nil {
+		return object{}, err
+	}
+	return object{data: b.Bytes(), tag: aws.ToString(o.ETag)}, nil
+}
+
+// put replaces an object only if it is still the version read (tag), or
+// writes it only if there was none ("").
+func put(ctx context.Context, c *s3.Client, bucket, key string, data []byte, ct, tag string) error {
+	in := &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(data),
+		// Short: a reader may meet the new list beside the old signature
+		// for this long, and retries.
+		ContentType: aws.String(ct), CacheControl: aws.String("public, max-age=10")}
+	if tag == "" {
+		in.IfNoneMatch = aws.String("*")
+	} else {
+		in.IfMatch = aws.String(tag)
+	}
+	if _, err := c.PutObject(ctx, in); err != nil {
+		return fmt.Errorf("%s changed while publishing (another publish?): %w", key, err)
+	}
+	return nil
+}
+
+// signList is the site's signature of a list's bytes (BALLOT-PROTOCOL
+// §3.3).
+func signList(key ed25519.PrivateKey, data []byte) ([]byte, error) {
+	return suite.Sign(key, vote.LabelServiceList, sum(data))
 }
 
 func sum(b []byte) []byte { h := sha256.Sum256(b); return h[:] }

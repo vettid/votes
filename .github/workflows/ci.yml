@@ -69,7 +69,7 @@ jobs:
       - name: integration tests
         env:
           VOTES_IT_LOCALSTACK: http://127.0.0.1:4566
-        run: go test -count=1 -tags integration ./site/s3store/
+        run: go test -count=1 -tags integration ./site/s3store/ ./cmd/votesctl/
 
   gitleaks:
     # Pinned binary over the FULL history (the gitleaks-action fails on a

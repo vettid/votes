@@ -7,3 +7,10 @@ useDefault = true
 [[allowlists]]
 description = "the site's public test vote"
 paths = ['''^site/testdata/vote\.json$''', '''^site/testdata/staging_trusted_root\.json$''']
+
+# CDK build output and node_modules committed by mistake to one branch
+# (votes PR #3) and removed in the next commit: asset hashes and package
+# files, no secrets. The branch is squash-merged, so main never has them.
+[[allowlists]]
+description = "CDK build output once committed by mistake"
+paths = ['''^cdk/cdk\.out/''', '''^cdk/node_modules/''']

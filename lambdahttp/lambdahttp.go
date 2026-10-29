@@ -84,6 +84,18 @@ func Serve(ctx context.Context, api string, h http.Handler) error {
 			return fmt.Errorf("lambdahttp: respond: %w", err)
 		}
 		pr.Body.Close()
+		if pr.StatusCode/100 != 2 {
+			// The runtime refused the response (one over Lambda's size
+			// limit, for one): say so in place of it.
+			ep, err := http.NewRequestWithContext(ctx, http.MethodPost, base+id+"/error",
+				strings.NewReader(`{"errorMessage":"response refused","errorType":"ResponseRefused"}`))
+			if err != nil {
+				return err
+			}
+			if er, err := c.Do(ep); err == nil {
+				er.Body.Close()
+			}
+		}
 	}
 	return ctx.Err()
 }
@@ -110,7 +122,8 @@ func invoke(ctx context.Context, h http.Handler, payload []byte, deadline time.T
 		}
 		body = b
 	}
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	// A second before Lambda's deadline, so that an answer still goes out.
+	ctx, cancel := context.WithDeadline(ctx, deadline.Add(-time.Second))
 	defer cancel()
 	target := ev.RawPath
 	if ev.RawQueryString != "" {
@@ -124,10 +137,25 @@ func invoke(ctx context.Context, h http.Handler, payload []byte, deadline time.T
 		req.Header.Set(k, v)
 	}
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	if err := serve(h, rec, req); err != nil {
+		rec = httptest.NewRecorder()
+		rec.WriteHeader(http.StatusInternalServerError)
+	}
 	res := response{StatusCode: rec.Code, Headers: map[string]string{}, Body: base64.StdEncoding.EncodeToString(rec.Body.Bytes()), IsBase64Encoded: true}
 	for k, v := range rec.Header() {
 		res.Headers[k] = strings.Join(v, ", ")
 	}
 	return json.Marshal(res)
+}
+
+// serve runs h, turning a panic into an error: one bad request must not
+// end the runtime process.
+func serve(h http.Handler, w http.ResponseWriter, r *http.Request) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("lambdahttp: panic: %v", p)
+		}
+	}()
+	h.ServeHTTP(w, r)
+	return nil
 }

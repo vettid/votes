@@ -5,13 +5,16 @@ package s3store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/vettid/votes/site"
 )
@@ -27,10 +30,16 @@ func TestConditionalWrites(t *testing.T) {
 	ctx := context.Background()
 	c := s3.New(s3.Options{Region: "us-east-1", BaseEndpoint: aws.String(ep), UsePathStyle: true,
 		Credentials: credentials.NewStaticCredentialsProvider("test", "test", "")})
-	if _, err := c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String("votes-it")}); err != nil {
+	// A fresh, versioned bucket each run, as production's is versioned.
+	bucket := fmt.Sprintf("votes-it-%d", time.Now().UnixNano())
+	if _, err := c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Fatal(err)
 	}
-	st := &Store{Client: c, Bucket: "votes-it"}
+	if _, err := c.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{Bucket: aws.String(bucket),
+		VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusEnabled}}); err != nil {
+		t.Fatal(err)
+	}
+	st := &Store{Client: c, Bucket: bucket}
 	if _, _, err := st.Get(ctx, "v1/p/x/proposal.json"); !errors.Is(err, site.ErrNotExist) {
 		t.Fatalf("a missing object: %v", err)
 	}
