@@ -2,7 +2,7 @@
 
 **Status:** 0.2.0 (2026-10-29), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
-(0.9.0); its §3.3 is this site's contract and §8.5 has the document
+(0.10.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
 and this document is corrected.
 
@@ -26,7 +26,7 @@ one: the service's signature and the Rekor anchor catch that.
 | Bucket | Private S3 bucket, versioned, blocking public access. Read only through CloudFront (origin access control). Written only by the upload function, which cannot delete. |
 | CloudFront | `votes.vettid.org`. Serves `/v1/*` from the bucket and `/api/*` from the API. Security headers as vettid.org's sites. No access logs. |
 | Upload API | API Gateway HTTP API → Lambda `votes-api` (Go, arm64). |
-| Service list | `services.json` in this repository, changed only by PR, signed and anchored at deploy. |
+| Service list | `services.json` in this repository, changed only by PR, signed at deploy with the site's Ed25519 key (BALLOT-PROTOCOL §3.3). |
 | Stack | CDK (TypeScript), `VotesSite-staging` and `VotesSite-prod`, as member-service. |
 
 **(chosen; not in the spec:** Lambda rather than an ECS service, because
@@ -43,18 +43,20 @@ All under `https://votes.vettid.org/v1/`.
 
 | Path | Contents | Cache |
 |---|---|---|
-| `services.json`, `.sig`, `.sigstore.json` | The service list (BALLOT-PROTOCOL §8.5) | 5 min |
+| `services.json`, `.sig` | The service list and the site's signature (BALLOT-PROTOCOL §3.3, §8.5) | 5 min |
 | `index.json` | Proposals open or closed within the last 30 days: `[{proposal_id, service_id, proposal_hash, opens_at, closes_at, extended, published}]`, by `opens_at` | 60 s |
 | `archive/<YYYY-MM>.json` | Every proposal by the month of `opens_at`, same entries | 60 s |
 | `p/<proposal_id>/proposal.json`, `.sig`, `.sigstore.json` | The proposal, `proposal_sig` (raw 64 bytes), its anchor bundle | 1 year, immutable |
 | `p/<proposal_id>/extension-<n>.json`, `.sig`, `.sigstore.json` | An extension | 1 year, immutable |
 | `p/<proposal_id>/results.json`, `.sig`, `.sigstore.json` | The results | 1 year, immutable |
+| `p/<proposal_id>/rows.json` | The rows, which `results.json` names by hash | 1 year, immutable |
 
 ## 4. Upload API
 
 `POST https://votes.vettid.org/api/v1/p/<proposal_id>/<name>`, where
 `<name>` is `proposal`, `extension-<n>` or `results`. The body is JSON
-`{doc: b64, sig: b64, bundle: <Sigstore bundle JSON>}`. There is no other
+`{doc: b64, sig: b64, bundle: <Sigstore bundle JSON>, rows?: b64}`, with
+`rows` for the results only. There is no other
 credential: the service's signature is the authentication.
 
 **Checks, in order** (each failure is `422` with an error code):
@@ -72,8 +74,9 @@ credential: the service's signature is the authentication.
    - a proposal: before its `opens_at`;
    - an extension: `n` is the next number, its timestamp is before the
      `closes_at` it extends, and the total is within 24 h;
-   - results: after the final `closes_at`, and they contain the
-     published proposal and extensions byte for byte.
+   - results: after the final `closes_at`; they contain the published
+     proposal and extensions byte for byte, and `rows` hashes to their
+     `rows_hash`.
 6. **Write-once** (§2).
 
 Then the function updates `index.json` and the archive with a
@@ -105,7 +108,8 @@ function logs ids, types, sizes and error codes.
 
 ## Changes
 
-- **0.2.0 (2026-10-29):** follows BALLOT-PROTOCOL 0.9.0. Pools, rosters,
+- **0.2.0 (2026-10-29):** follows BALLOT-PROTOCOL 0.10.0: results in two
+  parts, and the service list signed by the site's key. Pools, rosters,
   closings, mix lists, the Rekor monitor, mirrors, OpenTimestamps and
   reports are gone. The service list is signed and anchored.
 - **0.1.0 (2026-10-29):** first draft.
