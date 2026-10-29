@@ -15,8 +15,9 @@ The protocol is
 ## Status
 
 The upload API (`site/`, `cmd/votes-api`), its storage on S3, the
-operator's `votesctl` and the CDK stack (`cdk/`) are written; nothing is
-deployed yet.
+operator's `votesctl` and the CDK stack (`cdk/`) are written. Staging
+runs at `https://votes.staging.vettid.org` (2026-10-29); production is
+not deployed.
 
 ## Checking a vote
 
