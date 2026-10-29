@@ -26,6 +26,36 @@ jobs:
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
       - name: go test -race
         run: go test -race -count=1 ./...
+      - name: build
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags=-buildid= -o /dev/null ./cmd/votes-api
+          CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/votesctl
+
+  integration:
+    # S3's conditional writes against LocalStack, from VettID's mirror of
+    # the upstream digest (vettid.org .github/mirror):
+    # public.ecr.aws/localstack/localstack:4.9@sha256:59373b4a27dba3ec15c4db0b7455f0cb68c8a42300e2cbbe362b440f9a131697
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    services:
+      localstack:
+        image: ghcr.io/vettid/mirror/localstack@sha256:59373b4a27dba3ec15c4db0b7455f0cb68c8a42300e2cbbe362b440f9a131697
+        ports: ["4566:4566"]
+        env:
+          SERVICES: s3
+          LOCALSTACK_HOST: 127.0.0.1:4566
+        options: --memory 1536m
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: wait for LocalStack
+        run: for i in $(seq 1 90); do curl -sf http://127.0.0.1:4566/_localstack/health >/dev/null && exit 0; sleep 1; done; exit 1
+      - name: integration tests
+        env:
+          VOTES_IT_LOCALSTACK: http://127.0.0.1:4566
+        run: go test -count=1 -tags integration ./site/s3store/
 
   gitleaks:
     # Pinned binary over the FULL history (the gitleaks-action fails on a
