@@ -41,6 +41,9 @@ func TestPublishServices(t *testing.T) {
 	key := ed25519.NewKeyFromSeed(seed[:])
 	ik := bytes.Repeat([]byte{3}, 32)
 	list := func(version int64, previous []byte, services ...site.Service) []byte {
+		if services == nil {
+			services = []site.Service{}
+		}
 		b, _ := json.Marshal(&site.ServiceList{V: 1, Version: version, Previous: previous, Services: services})
 		b, _ = vote.Canonicalize(b)
 		return b
