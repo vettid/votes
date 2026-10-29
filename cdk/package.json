@@ -1,0 +1,32 @@
+{
+  "name": "votes-cdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AWS CDK app for votes.vettid.org (docs/VOTES-SITE.md \u00a72)",
+  "license": "AGPL-3.0-or-later",
+  "bin": {
+    "votes": "bin/votes.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "cdk": "cdk",
+    "synth": "cdk synth"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^26.6.4",
+    "aws-cdk": "^2.1146.1",
+    "jest": "^30.5.2",
+    "ts-jest": "^29.4.14",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.9.3"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.274.0",
+    "constructs": "^10.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

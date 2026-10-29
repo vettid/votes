@@ -14,7 +14,48 @@ The protocol is
 
 ## Status
 
-The upload API's checks (`site/`) are written; the Lambda, its storage and the CDK stack follow.
+The upload API (`site/`, `cmd/votes-api`), its storage on S3, the
+operator's `votesctl` and the CDK stack (`cdk/`) are written; nothing is
+deployed yet.
+
+## Deployment
+
+Deploys need the owner's go. The stack is `VotesSite-<envName>` in
+`cdk/`, always in `us-east-1` (CloudFront's certificate must be there).
+The deploying machine needs Node 22 and Go: the function is built at
+synth by `scripts/build-api.sh`, the build CI hashes.
+
+Every deploy passes, from `cdk/` after `npm ci`:
+`-c envName=<staging|prod> -c hostName=<name> -c hostedZoneId=<id> -c zoneName=vettid.org -c sigstore=<staging|production>`,
+where `sigstore` matches the service vaults' `SV_SIGSTORE` for that
+environment. None has a default.
+
+1. **Once per account:** `npx cdk bootstrap aws://<account>/us-east-1`.
+2. **First deploy:** `npx cdk deploy <context> -c firstDeploy=true`.
+   It makes the bucket, the function, the API, the certificate, the
+   CloudFront distribution, the name's records and the site key's
+   secret (output `SiteKeySecret`). Uploads are refused until step 4.
+3. **The site key:** build votesctl (`go build -o votesctl ./cmd/votesctl`
+   at the root), then `./votesctl site-key -secret <SiteKeySecret>`
+   prints its public key. It also goes in the member vaults' release
+   config (BALLOT-PROTOCOL §3.3).
+4. **Deploy again** with `-c siteKey=<that key>`, and pass it on every
+   deploy from then on (a deploy without it is refused).
+5. **The service list:** `services.json` holds
+
+   ```json
+   {"v": 1, "version": 1, "previous": "<base64 of 32 zero bytes>",
+    "services": [{"service_id": "<hex>", "name": "<name>", "iks": ["<base64 ik>"],
+                  "anchor_keys": [{"key": "<base64 SPKI>", "anchor_cert": "<base64>", "ik": "<base64 ik>"}]}]}
+   ```
+
+   with each service's identity keys, and its anchor key and certificate
+   from the service vault's `GET /v1/anchor-key`. Each later list has the
+   next `version` and, as `previous`, the base64 SHA-256 of the published
+   `v1/services.json`. Publish it with
+   `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`.
+   A list that drops anything the published one had is refused; one
+   interrupted half-way is finished by running the same command again.
 
 ## License
 
