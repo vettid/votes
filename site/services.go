@@ -70,6 +70,9 @@ func ParseServiceList(data, sig []byte, siteKey ed25519.PublicKey) (*ServiceList
 	if again, err = vote.Canonicalize(again); err != nil || !bytes.Equal(again, data) {
 		return nil, errors.New("site: the service list isn't in its exact form")
 	}
+	if l.Services == nil {
+		return nil, errors.New("site: the service list has no services array")
+	}
 	ids, iks := map[string]bool{}, map[string]bool{}
 	for _, s := range l.Services {
 		if err := s.check(); err != nil {
@@ -90,6 +93,9 @@ func ParseServiceList(data, sig []byte, siteKey ed25519.PublicKey) (*ServiceList
 }
 
 func (s *Service) check() error {
+	if s.AnchorKeys == nil {
+		return fmt.Errorf("site: service %q: no anchor_keys array", s.ServiceID)
+	}
 	if len(s.IKs) == 0 || s.ServiceID != ServiceID(s.IKs[0]) {
 		return fmt.Errorf("site: service %q: id", s.ServiceID)
 	}

@@ -29,10 +29,13 @@ const MaxUpload = 6<<20 - 64<<10
 // extension is a few hundred bytes; results carry the proposal, the
 // extensions, roots and the tally; rows grow with the eligible members.
 const (
-	maxProposal  = 64 << 10
+	maxProposal  = 256 << 10 // the 16 KiB text, labels and rules, even with every character escaped
 	maxExtension = 4 << 10
-	maxResults   = 256 << 10
+	maxResults   = 512 << 10 // the proposal (in base64) and up to maxExtensions extensions
 	maxBundle    = 64 << 10
+	// maxExtensions bounds an extension's number: extensions add at most
+	// 24 h in all, a whole hour at least each (BALLOT-PROTOCOL §10.2).
+	maxExtensions = 24
 )
 
 // CollectMargin is how long after the final close the results may be
@@ -66,7 +69,7 @@ func (s *Site) Handler() http.Handler {
 	return mux
 }
 
-var nameRe = regexp.MustCompile(`^(proposal|results|extension-([1-9][0-9]{0,2}))$`)
+var nameRe = regexp.MustCompile(`^(proposal|results|extension-([1-9][0-9]?))$`)
 
 // refusal is a check that failed: an HTTP status and an error code.
 type refusal struct {
@@ -82,7 +85,7 @@ func refuse(status int, code, why string) error { return &refusal{status, code, 
 func (s *Site) upload(w http.ResponseWriter, r *http.Request) {
 	id, name := r.PathValue("id"), r.PathValue("name")
 	m := nameRe.FindStringSubmatch(name)
-	if !vote.ValidProposalID(id) || m == nil {
+	if n, _ := strconv.Atoi(m2(m)); !vote.ValidProposalID(id) || m == nil || n > maxExtensions {
 		writeError(w, http.StatusNotFound, "not_found")
 		return
 	}
@@ -102,7 +105,11 @@ func (s *Site) upload(w http.ResponseWriter, r *http.Request) {
 	if name == "results" {
 		limit = maxResults
 	}
-	if len(u.Doc) > limit || (name != "results" && u.Rows != nil) {
+	if name != "results" && u.Rows != nil {
+		writeError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	if len(u.Doc) > limit {
 		writeError(w, http.StatusRequestEntityTooLarge, "too_large")
 		return
 	}
@@ -380,8 +387,10 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 	if err != nil {
 		return false, err
 	}
-	if ts.Before(time.Unix(closes, 0)) {
-		return false, refuse(http.StatusUnprocessableEntity, "bad_anchor", "results anchored before the close")
+	if ts.Before(end) {
+		// Collection ends a minute after the close (§7): results anchored
+		// sooner were counted before it ended.
+		return false, refuse(http.StatusUnprocessableEntity, "bad_anchor", "results anchored before collection ended")
 	}
 	created, err := s.write(ctx, id, "results", u, u.Rows, svc)
 	if err != nil {
@@ -601,4 +610,12 @@ func checkProfile(raw []byte) error {
 		return errors.New("bundle: not exactly one RFC 3161 timestamp")
 	}
 	return nil
+}
+
+// m2 is the extension number a name match holds, or "".
+func m2(m []string) string {
+	if len(m) > 2 {
+		return m[2]
+	}
+	return ""
 }

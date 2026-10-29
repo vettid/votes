@@ -78,8 +78,8 @@ credential: the service's signature is the authentication.
    - an extension: `n` is the next number, it is anchored and uploaded
      before the `closes_at` it extends, never once results are
      published, and the total is within 24 h;
-   - results: uploaded at least a minute after the final `closes_at`
-     and anchored after it; they pass the observer's check (BALLOT-
+   - results: uploaded and anchored at least a minute after the final
+     `closes_at`, when collection ends (BALLOT-PROTOCOL §7); they pass the observer's check (BALLOT-
      PROTOCOL §8.4) and contain the published proposal and extensions
      byte for byte, and `rows` hashes to their `rows_hash`.
 6. **Write-once** (§2): the signature, the bundle and any rows go up
@@ -91,8 +91,8 @@ credential: the service's signature is the authentication.
    `409`.
 
 Before these, the request is refused if it is over the size for its
-kind (a proposal 64 KiB, an extension 4 KiB, results 256 KiB, a bundle
-64 KiB), and the bundle must be in the protocol's profile: v0.3, a
+kind (a proposal 256 KiB, an extension 4 KiB, results 512 KiB, a bundle
+64 KiB; extensions are numbered at most 24), and the bundle must be in the protocol's profile: v0.3, a
 SHA-256 message signature under a public key, exactly one `hashedrekord`
 0.0.1 entry and exactly one RFC 3161 timestamp. Documents nest at most 8
 deep. The index is updated on every accepted upload, retries included,

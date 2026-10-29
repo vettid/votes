@@ -393,3 +393,102 @@ func TestResultsRefusals(t *testing.T) {
 	code, why = post(t, s, "results", &f.Results)
 	want(t, "the real results", code, why, 201, "")
 }
+
+// Extension n waits for n−1; numbers past 24 aren't routes.
+func TestExtensionOrder(t *testing.T) {
+	f := loadFixture(t)
+	s, _ := newSite(t, f, f.during())
+	post(t, s, "proposal", &f.Proposal)
+	doc, err := vote.EncodeExtension(&vote.Extension{V: 1, ProposalID: testID, N: 2, ClosesAt: f.e.ClosesAt + 3600, Outage: f.e.Outage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _ := vote.DocSigMsg(sha(f.Proposal.Doc), doc)
+	sig, _ := suite.Sign(ed25519.NewKeyFromSeed(f.ServiceSeed), vote.LabelExtended, m)
+	code, why := post(t, s, "extension-2", &Upload{Doc: doc, Sig: sig, Bundle: f.Extension.Bundle})
+	want(t, "extension 2 before 1", code, why, 422, "out_of_order")
+	code, why = post(t, s, "extension-25", &f.Extension)
+	want(t, "extension 25", code, why, 404, "not_found")
+	code, why = post(t, s, "extension-1", mut(f.Extension, func(u *Upload) { u.Rows = []byte("x") }))
+	want(t, "rows with an extension", code, why, 400, "bad_request")
+}
+
+// An extension whose index update failed is indexed by its retry.
+func TestExtensionIndexRetry(t *testing.T) {
+	f := loadFixture(t)
+	s, st := newSite(t, f, f.during())
+	post(t, s, "proposal", &f.Proposal)
+	st.failIndex = 1
+	code, _ := post(t, s, "extension-1", &f.Extension)
+	want(t, "the index fails", code, "", 503, "")
+	code, why := post(t, s, "extension-1", &f.Extension)
+	want(t, "the retry", code, why, 200, "")
+	if es := index(t, st); es[0].Extended != 1 || es[0].ClosesAt != f.e.ClosesAt {
+		t.Fatalf("index %+v", es)
+	}
+}
+
+// Bundles outside the protocol's profile are refused before Sigstore's
+// verifier sees them.
+func TestBundleProfile(t *testing.T) {
+	f := loadFixture(t)
+	s, _ := newSite(t, f, f.during())
+	edit := func(fn func(map[string]any)) json.RawMessage {
+		var b map[string]any
+		_ = json.Unmarshal(f.Proposal.Bundle, &b)
+		fn(b)
+		out, _ := json.Marshal(b)
+		return out
+	}
+	vm := func(b map[string]any) map[string]any { return b["verificationMaterial"].(map[string]any) }
+	for name, bundle := range map[string]json.RawMessage{
+		"two log entries": edit(func(b map[string]any) {
+			e := vm(b)["tlogEntries"].([]any)
+			vm(b)["tlogEntries"] = append(e, e[0])
+		}),
+		"two timestamps": edit(func(b map[string]any) {
+			td := vm(b)["timestampVerificationData"].(map[string]any)
+			ts := td["rfc3161Timestamps"].([]any)
+			td["rfc3161Timestamps"] = append(ts, ts[0])
+		}),
+		"another digest": edit(func(b map[string]any) {
+			b["messageSignature"].(map[string]any)["messageDigest"].(map[string]any)["algorithm"] = "SHA2_384"
+		}),
+		"a DSSE envelope": edit(func(b map[string]any) { b["dsseEnvelope"] = map[string]any{"payload": "e30="} }),
+		"no public key":   edit(func(b map[string]any) { delete(vm(b), "publicKey") }),
+	} {
+		code, why := post(t, s, "proposal", mut(f.Proposal, func(u *Upload) { u.Bundle = bundle }))
+		want(t, name, code, why, 422, "bad_anchor")
+	}
+}
+
+// The service list is parsed in its exact form only.
+func TestServiceListStrict(t *testing.T) {
+	f := loadFixture(t)
+	sign := func(b []byte) []byte { s, _ := suite.Sign(siteKey(), vote.LabelServiceList, sha(b)); return s }
+	pub := siteKey().Public().(ed25519.PublicKey)
+	l := f.list()
+	good, _ := json.Marshal(l)
+	good, _ = vote.Canonicalize(good)
+	if _, err := ParseServiceList(good, sign(good), pub); err != nil {
+		t.Fatal(err)
+	}
+	twice := f.list()
+	twice.Services = append(twice.Services, twice.Services[0])
+	dup, _ := json.Marshal(twice)
+	dup, _ = vote.Canonicalize(dup)
+	upper := bytes.Replace(good, []byte(`"services"`), []byte(`"Services"`), 1)
+	upper, _ = vote.Canonicalize(upper)
+	nl := f.list()
+	nl.Services[0].AnchorKeys = nil // encodes as null
+	null, _ := json.Marshal(nl)
+	null, _ = vote.Canonicalize(null)
+	if !bytes.Contains(null, []byte(`"anchor_keys":null`)) {
+		t.Fatal("the test list has no null")
+	}
+	for name, b := range map[string][]byte{"a service twice": dup, "a name in another case": upper, "null arrays": null} {
+		if _, err := ParseServiceList(b, sign(b), pub); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
