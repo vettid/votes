@@ -30,8 +30,9 @@ one: the service's signature and the Rekor anchor catch that.
 | Stack | CDK (TypeScript), `VotesSite-staging` and `VotesSite-prod`, as member-service. |
 
 **(chosen; not in the spec:** Lambda rather than an ECS service, because
-uploads are a few per vote. The function's zip is built in CI with
-attested build provenance, like the images.)
+uploads are a few per vote. The function is a reproducible build,
+`scripts/build-api.sh`: CI prints its sha256 for each commit, and the
+binary a deploy ships has the same hash.)
 
 **Write-once** is the bucket's conditional write: every document is put
 with `If-None-Match: *`. A `412` means the path exists: the function

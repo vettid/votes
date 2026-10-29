@@ -19,9 +19,10 @@ import { Construct } from 'constructs';
  * checks and the results it must precede (docs/VOTES-SITE.md §4). */
 export const LAMBDA_TIMEOUT_SECONDS = 20;
 
-/** What the upload function may do on the bucket: read, list (so that a
- * missing object is a 404) and write. Never delete. */
-export const BUCKET_ACTIONS = ['s3:GetObject', 's3:PutObject'] as const;
+/** Where the upload function may write: published documents (write-once,
+ * enforced by the bucket policy), the index and the archive. Not the
+ * service list, which only the operator's votesctl writes. */
+export const WRITE_PATHS = ['v1/p/*', 'v1/index.json', 'v1/archive/*'] as const;
 
 export interface VotesStackProps extends cdk.StackProps {
   readonly envName: string;
@@ -29,35 +30,40 @@ export interface VotesStackProps extends cdk.StackProps {
   readonly hostName: string;
   readonly hostedZoneId: string;
   readonly zoneName: string;
-  /** The site's Ed25519 public key (base64), from `votesctl site-key`
-   * after the first deploy. Until it is set, uploads are refused. */
+  /** The Sigstore instance bundles are checked against: the one the
+   * service vaults of this environment anchor in (their SV_SIGSTORE). */
+  readonly sigstore: 'staging' | 'production';
+  /** The site's Ed25519 public key (base64), from `votesctl site-key`.
+   * Absent only on the first deploy, which makes the key's secret: uploads
+   * are refused until a deploy sets it. */
   readonly siteKey?: string;
   /** The function's code; by default `cmd/votes-api` built for arm64. */
   readonly lambdaCode?: lambda.Code;
 }
 
-/** Builds cmd/votes-api for Lambda's provided.al2023 on arm64. */
+/** Builds cmd/votes-api with scripts/build-api.sh, the build CI runs and
+ * hashes, so a deploy's binary can be compared with CI's. */
 function buildApi(): lambda.Code {
   const root = path.join(__dirname, '..', '..');
   return lambda.Code.fromAsset(root, {
-    // The asset is named by what was built (a reproducible binary: no
-    // build id, trimmed paths), not by the source tree it came from.
+    // Named by what was built (reproducible), not by the source tree.
     assetHashType: cdk.AssetHashType.OUTPUT,
     exclude: ['cdk/node_modules', 'cdk/cdk.out', '.git'],
     bundling: {
       image: cdk.DockerImage.fromRegistry('unused'), // built locally, below
       local: {
         tryBundle(out: string): boolean {
-          execFileSync('go', ['build', '-trimpath', '-ldflags=-s -w -buildid=', '-o', path.join(out, 'bootstrap'), './cmd/votes-api'], {
-            cwd: root,
-            env: { ...process.env, CGO_ENABLED: '0', GOOS: 'linux', GOARCH: 'arm64' },
-            stdio: 'inherit',
-          });
+          execFileSync(path.join(root, 'scripts', 'build-api.sh'), [out], { cwd: root, stdio: 'inherit' });
           return true;
         },
       },
     },
   });
+}
+
+/** A base64 Ed25519 public key: 32 bytes. */
+export function validSiteKey(k: string): boolean {
+  return /^[A-Za-z0-9+/]{43}=$/.test(k) && Buffer.from(k, 'base64').length === 32;
 }
 
 /**
@@ -73,6 +79,12 @@ export class VotesStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: VotesStackProps) {
     super(scope, id, props);
     const prefix = `vettid-votes-${props.envName}`;
+    if (props.siteKey !== undefined && !validSiteKey(props.siteKey)) {
+      throw new Error('siteKey must be a base64 Ed25519 public key (votesctl site-key)');
+    }
+    if (!cdk.Token.isUnresolved(this.region) && this.region !== 'us-east-1') {
+      throw new Error('the stack must be in us-east-1: CloudFront takes its certificate from there');
+    }
 
     this.bucket = new s3.Bucket(this, 'Bucket', {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -82,6 +94,18 @@ export class VotesStack extends cdk.Stack {
       objectOwnership: s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
+    // Write-once, enforced by S3 for every principal: a published document
+    // is written only with If-None-Match: * and never deleted (§2).
+    this.bucket.addToResourcePolicy(new iam.PolicyStatement({
+      sid: 'PublishedWriteOnce', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()],
+      actions: ['s3:PutObject'], resources: [this.bucket.arnForObjects('v1/p/*')],
+      conditions: { Null: { 's3:if-none-match': 'true' } },
+    }));
+    this.bucket.addToResourcePolicy(new iam.PolicyStatement({
+      sid: 'PublishedNeverDeleted', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()],
+      actions: ['s3:DeleteObject', 's3:DeleteObjectVersion', 's3:PutObjectRetention', 's3:PutLifecycleConfiguration'],
+      resources: [this.bucket.arnForObjects('v1/p/*'), this.bucket.bucketArn],
+    }));
 
     // The site's signing key for the service list: a generated secret the
     // operator's votesctl derives the key from. The function never reads
@@ -111,12 +135,15 @@ export class VotesStack extends cdk.Stack {
         VOTES_BUCKET: this.bucket.bucketName,
         // Bundles are checked against the instance the service vaults
         // anchor in: staging outside production.
-        VOTES_SIGSTORE: props.envName === 'prod' ? 'production' : 'staging',
+        VOTES_SIGSTORE: props.sigstore,
         VOTES_SITE_KEY: props.siteKey ?? '',
       },
     });
     this.fn.addToRolePolicy(new iam.PolicyStatement({
-      sid: 'Objects', actions: [...BUCKET_ACTIONS], resources: [this.bucket.arnForObjects('*')],
+      sid: 'Read', actions: ['s3:GetObject'], resources: [this.bucket.arnForObjects('*')],
+    }));
+    this.fn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'Write', actions: ['s3:PutObject'], resources: WRITE_PATHS.map((p) => this.bucket.arnForObjects(p)),
     }));
     this.fn.addToRolePolicy(new iam.PolicyStatement({
       sid: 'List', actions: ['s3:ListBucket'], resources: [this.bucket.bucketArn],
@@ -159,6 +186,15 @@ export class VotesStack extends cdk.Stack {
         accessControlAllowHeaders: ['*'], accessControlAllowCredentials: false, originOverride: true,
       },
     });
+    const apiHeaders = new cloudfront.ResponseHeadersPolicy(this, 'ApiHeaders', {
+      responseHeadersPolicyName: `${prefix}-api-headers`,
+      securityHeadersBehavior: {
+        strictTransportSecurity: { accessControlMaxAge: cdk.Duration.days(730), includeSubdomains: true, preload: true, override: true },
+        contentTypeOptions: { override: true },
+        frameOptions: { frameOption: cloudfront.HeadersFrameOption.DENY, override: true },
+        referrerPolicy: { referrerPolicy: cloudfront.HeadersReferrerPolicy.NO_REFERRER, override: true },
+      },
+    });
     const apiDomain = cdk.Fn.select(2, cdk.Fn.split('/', api.apiEndpoint));
     this.distribution = new cloudfront.Distribution(this, 'Cdn', {
       comment: `votes.vettid.org (${props.envName})`,
@@ -168,7 +204,10 @@ export class VotesStack extends cdk.Stack {
       // No access logs: the site keeps no record of readers (§5).
       enableLogging: false,
       defaultBehavior: {
-        origin: origins.S3BucketOrigin.withOriginAccessControl(this.bucket),
+        // LIST as well as READ, so that a missing document is a 404.
+        origin: origins.S3BucketOrigin.withOriginAccessControl(this.bucket, {
+          originAccessLevels: [cloudfront.AccessLevel.READ, cloudfront.AccessLevel.LIST],
+        }),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
@@ -181,9 +220,15 @@ export class VotesStack extends cdk.Stack {
           allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
           cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
           originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+          responseHeadersPolicy: apiHeaders,
         },
       },
     });
+    // Every document is public, and the default cache policy forwards no
+    // query string, so LIST gives readers 404s rather than 403s and no
+    // listing.
+    cdk.Annotations.of(this.distribution).acknowledgeWarning(
+      '@aws-cdk/aws-cloudfront-origins:listBucketSecurityRisk', 'all documents are public; no query string reaches S3');
     const alias = route53.RecordTarget.fromAlias(new targets.CloudFrontTarget(this.distribution));
     new route53.ARecord(this, 'AliasA', { zone, recordName: props.hostName, target: alias });
     new route53.AaaaRecord(this, 'AliasAAAA', { zone, recordName: props.hostName, target: alias });

@@ -27,8 +27,11 @@ jobs:
       - name: go test -race
         run: go test -race -count=1 ./...
       - name: build
+        # The same build the CDK stack deploys: compare a deploy's
+        # bootstrap with this hash for the same commit.
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags=-buildid= -o /dev/null ./cmd/votes-api
+          ./scripts/build-api.sh "$RUNNER_TEMP/api"
+          sha256sum "$RUNNER_TEMP/api/bootstrap"
           CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/votesctl
 
   cdk:
