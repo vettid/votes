@@ -14,7 +14,7 @@ The protocol is
 
 ## Status
 
-Design draft. No code yet.
+The upload API's checks (`site/`) are written; the Lambda, its storage and the CDK stack follow.
 
 ## License
 

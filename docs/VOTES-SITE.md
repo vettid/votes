@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.0 (2026-10-29), draft. The protocol this site serves is
+**Status:** 0.2.1 (2026-10-29), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.10.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -26,7 +26,7 @@ one: the service's signature and the Rekor anchor catch that.
 | Bucket | Private S3 bucket, versioned, blocking public access. Read only through CloudFront (origin access control). Written only by the upload function, which cannot delete. |
 | CloudFront | `votes.vettid.org`. Serves `/v1/*` from the bucket and `/api/*` from the API. Security headers as vettid.org's sites. No access logs. |
 | Upload API | API Gateway HTTP API → Lambda `votes-api` (Go, arm64). |
-| Service list | `services.json` in this repository, changed only by PR, signed at deploy with the site's Ed25519 key (BALLOT-PROTOCOL §3.3). |
+| Service list | `services.json` in this repository, changed only by PR, signed with the site's Ed25519 key and uploaded by the operator (BALLOT-PROTOCOL §3.3). The function checks it under the site's public key on every upload. |
 | Stack | CDK (TypeScript), `VotesSite-staging` and `VotesSite-prod`, as member-service. |
 
 **(chosen; not in the spec:** Lambda rather than an ECS service, because
@@ -66,18 +66,24 @@ credential: the service's signature is the authentication.
    `proposal_id` is the path's.
 3. **Signature:** under the proposal's `service` key, with the
    document's label (BALLOT-PROTOCOL §3.1, §8.5, §7).
-4. **Anchor:** the bundle's `hashedrekord` entry names the document's
-   hash and one of the service's listed anchor keys, its signature and
-   inclusion proof verify against the pinned Sigstore trusted root, and
-   its timestamp verifies.
+4. **Anchor:** the bundle verifies with Sigstore's own verifier
+   (`sigstore-go`) against the trusted root of the stack's Sigstore
+   instance (staging or production, fetched through its TUF repository):
+   the ECDSA signature over the document under one of the service's
+   listed anchor keys, the Rekor entry and its inclusion proof, and one
+   RFC 3161 timestamp.
 5. **Order and fields:**
-   - a proposal: before its `opens_at`;
+   - a proposal: anchored, and uploaded, before its `closes_at`;
    - an extension: `n` is the next number, its timestamp is before the
      `closes_at` it extends, and the total is within 24 h;
    - results: after the final `closes_at`; they contain the published
      proposal and extensions byte for byte, and `rows` hashes to their
      `rows_hash`.
-6. **Write-once** (§2).
+6. **Write-once** (§2): the signature, the bundle and any rows go up
+   first and the document last, so a document is never there without
+   them; a retry fills in what a failed upload left out. A bundle already
+   there for the same document is kept: another anchor of the same bytes
+   is the same document.
 
 Then the function updates `index.json` and the archive with a
 conditional write on their ETag, retrying on a conflict.
@@ -108,6 +114,9 @@ function logs ids, types, sizes and error codes.
 
 ## Changes
 
+- **0.2.1 (2026-10-29):** the code's rules: bundles are checked with
+  Sigstore's own verifier; a proposal may be published until its close;
+  the write order.
 - **0.2.0 (2026-10-29):** follows BALLOT-PROTOCOL 0.10.0: results in two
   parts, and the service list signed by the site's key. Pools, rosters,
   closings, mix lists, the Rekor monitor, mirrors, OpenTimestamps and
