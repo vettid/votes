@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-The public record of VettID votes. Every proposal, pool, extension and
+The public record of VettID votes. Every proposal, extension and
 result of a vote run through a
 [VettID service vault](https://github.com/vettid/service-vault) is
 published here, anchored in Sigstore's Rekor transparency log, and never
@@ -15,8 +15,39 @@ The protocol is
 ## Status
 
 The upload API (`site/`, `cmd/votes-api`), its storage on S3, the
-operator's `votesctl` and the CDK stack (`cdk/`) are written; nothing is
-deployed yet.
+operator's `votesctl` and the CDK stack (`cdk/`) are written. Staging
+runs at `https://votes.staging.vettid.org` (2026-10-29); production is
+not deployed.
+
+## Checking a vote
+
+Anyone can check a vote from what the site serves (BALLOT-PROTOCOL
+§8.4), with the site's public key (in the member vaults' release config):
+
+```sh
+go build -o votesctl ./cmd/votesctl
+./votesctl check -site-key <base64> <proposal_id>
+# staging: -site https://votes.staging.vettid.org -sigstore staging
+```
+
+It fetches the service list, the proposal, its extensions and the
+results with their rows, signatures and Sigstore bundles, and puts each
+document, in order, through the upload API's own checks on an empty
+store, at the time its anchor shows. So it checks every signature, each
+anchor in Rekor under the service's registered anchor key, the timing as
+anchored (the proposal and each extension timestamped before the close
+they precede, the results after collection ended; when each was uploaded
+is the site's word), the extensions (numbered without gaps, 24 at most,
+exactly those the results list), and the results against the rows and
+the tags. It prints a JSON report or fails with the first check that
+didn't hold. The report's `status` is `open` (before the close in force
+plus a minute), `closed` (after it, with no results published: not yet,
+or withheld), or `counted` (with the tally and counts); `hashes` are
+each document's SHA-256, for readers to compare what they were served;
+`partial` names a document whose signature or bundle is there without
+it (an upload not finished). Only a 404 is taken as not published.
+`-trusted-root <file>` uses a Sigstore trusted root file instead of
+fetching it.
 
 ## Deployment
 
