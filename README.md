@@ -94,6 +94,10 @@ environment. None has a default.
    next `version` and, as `previous`, the base64 SHA-256 of the published
    `v1/services.json`. Publish it with
    `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`.
+   Each version is also kept, write-once, as `v1/services/<version>.json`
+   and `.sig`, for vaults that missed versions; running the command again
+   with the list that is already published writes its copy if it is
+   missing (as for a list published before copies were kept).
    A list that drops anything the published one had is refused, and so
    is one outside BALLOT-PROTOCOL §3.3's bounds (a name of 1–100 bytes,
    4,194,304 bytes in all; the number of services and keys is not

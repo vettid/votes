@@ -79,6 +79,58 @@ func TestPublishServices(t *testing.T) {
 		t.Fatalf("the published pair: %v", err)
 	}
 
+	// Every version is kept, write-once, beside the current list.
+	kept := func(version int64, want []byte) {
+		t.Helper()
+		d, _ := get(ctx, c, bucket, fmt.Sprintf("v1/services/%d.json", version))
+		sg, _ := get(ctx, c, bucket, fmt.Sprintf("v1/services/%d.json.sig", version))
+		if !bytes.Equal(d.data, want) {
+			t.Fatalf("version %d's history", version)
+		}
+		if _, err := site.ParseServiceList(d.data, sg.data, key.Public().(ed25519.PublicKey)); err != nil {
+			t.Fatalf("version %d's history: %v", version, err)
+		}
+	}
+	kept(1, v1)
+	kept(2, data)
+	// The current list again: its history is written if missing.
+	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("v1/services/2.json")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishList(ctx, c, bucket, key, v2); err != nil {
+		t.Fatalf("the current list again: %v", err)
+	}
+	kept(2, data)
+	// A version's history is never rewritten: the publish stops before
+	// the current list moves.
+	h2 := sha256.Sum256(data)
+	v3 := list(3, h2[:], svc, site.Service{ServiceID: site.ServiceID(ik2), Name: "B2", IKs: [][]byte{ik2}, AnchorKeys: []site.AnchorKey{}})
+	if err := put(ctx, c, bucket, "v1/services/3.json.sig", []byte("other"), "application/octet-stream", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishList(ctx, c, bucket, key, v3); err == nil || !strings.Contains(err.Error(), "other bytes") {
+		t.Fatalf("over another version 3: %v", err)
+	}
+	if got, _ := get(ctx, c, bucket, "v1/services.json"); !bytes.Equal(got.data, data) {
+		t.Fatal("the current list moved")
+	}
+	if got, _ := get(ctx, c, bucket, "v1/services/3.json"); got.data != nil {
+		t.Fatal("a copy of a list that was never current")
+	}
+	// Versions are consecutive.
+	v4 := list(4, h2[:], svc, site.Service{ServiceID: site.ServiceID(ik2), Name: "B2", IKs: [][]byte{ik2}, AnchorKeys: []site.AnchorKey{}})
+	if err := publishList(ctx, c, bucket, key, v4); err == nil || !strings.Contains(err.Error(), "next version is 3") {
+		t.Fatalf("a version gap: %v", err)
+	}
+	// A missing signature copy of the current list is restored too.
+	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("v1/services/2.json.sig")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishList(ctx, c, bucket, key, v2); err != nil {
+		t.Fatal(err)
+	}
+	kept(2, data)
+
 	// A stale write is refused: another publish moved the list.
 	if err := put(ctx, c, bucket, "v1/services.json", v1, "application/json", cur.tag); err == nil {
 		t.Fatal("a write over a stale tag")

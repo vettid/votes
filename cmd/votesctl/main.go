@@ -155,9 +155,22 @@ func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.P
 	}
 	// Both objects are written conditionally, the signature first, so two
 	// publishes can't interleave; one that stopped between the two writes
-	// is finished by running it again with the same file.
+	// is finished by running it again with the same file. Every version
+	// is also kept, write-once, as services/<version>.json and .sig, so a
+	// vault that missed versions can follow the chain (VOTES-SITE §3). A
+	// version's copy is written only once it has been the current list
+	// (after the move; the previous one's again before it), so the copies
+	// never hold a list that wasn't served.
 	resuming := curSig.data != nil && bytes.Equal(curSig.data, sig)
 	switch {
+	case resuming && bytes.Equal(cur.data, data):
+		// Already the current list: only its history is checked, and
+		// written if missing (the list published before history was kept).
+		if err := keepVersion(ctx, c, bucket, next.Version, data, sig); err != nil {
+			return err
+		}
+		fmt.Printf("service list version %d is already published; its history is kept\n", next.Version)
+		return nil
 	case cur.data == nil && curSig.data == nil:
 		if next.Version != 1 || !bytes.Equal(next.Previous, make([]byte, 32)) {
 			return errors.New("the first list is version 1 with an all-zero previous")
@@ -174,6 +187,19 @@ func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.P
 		if err := site.Extends(prev, cur.data, next); err != nil {
 			return err
 		}
+		if next.Version != prev.Version+1 {
+			// Consecutive, so a vault's app fetches each version after
+			// the one it holds without gaps.
+			return fmt.Errorf("the next version is %d", prev.Version+1)
+		}
+		if err := keepVersion(ctx, c, bucket, prev.Version, cur.data, curSig.data); err != nil {
+			return err
+		}
+	}
+	// Nothing else may already sit at this version's copy: checked, not
+	// written, before the move.
+	if err := checkVersion(ctx, c, bucket, next.Version, data, sig); err != nil {
+		return err
 	}
 	if !resuming {
 		if err := put(ctx, c, bucket, "v1/services.json.sig", sig, "application/octet-stream", curSig.tag); err != nil {
@@ -183,7 +209,53 @@ func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.P
 	if err := put(ctx, c, bucket, "v1/services.json", data, "application/json", cur.tag); err != nil {
 		return err
 	}
+	// A failure here leaves the list current without its copy: the same
+	// command again, or the next publish, writes it.
+	if err := keepVersion(ctx, c, bucket, next.Version, data, sig); err != nil {
+		return err
+	}
 	fmt.Printf("published service list version %d (%d services)\n", next.Version, len(next.Services))
+	return nil
+}
+
+// keepVersion writes a list version's copy, write-once: an object
+// already there must hold the same bytes.
+func keepVersion(ctx context.Context, c *s3.Client, bucket string, version int64, data, sig []byte) error {
+	return versionCopy(ctx, c, bucket, version, data, sig, true)
+}
+
+// checkVersion reports whether a version's copy is absent or holds the
+// same bytes, writing nothing.
+func checkVersion(ctx context.Context, c *s3.Client, bucket string, version int64, data, sig []byte) error {
+	return versionCopy(ctx, c, bucket, version, data, sig, false)
+}
+
+func versionCopy(ctx context.Context, c *s3.Client, bucket string, version int64, data, sig []byte, write bool) error {
+	base := fmt.Sprintf("v1/services/%d.json", version)
+	for _, o := range []struct {
+		key, ct string
+		data    []byte
+	}{{base + ".sig", "application/octet-stream", sig}, {base, "application/json", data}} {
+		got, err := get(ctx, c, bucket, o.key)
+		if err != nil {
+			return err
+		}
+		if got.data != nil {
+			if !bytes.Equal(got.data, o.data) {
+				return fmt.Errorf("%s holds other bytes: a version is never rewritten", o.key)
+			}
+			continue
+		}
+		if !write {
+			continue
+		}
+		in := &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String(o.key), Body: bytes.NewReader(o.data),
+			ContentType: aws.String(o.ct), CacheControl: aws.String("public, max-age=31536000, immutable"),
+			IfNoneMatch: aws.String("*")}
+		if _, err := c.PutObject(ctx, in); err != nil {
+			return fmt.Errorf("%s: %w", o.key, err)
+		}
+	}
 	return nil
 }
 
