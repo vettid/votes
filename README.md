@@ -42,7 +42,9 @@ exactly those the results list), and the results against the rows and
 the tags. It prints a JSON report or fails with the first check that
 didn't hold. The report's `status` is `open` (before the close in force
 plus a minute), `closed` (after it, with no results published: not yet,
-or withheld), or `counted` (with the tally and counts); `hashes` are
+or withheld), or `counted` (with the tally and counts, among them `unhandled`: messages
+from before the close the count went ahead without, each of which may
+have held a ballot); `hashes` are
 each document's SHA-256, for readers to compare what they were served;
 `partial` names a document whose signature or bundle is there without
 it (an upload not finished). Only a 404 is taken as not published.

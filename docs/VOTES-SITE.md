@@ -1,8 +1,8 @@
 # votes.vettid.org
 
-**Status:** 0.2.1 (2026-10-29), draft. The protocol this site serves is
+**Status:** 0.2.2 (2026-10-30), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
-(0.10.0); its §3.3 is this site's contract and §8.5 has the document
+(0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
 and this document is corrected.
 
@@ -128,6 +128,9 @@ function logs ids, types, sizes and error codes.
 
 ## Changes
 
+- **0.2.2 (2026-10-30):** follows BALLOT-PROTOCOL 0.11.0: the results'
+  counts have `unhandled`, which the upload API requires (a results
+  document without it is refused as `bad_document`).
 - **0.2.1 (2026-10-29):** the code's rules: bundles are checked with
   Sigstore's own verifier and held to the profile; a proposal may be
   published until its close; extensions not after their close or the

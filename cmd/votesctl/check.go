@@ -88,6 +88,9 @@ type results struct {
 	Eligible int64            `json:"eligible"`
 	Ballots  int64            `json:"ballots"`
 	Removed  int64            `json:"removed"`
+	// Unhandled: messages from before the close the count went ahead
+	// without (BALLOT-PROTOCOL §7); each may have held a ballot.
+	Unhandled int64 `json:"unhandled"`
 }
 
 // checkVote checks one proposal on a site and writes the report.
@@ -118,7 +121,8 @@ func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *si
 		out.Status = "closed"
 	}
 	if r := rep.Results; r != nil {
-		out.Results = &results{Tally: r.Tally, Eligible: r.Counts.Eligible, Ballots: r.Counts.Ballots, Removed: r.Counts.Removed}
+		out.Results = &results{Tally: r.Tally, Eligible: r.Counts.Eligible, Ballots: r.Counts.Ballots, Removed: r.Counts.Removed,
+			Unhandled: r.Counts.Unhandled}
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
