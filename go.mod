@@ -13,7 +13,7 @@ require (
 	github.com/aws/smithy-go v1.28.7
 	github.com/sigstore/sigstore v1.10.8
 	github.com/sigstore/sigstore-go v1.3.0
-	github.com/vettid/service-vault v0.0.0-20261030095216-4784f69c7866
+	github.com/vettid/service-vault v0.0.0-20261030171536-5d4b5ea2b428
 	github.com/vettid/vettid-vault v0.0.0-20261029162102-214b88f531e6
 )
 
