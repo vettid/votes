@@ -95,10 +95,10 @@ environment. None has a default.
    `v1/services.json`. Publish it with
    `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`.
    A list that drops anything the published one had is refused, and so
-   is one outside BALLOT-PROTOCOL §3.3's bounds (64 services, 16
-   identity keys and 16 anchor keys each, a name of 1–100 bytes,
-   262,144 bytes in all); one interrupted half-way is finished by
-   running the same command again.
+   is one outside BALLOT-PROTOCOL §3.3's bounds (a name of 1–100 bytes,
+   4,194,304 bytes in all; the number of services and keys is not
+   limited, since the list only grows); one interrupted half-way is
+   finished by running the same command again.
 
 ## License
 

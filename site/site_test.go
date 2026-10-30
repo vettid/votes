@@ -511,7 +511,7 @@ func TestServiceListBounds(t *testing.T) {
 		_, err := ParseServiceList(b, s, pub)
 		return err
 	}
-	ik := func(i int) []byte { k := bytes.Repeat([]byte{byte(i)}, 32); k[0] = 0xee; return k }
+	ik := func(i int) []byte { k := bytes.Repeat([]byte{byte(i)}, 32); k[0], k[1] = 0xee, byte(i>>8); return k }
 	services := func(n int) func(*ServiceList) {
 		return func(l *ServiceList) {
 			for i := len(l.Services); i < n; i++ {
@@ -522,7 +522,7 @@ func TestServiceListBounds(t *testing.T) {
 	iks := func(n int) func(*ServiceList) {
 		return func(l *ServiceList) {
 			for i := len(l.Services[0].IKs); i < n; i++ {
-				l.Services[0].IKs = append(l.Services[0].IKs, ik(100+i))
+				l.Services[0].IKs = append(l.Services[0].IKs, ik(1000+i))
 			}
 		}
 	}
@@ -538,15 +538,13 @@ func TestServiceListBounds(t *testing.T) {
 		f   func(*ServiceList)
 		why string // in the refusal; "" for accepted
 	}{
-		"64 services":      {services(MaxServices), ""},
-		"65 services":      {services(MaxServices + 1), "too many services"},
-		"16 identity keys": {iks(MaxServiceKeys), ""},
-		"17 identity keys": {iks(MaxServiceKeys + 1), "too many keys"},
-		"16 anchor keys":   {anchors(MaxServiceKeys), ""},
-		"17 anchor keys":   {anchors(MaxServiceKeys + 1), "too many keys"},
-		"a 100-byte name":  {name(strings.Repeat("é", 50)), ""},
-		"a 101-byte name":  {name(strings.Repeat("é", 50) + "x"), "name"},
-		"an empty name":    {name(""), "name"},
+		// No limit on the number of services or keys: the list only grows.
+		"500 services":      {services(500), ""},
+		"100 identity keys": {iks(100), ""},
+		"100 anchor keys":   {anchors(100), ""},
+		"a 100-byte name":   {name(strings.Repeat("é", 50)), ""},
+		"a 101-byte name":   {name(strings.Repeat("é", 50) + "x"), "name"},
+		"an empty name":     {name(""), "name"},
 	} {
 		l := f.list()
 		c.f(l)

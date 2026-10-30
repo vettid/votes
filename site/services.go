@@ -32,11 +32,10 @@ type Service struct {
 	AnchorKeys []AnchorKey `json:"anchor_keys"`
 }
 
-// Bounds of the service list (BALLOT-PROTOCOL §3.3).
+// Bounds of the service list (BALLOT-PROTOCOL §3.3). The list only
+// grows, so there is no limit on the number of services or keys.
 const (
-	MaxServiceList = 256 << 10 // services.json, in bytes
-	MaxServices    = 64
-	MaxServiceKeys = 16 // identity keys, and anchor keys, per service
+	MaxServiceList = 4 << 20 // services.json, in bytes
 	MaxServiceName = 100
 )
 
@@ -85,9 +84,6 @@ func ParseServiceList(data, sig []byte, siteKey ed25519.PublicKey) (*ServiceList
 	if l.Services == nil {
 		return nil, errors.New("site: the service list has no services array")
 	}
-	if len(l.Services) > MaxServices {
-		return nil, errors.New("site: the service list has too many services")
-	}
 	ids, iks := map[string]bool{}, map[string]bool{}
 	for _, s := range l.Services {
 		if err := s.check(); err != nil {
@@ -116,9 +112,6 @@ func (s *Service) check() error {
 	}
 	if s.Name == "" || len(s.Name) > MaxServiceName || !utf8.ValidString(s.Name) {
 		return fmt.Errorf("site: service %s: name", s.ServiceID)
-	}
-	if len(s.IKs) > MaxServiceKeys || len(s.AnchorKeys) > MaxServiceKeys {
-		return fmt.Errorf("site: service %s: too many keys", s.ServiceID)
 	}
 	for i, k := range s.IKs {
 		if len(k) != vote.VKLen {
