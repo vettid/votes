@@ -45,7 +45,7 @@ All under `https://votes.vettid.org/v1/`.
 | Path | Contents | Cache |
 |---|---|---|
 | `services.json`, `.sig` | The service list and the site's signature (BALLOT-PROTOCOL §3.3, §8.5) | 5 min |
-| `index.json` | Proposals open or closed within the last 30 days: `[{proposal_id, service_id, proposal_hash, opens_at, closes_at, extended, published}]`, by `opens_at` | 60 s |
+| `index.json` | Proposals open or closed within the last 30 days: `[{proposal_id, service_id, proposal_hash, opens_at, closes_at, extended, published, unhandled?}]`, by `opens_at`; `unhandled` is the results' `counts.unhandled`, once they are published | 60 s |
 | `archive/<YYYY-MM>.json` | Every proposal by the month of `opens_at`, same entries | 60 s |
 | `p/<proposal_id>/proposal.json`, `.sig`, `.sigstore.json` | The proposal, `proposal_sig` (raw 64 bytes), its anchor bundle | 1 year, immutable |
 | `p/<proposal_id>/extension-<n>.json`, `.sig`, `.sigstore.json` | An extension | 1 year, immutable |

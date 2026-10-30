@@ -200,8 +200,15 @@ func TestVote(t *testing.T) {
 	want(t, "results", code, why, 201, "")
 	code, why = post(t, s, "results", &f.Results)
 	want(t, "results again", code, why, 200, "")
-	if es := index(t, st); !es[0].Published {
-		t.Fatal("index: not published")
+	res, err := vote.ParseResults(f.Results.Doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if es := index(t, st); !es[0].Published || es[0].Unhandled == nil || *es[0].Unhandled != res.Counts.Unhandled {
+		t.Fatal("index: not published, or without the results' unhandled")
+	}
+	if !bytes.Contains(st.Objects[archivePath(f.p.OpensAt)], []byte(`"unhandled":`)) {
+		t.Fatal("archive: without unhandled")
 	}
 	if !bytes.Equal(st.Objects["v1/p/"+testID+"/rows.json"], f.Rows) {
 		t.Fatal("rows not published")
