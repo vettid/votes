@@ -90,6 +90,9 @@ func TestCheckCommand(t *testing.T) {
 	if err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	if !bytes.Contains(out.Bytes(), []byte(`"unhandled": 0`)) {
+		t.Fatalf("no unhandled in the report: %s", out.Bytes())
+	}
 	var rep report
 	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
 		t.Fatal(err)
