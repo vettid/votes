@@ -5,7 +5,9 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -21,11 +23,15 @@ import (
 // trusted root, at its timestamp; the stdlib checks are the service
 // vault's own test.
 func TestAnchorVector(t *testing.T) {
-	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/vettid/service-vault").Output()
-	if err != nil {
-		t.Fatalf("go list: %v", err)
+	var stderr bytes.Buffer
+	cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/vettid/service-vault")
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	dir := strings.TrimSpace(string(out))
+	if err != nil || dir == "" {
+		t.Fatalf("go list: %v: %s", err, stderr.String())
 	}
-	raw, err := os.ReadFile(filepath.Join(strings.TrimSpace(string(out)), "vote", "testdata", "anchor-vector.json"))
+	raw, err := os.ReadFile(filepath.Join(dir, "vote", "testdata", "anchor-vector.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,6 +63,27 @@ func TestAnchorVector(t *testing.T) {
 	other, _ := x509.MarshalPKIXPublicKey(&k.PublicKey)
 	if _, err := a.Verify(v.Bundle, doc, other); err == nil {
 		t.Error("another key verified")
+	}
+	// Another key the bundle names: Sigstore's verifier refuses it, not
+	// only the hint check.
+	h := sha256.Sum256(v.AnchorKey)
+	renamed := bytes.Replace(v.Bundle, []byte(base64.StdEncoding.EncodeToString(h[:])), []byte(Hint(other)), 1)
+	if bytes.Equal(renamed, v.Bundle) {
+		t.Fatal("no hint to rewrite")
+	}
+	if _, err := a.Verify(renamed, doc, other); err == nil {
+		t.Error("another key, named by the bundle, verified")
+	}
+	// The RFC 3161 timestamp is required.
+	var bm, vm map[string]json.RawMessage
+	if json.Unmarshal(v.Bundle, &bm) != nil || json.Unmarshal(bm["verificationMaterial"], &vm) != nil || vm["timestampVerificationData"] == nil {
+		t.Fatal("bundle: no timestampVerificationData")
+	}
+	delete(vm, "timestampVerificationData")
+	bm["verificationMaterial"], _ = json.Marshal(vm)
+	noTS, _ := json.Marshal(bm)
+	if _, err := a.Verify(noTS, doc, v.AnchorKey); err == nil {
+		t.Error("a bundle without a timestamp verified")
 	}
 	bad := bytes.Replace(v.Bundle, []byte(`"integratedTime": "`), []byte(`"integratedTime": "1`), 1)
 	if bytes.Equal(bad, v.Bundle) {
