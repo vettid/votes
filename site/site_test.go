@@ -526,6 +526,13 @@ func TestServiceListBounds(t *testing.T) {
 			}
 		}
 	}
+	anchors := func(n int) func(*ServiceList) {
+		return func(l *ServiceList) {
+			for len(l.Services[0].AnchorKeys) < n {
+				l.Services[0].AnchorKeys = append(l.Services[0].AnchorKeys, l.Services[0].AnchorKeys[0])
+			}
+		}
+	}
 	name := func(s string) func(*ServiceList) { return func(l *ServiceList) { l.Services[0].Name = s } }
 	for what, c := range map[string]struct {
 		f   func(*ServiceList)
@@ -534,6 +541,7 @@ func TestServiceListBounds(t *testing.T) {
 		// No limit on the number of services or keys: the list only grows.
 		"500 services":      {services(500), ""},
 		"100 identity keys": {iks(100), ""},
+		"100 anchor keys":   {anchors(100), ""},
 		"a 100-byte name":   {name(strings.Repeat("é", 50)), ""},
 		"a 101-byte name":   {name(strings.Repeat("é", 50) + "x"), "name"},
 		"an empty name":     {name(""), "name"},
