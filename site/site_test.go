@@ -500,6 +500,71 @@ func TestServiceListStrict(t *testing.T) {
 	}
 }
 
+// The service list's bounds (BALLOT-PROTOCOL §3.3).
+func TestServiceListBounds(t *testing.T) {
+	f := loadFixture(t)
+	pub := siteKey().Public().(ed25519.PublicKey)
+	parse := func(l *ServiceList) error {
+		b, _ := json.Marshal(l)
+		b, _ = vote.Canonicalize(b)
+		s, _ := suite.Sign(siteKey(), vote.LabelServiceList, sha(b))
+		_, err := ParseServiceList(b, s, pub)
+		return err
+	}
+	ik := func(i int) []byte { k := bytes.Repeat([]byte{byte(i)}, 32); k[0] = 0xee; return k }
+	services := func(n int) func(*ServiceList) {
+		return func(l *ServiceList) {
+			for i := len(l.Services); i < n; i++ {
+				l.Services = append(l.Services, Service{ServiceID: ServiceID(ik(i)), Name: "S", IKs: [][]byte{ik(i)}, AnchorKeys: []AnchorKey{}})
+			}
+		}
+	}
+	iks := func(n int) func(*ServiceList) {
+		return func(l *ServiceList) {
+			for i := len(l.Services[0].IKs); i < n; i++ {
+				l.Services[0].IKs = append(l.Services[0].IKs, ik(100+i))
+			}
+		}
+	}
+	anchors := func(n int) func(*ServiceList) {
+		return func(l *ServiceList) {
+			for len(l.Services[0].AnchorKeys) < n {
+				l.Services[0].AnchorKeys = append(l.Services[0].AnchorKeys, l.Services[0].AnchorKeys[0])
+			}
+		}
+	}
+	name := func(s string) func(*ServiceList) { return func(l *ServiceList) { l.Services[0].Name = s } }
+	for what, c := range map[string]struct {
+		f   func(*ServiceList)
+		why string // in the refusal; "" for accepted
+	}{
+		"64 services":      {services(MaxServices), ""},
+		"65 services":      {services(MaxServices + 1), "too many services"},
+		"16 identity keys": {iks(MaxServiceKeys), ""},
+		"17 identity keys": {iks(MaxServiceKeys + 1), "too many keys"},
+		"16 anchor keys":   {anchors(MaxServiceKeys), ""},
+		"17 anchor keys":   {anchors(MaxServiceKeys + 1), "too many keys"},
+		"a 100-byte name":  {name(strings.Repeat("é", 50)), ""},
+		"a 101-byte name":  {name(strings.Repeat("é", 50) + "x"), "name"},
+		"an empty name":    {name(""), "name"},
+	} {
+		l := f.list()
+		c.f(l)
+		err := parse(l)
+		if c.why == "" && err != nil || c.why != "" && (err == nil || !strings.Contains(err.Error(), c.why)) {
+			t.Errorf("%s: %v", what, err)
+		}
+	}
+	// At the size limit the list gets past the size check (to fail on its
+	// signature); one byte over, it doesn't.
+	if _, err := ParseServiceList(make([]byte, MaxServiceList), nil, pub); err == nil || strings.Contains(err.Error(), "too large") {
+		t.Fatalf("at the limit: %v", err)
+	}
+	if _, err := ParseServiceList(make([]byte, MaxServiceList+1), nil, pub); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("oversized: %v", err)
+	}
+}
+
 // A new service list must extend the published one.
 func TestExtends(t *testing.T) {
 	f := loadFixture(t)

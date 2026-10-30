@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/vettid/service-vault/vote"
 )
@@ -31,6 +32,14 @@ type Service struct {
 	AnchorKeys []AnchorKey `json:"anchor_keys"`
 }
 
+// Bounds of the service list (BALLOT-PROTOCOL §3.3).
+const (
+	MaxServiceList = 256 << 10 // services.json, in bytes
+	MaxServices    = 64
+	MaxServiceKeys = 16 // identity keys, and anchor keys, per service
+	MaxServiceName = 100
+)
+
 // ServiceList is the list as published.
 type ServiceList struct {
 	V        int64     `json:"v"`
@@ -48,6 +57,9 @@ func ServiceID(firstIK []byte) string {
 // ParseServiceList checks the list's signature under siteKey, its exact
 // canonical bytes, and every entry, and returns it.
 func ParseServiceList(data, sig []byte, siteKey ed25519.PublicKey) (*ServiceList, error) {
+	if len(data) > MaxServiceList {
+		return nil, errors.New("site: the service list is too large")
+	}
 	if vote.Verify(siteKey, vote.LabelServiceList, sha(data), sig) != nil {
 		return nil, errors.New("site: the service list's signature fails")
 	}
@@ -72,6 +84,9 @@ func ParseServiceList(data, sig []byte, siteKey ed25519.PublicKey) (*ServiceList
 	}
 	if l.Services == nil {
 		return nil, errors.New("site: the service list has no services array")
+	}
+	if len(l.Services) > MaxServices {
+		return nil, errors.New("site: the service list has too many services")
 	}
 	ids, iks := map[string]bool{}, map[string]bool{}
 	for _, s := range l.Services {
@@ -98,6 +113,12 @@ func (s *Service) check() error {
 	}
 	if len(s.IKs) == 0 || s.ServiceID != ServiceID(s.IKs[0]) {
 		return fmt.Errorf("site: service %q: id", s.ServiceID)
+	}
+	if s.Name == "" || len(s.Name) > MaxServiceName || !utf8.ValidString(s.Name) {
+		return fmt.Errorf("site: service %s: name", s.ServiceID)
+	}
+	if len(s.IKs) > MaxServiceKeys || len(s.AnchorKeys) > MaxServiceKeys {
+		return fmt.Errorf("site: service %s: too many keys", s.ServiceID)
 	}
 	for i, k := range s.IKs {
 		if len(k) != vote.VKLen {
