@@ -1,7 +1,9 @@
 package site
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -15,8 +17,11 @@ import (
 // published, through the upload API's document checks on an empty store,
 // each with the clock at its anchor's time. Timing is so checked as
 // anchored (timestamped) time, which is what the files can show; that a
-// document was also uploaded in time is the live site's word. The
-// request-level limits of the upload API (sizes) are not re-checked.
+// document was also uploaded in time is the live site's word. The upload
+// API's request-level rules (parts and sizes) are applied too. The index
+// and the month's archive are compared with what the documents show;
+// a difference is reported, not refused, since the lists are rewritten
+// after a document is published and may lag behind a failed upload.
 
 // Fetcher reads one published object by path (v1/...): nil, nil when it
 // isn't published.
@@ -43,6 +48,9 @@ type Report struct {
 	// Partial names documents whose signature, bundle or rows are
 	// published without the document: an upload not finished.
 	Partial []string
+	// Listing names each way index.json or the month's archive differs
+	// from the documents ("archive: missing", "index: closes_at", …).
+	Listing []string
 
 	serviceIK []byte
 }
@@ -50,8 +58,9 @@ type Report struct {
 // ErrNotPublished is a proposal the site doesn't serve.
 var ErrNotPublished = errors.New("site: the proposal isn't published")
 
-// Check checks proposal id as served by fetch, under the site's key.
-func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte, id string) (*Report, error) {
+// Check checks proposal id as served by fetch, under the site's key, at
+// now (for whether the index may have dropped it).
+func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte, id string, now time.Time) (*Report, error) {
 	if !vote.ValidProposalID(id) {
 		return nil, errors.New("site: not a proposal id")
 	}
@@ -99,6 +108,20 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 			if u.Rows, err = fetch(ctx, "v1/p/"+id+"/rows.json"); err != nil {
 				return true, err
 			}
+		}
+		if _, code := uploadShape(name, u); code != "" {
+			return true, fmt.Errorf("%s: an upload the site should have refused (%s)", name, code)
+		}
+		// The request it would take, at its smallest: the API measured
+		// the body as sent, so this is never more.
+		var body bytes.Buffer
+		enc := json.NewEncoder(&body)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(u); err != nil {
+			return true, fmt.Errorf("%s: an upload the site should have refused (bad_request)", name)
+		}
+		if body.Len()-1 > MaxUpload {
+			return true, fmt.Errorf("%s: an upload the site should have refused (too_large)", name)
 		}
 		// The anchor's time, under the anchor key of the document's
 		// service: the proposal names it, and the rest are its.
@@ -170,7 +193,68 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 			return nil, err
 		}
 	}
+	// The entry, as the site would have it after these uploads: from the
+	// archive, which isn't pruned (results may be anchored long after the
+	// close, and their index update drops the vote).
+	var es []IndexEntry
+	if err := json.Unmarshal(mem.Objects[archivePath(p.OpensAt)], &es); err != nil || len(es) != 1 {
+		return nil, fmt.Errorf("site: the check's own archive: %v", err)
+	}
+	for _, l := range []struct {
+		name, path string
+		pruned     bool
+	}{{"index", indexPath, true}, {"archive", archivePath(p.OpensAt), false}} {
+		b, err := fetch(ctx, l.path)
+		if err != nil {
+			return nil, err
+		}
+		rep.Listing = append(rep.Listing, compareListing(l.name, b, es[0], l.pruned, now)...)
+	}
 	return rep, nil
+}
+
+// compareListing compares a served list with the entry the documents
+// show. A pruned list (the index) may lack an entry that closed more than
+// IndexWindow before now.
+func compareListing(name string, served []byte, want IndexEntry, pruned bool, now time.Time) []string {
+	if served == nil {
+		return []string{name + ": not published"}
+	}
+	var es []IndexEntry
+	if err := json.Unmarshal(served, &es); err != nil {
+		return []string{name + ": not a list of entries"}
+	}
+	var got *IndexEntry
+	for i := range es {
+		if es[i].ProposalID == want.ProposalID {
+			if got != nil {
+				return []string{name + ": listed twice"}
+			}
+			got = &es[i]
+		}
+	}
+	if got == nil {
+		if pruned && want.ClosesAt < now.Add(-IndexWindow).Unix() {
+			return nil
+		}
+		return []string{name + ": missing"}
+	}
+	var out []string
+	diff := func(field string, same bool) {
+		if !same {
+			out = append(out, name+": "+field)
+		}
+	}
+	diff("service_id", got.ServiceID == want.ServiceID)
+	diff("proposal_hash", bytes.Equal(got.ProposalHash, want.ProposalHash))
+	diff("opens_at", got.OpensAt == want.OpensAt)
+	diff("closes_at", got.ClosesAt == want.ClosesAt)
+	diff("extended", got.Extended == want.Extended)
+	diff("published", got.Published == want.Published)
+	// An entry from before the site listed unhandled lacks it: only a
+	// value that differs is reported.
+	diff("unhandled", got.Unhandled == nil || want.Unhandled != nil && *got.Unhandled == *want.Unhandled)
+	return out
 }
 
 // serviceOf is the identity key of a document's service: the proposal's

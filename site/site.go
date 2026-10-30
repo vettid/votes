@@ -97,20 +97,12 @@ func (s *Site) upload(w http.ResponseWriter, r *http.Request) {
 	var u Upload
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
-	if dec.Decode(&u) != nil || len(u.Doc) == 0 || len(u.Sig) != vote.SigLen || len(u.Bundle) == 0 || len(u.Bundle) > maxBundle {
+	if dec.Decode(&u) != nil {
 		writeError(w, http.StatusBadRequest, "bad_request")
 		return
 	}
-	limit := map[bool]int{true: maxProposal, false: maxExtension}[name == "proposal"]
-	if name == "results" {
-		limit = maxResults
-	}
-	if name != "results" && u.Rows != nil {
-		writeError(w, http.StatusBadRequest, "bad_request")
-		return
-	}
-	if len(u.Doc) > limit {
-		writeError(w, http.StatusRequestEntityTooLarge, "too_large")
+	if status, code := uploadShape(name, &u); status != 0 {
+		writeError(w, status, code)
 		return
 	}
 	var created bool
@@ -405,6 +397,24 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 		}
 		return es
 	}, p.OpensAt)
+}
+
+// uploadShape applies the upload's request-level rules to a decoded
+// upload of a document called name: the parts present, the signature's
+// length and each part's size limit. It returns 0 when they hold.
+func uploadShape(name string, u *Upload) (status int, code string) {
+	if len(u.Doc) == 0 || len(u.Sig) != vote.SigLen || len(u.Bundle) == 0 || len(u.Bundle) > maxBundle ||
+		name != "results" && u.Rows != nil {
+		return http.StatusBadRequest, "bad_request"
+	}
+	limit := map[bool]int{true: maxProposal, false: maxExtension}[name == "proposal"]
+	if name == "results" {
+		limit = maxResults
+	}
+	if len(u.Doc) > limit {
+		return http.StatusRequestEntityTooLarge, "too_large"
+	}
+	return 0, ""
 }
 
 // write publishes a checked document: its signature, bundle and any rows

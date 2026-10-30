@@ -3,9 +3,13 @@ package site
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 // published runs the fixture's vote through the site, as it was
@@ -37,7 +41,7 @@ func fetcher(objs map[string][]byte) Fetcher {
 func check(t *testing.T, f *fixture, objs map[string][]byte, id string) (*Report, error) {
 	t.Helper()
 	s, _ := newSite(t, f, f.during())
-	return Check(context.Background(), fetcher(objs), s.Anchors, s.SiteKey, id)
+	return Check(context.Background(), fetcher(objs), s.Anchors, s.SiteKey, id, f.closed())
 }
 
 // A published vote checks from the site's files alone; one whose files
@@ -102,5 +106,79 @@ func TestCheckOpenAndUnknown(t *testing.T) {
 	}
 	if _, err := check(t, f, objs, "01KC0000000000000000000002"); !errors.Is(err, ErrNotPublished) {
 		t.Fatalf("unknown: %v", err)
+	}
+}
+
+// The index and the archive are compared with the documents: a
+// difference is reported, not a failed check.
+func TestCheckListing(t *testing.T) {
+	f := loadFixture(t)
+	objs := published(t, f, true)
+	rep, err := check(t, f, objs, testID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Listing) != 0 {
+		t.Fatalf("listing differences on a published vote: %v", rep.Listing)
+	}
+	edit := func(path string, change func(*IndexEntry)) map[string][]byte {
+		o := maps.Clone(objs)
+		var es []IndexEntry
+		if err := json.Unmarshal(o[path], &es); err != nil || len(es) != 1 {
+			t.Fatalf("%s: %v", path, err)
+		}
+		change(&es[0])
+		o[path], _ = json.Marshal(es)
+		return o
+	}
+	for name, c := range map[string]struct {
+		objs map[string][]byte
+		want string
+	}{
+		"closes_at":         {edit(indexPath, func(e *IndexEntry) { e.ClosesAt++ }), "index: closes_at"},
+		"unhandled":         {edit(indexPath, func(e *IndexEntry) { n := *e.Unhandled + 1; e.Unhandled = &n }), "index: unhandled"},
+		"published":         {edit(archivePath(f.p.OpensAt), func(e *IndexEntry) { e.Published = false }), "archive: published"},
+		"missing":           {edit(archivePath(f.p.OpensAt), func(e *IndexEntry) { e.ProposalID = "01KC0000000000000000000002" }), "archive: missing"},
+		"archive not there": {func() map[string][]byte { o := maps.Clone(objs); delete(o, archivePath(f.p.OpensAt)); return o }(), "archive: not published"},
+	} {
+		rep, err := check(t, f, c.objs, testID)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !slices.Contains(rep.Listing, c.want) {
+			t.Fatalf("%s: listing %v, want %q", name, rep.Listing, c.want)
+		}
+	}
+	// An entry from before the site listed unhandled lacks it.
+	if rep, err := check(t, f, edit(indexPath, func(e *IndexEntry) { e.Unhandled = nil }), testID); err != nil || len(rep.Listing) != 0 {
+		t.Fatalf("an entry without unhandled: %v %v", rep, err)
+	}
+	// Long after the close, the index may have dropped it.
+	o := edit(indexPath, func(e *IndexEntry) { e.ProposalID = "01KC0000000000000000000002" })
+	s, _ := newSite(t, f, f.during())
+	later := f.closed().Add(IndexWindow + time.Hour)
+	if rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, later); err != nil || len(rep.Listing) != 0 {
+		t.Fatalf("an index past its window: %v %v", rep, err)
+	}
+	if rep, err := check(t, f, o, testID); err != nil || !slices.Contains(rep.Listing, "index: missing") {
+		t.Fatalf("an index missing an entry in its window: %v %v", rep, err)
+	}
+}
+
+// The upload API's request rules are applied: a part the site should have
+// refused fails the check.
+func TestCheckUploadRules(t *testing.T) {
+	f := loadFixture(t)
+	objs := published(t, f, true)
+	o := maps.Clone(objs)
+	b := "v1/p/" + testID + "/proposal.json.sigstore.json"
+	o[b] = append(bytes.Clone(o[b]), bytes.Repeat([]byte(" "), maxBundle)...)
+	if _, err := check(t, f, o, testID); err == nil || !strings.Contains(err.Error(), "should have refused (bad_request)") {
+		t.Fatalf("an oversized bundle: %v", err)
+	}
+	o = maps.Clone(objs)
+	o["v1/p/"+testID+"/results.json.sig"] = []byte("short")
+	if _, err := check(t, f, o, testID); err == nil || !strings.Contains(err.Error(), "should have refused") {
+		t.Fatalf("a short signature: %v", err)
 	}
 }
