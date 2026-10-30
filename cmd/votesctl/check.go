@@ -81,6 +81,10 @@ type report struct {
 	Results *results          `json:"results"` // null until counted
 	Hashes  map[string]string `json:"hashes"`  // hex SHA-256, to compare with other readers
 	Partial []string          `json:"partial,omitempty"`
+	// Listing: where index.json or the month's archive differs from the
+	// documents. Not a failed check: the lists are rewritten after a
+	// document is published, and may lag behind an upload not finished.
+	Listing []string `json:"listing,omitempty"`
 }
 
 type results struct {
@@ -88,7 +92,7 @@ type results struct {
 	Eligible int64            `json:"eligible"`
 	Ballots  int64            `json:"ballots"`
 	Removed  int64            `json:"removed"`
-	// Unhandled: messages from before the close the count went ahead
+	// Unhandled: messages of the voting window the count went ahead
 	// without (BALLOT-PROTOCOL §7); each may have held a ballot.
 	Unhandled int64 `json:"unhandled"`
 }
@@ -99,13 +103,14 @@ func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *si
 	if err != nil || len(key) != ed25519.PublicKeySize {
 		return errors.New("-site-key: the site's public key, base64 of 32 bytes")
 	}
-	rep, err := site.Check(ctx, fetch, anchors, key, id)
+	rep, err := site.Check(ctx, fetch, anchors, key, id, now)
 	if err != nil {
 		return err
 	}
 	out := report{OK: true, ProposalID: rep.ProposalID, ServiceID: rep.ServiceID, ServiceName: rep.ServiceName,
 		Title: rep.Title, Eligible: rep.Eligible, OpensAt: rep.OpensAt, ClosesAt: rep.ClosesAt,
-		Extensions: rep.Extensions, Anchored: map[string]string{}, Hashes: map[string]string{}, Partial: rep.Partial}
+		Extensions: rep.Extensions, Anchored: map[string]string{}, Hashes: map[string]string{}, Partial: rep.Partial,
+		Listing: rep.Listing}
 	for name, ts := range rep.Anchored {
 		out.Anchored[name] = ts.UTC().Format(time.RFC3339)
 	}

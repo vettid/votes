@@ -38,16 +38,22 @@ anchor in Rekor under the service's registered anchor key, the timing as
 anchored (the proposal and each extension timestamped before the close
 they precede, the results after collection ended; when each was uploaded
 is the site's word), the extensions (numbered without gaps, 24 at most,
-exactly those the results list), and the results against the rows and
-the tags. It prints a JSON report or fails with the first check that
+exactly those the results list), the results against the rows and
+the tags, and the upload API's request rules (each part present, the
+signature's length, the size limits). It prints a JSON report or fails with the first check that
 didn't hold. The report's `status` is `open` (before the close in force
 plus a minute), `closed` (after it, with no results published: not yet,
 or withheld), or `counted` (with the tally and counts, among them `unhandled`: messages
-from before the close the count went ahead without, each of which may
+of the voting window the count went ahead without, each of which may
 have held a ballot); `hashes` are
 each document's SHA-256, for readers to compare what they were served;
 `partial` names a document whose signature or bundle is there without
-it (an upload not finished). Only a 404 is taken as not published.
+it (an upload not finished); `listing` names each way `index.json` or
+the month's archive differs from the documents (such as
+`index: closes_at` or `archive: missing`; the index may drop a vote 30
+days after its close). A `listing` entry doesn't fail the check: the
+lists are rewritten after each document, and may lag behind an upload
+not finished. Only a 404 is taken as not published.
 `-trusted-root <file>` uses a Sigstore trusted root file instead of
 fetching it.
 
