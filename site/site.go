@@ -396,10 +396,11 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 	if err != nil {
 		return false, err
 	}
+	unhandled := res.Counts.Unhandled
 	return created, s.index(ctx, func(es []IndexEntry) []IndexEntry {
 		for i := range es {
 			if es[i].ProposalID == id {
-				es[i].Published = true
+				es[i].Published, es[i].Unhandled = true, &unhandled
 			}
 		}
 		return es
@@ -485,6 +486,10 @@ type IndexEntry struct {
 	ClosesAt     int64  `json:"closes_at"` // as extended
 	Extended     int    `json:"extended"`  // the number of extensions
 	Published    bool   `json:"published"` // the results
+	// Unhandled is the results' counts.unhandled, once they are published:
+	// messages the count went ahead without (BALLOT-PROTOCOL §7), for
+	// readers to weigh without fetching the results.
+	Unhandled *int64 `json:"unhandled,omitempty"`
 }
 
 // index applies change to the index and to the month's archive, each
