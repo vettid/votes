@@ -114,6 +114,22 @@ func TestPublishServices(t *testing.T) {
 	if got, _ := get(ctx, c, bucket, "v1/services.json"); !bytes.Equal(got.data, data) {
 		t.Fatal("the current list moved")
 	}
+	if got, _ := get(ctx, c, bucket, "v1/services/3.json"); got.data != nil {
+		t.Fatal("a copy of a list that was never current")
+	}
+	// Versions are consecutive.
+	v4 := list(4, h2[:], svc, site.Service{ServiceID: site.ServiceID(ik2), Name: "B2", IKs: [][]byte{ik2}, AnchorKeys: []site.AnchorKey{}})
+	if err := publishList(ctx, c, bucket, key, v4); err == nil || !strings.Contains(err.Error(), "next version is 3") {
+		t.Fatalf("a version gap: %v", err)
+	}
+	// A missing signature copy of the current list is restored too.
+	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("v1/services/2.json.sig")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishList(ctx, c, bucket, key, v2); err != nil {
+		t.Fatal(err)
+	}
+	kept(2, data)
 
 	// A stale write is refused: another publish moved the list.
 	if err := put(ctx, c, bucket, "v1/services.json", v1, "application/json", cur.tag); err == nil {
