@@ -535,24 +535,30 @@ func TestServiceListBounds(t *testing.T) {
 	}
 	name := func(s string) func(*ServiceList) { return func(l *ServiceList) { l.Services[0].Name = s } }
 	for what, c := range map[string]struct {
-		f  func(*ServiceList)
-		ok bool
+		f   func(*ServiceList)
+		why string // in the refusal; "" for accepted
 	}{
-		"64 services":      {services(MaxServices), true},
-		"65 services":      {services(MaxServices + 1), false},
-		"16 identity keys": {iks(MaxServiceKeys), true},
-		"17 identity keys": {iks(MaxServiceKeys + 1), false},
-		"16 anchor keys":   {anchors(MaxServiceKeys), true},
-		"17 anchor keys":   {anchors(MaxServiceKeys + 1), false},
-		"a 100-byte name":  {name(strings.Repeat("é", 50)), true},
-		"a 101-byte name":  {name(strings.Repeat("é", 50) + "x"), false},
-		"an empty name":    {name(""), false},
+		"64 services":      {services(MaxServices), ""},
+		"65 services":      {services(MaxServices + 1), "too many services"},
+		"16 identity keys": {iks(MaxServiceKeys), ""},
+		"17 identity keys": {iks(MaxServiceKeys + 1), "too many keys"},
+		"16 anchor keys":   {anchors(MaxServiceKeys), ""},
+		"17 anchor keys":   {anchors(MaxServiceKeys + 1), "too many keys"},
+		"a 100-byte name":  {name(strings.Repeat("é", 50)), ""},
+		"a 101-byte name":  {name(strings.Repeat("é", 50) + "x"), "name"},
+		"an empty name":    {name(""), "name"},
 	} {
 		l := f.list()
 		c.f(l)
-		if err := parse(l); (err == nil) != c.ok {
+		err := parse(l)
+		if c.why == "" && err != nil || c.why != "" && (err == nil || !strings.Contains(err.Error(), c.why)) {
 			t.Errorf("%s: %v", what, err)
 		}
+	}
+	// At the size limit the list gets past the size check (to fail on its
+	// signature); one byte over, it doesn't.
+	if _, err := ParseServiceList(make([]byte, MaxServiceList), nil, pub); err == nil || strings.Contains(err.Error(), "too large") {
+		t.Fatalf("at the limit: %v", err)
 	}
 	if _, err := ParseServiceList(make([]byte, MaxServiceList+1), nil, pub); err == nil || !strings.Contains(err.Error(), "too large") {
 		t.Fatalf("oversized: %v", err)
