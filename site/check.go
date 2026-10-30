@@ -112,7 +112,15 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		if _, code := uploadShape(name, u); code != "" {
 			return true, fmt.Errorf("%s: an upload the site should have refused (%s)", name, code)
 		}
-		if body, err := json.Marshal(u); err != nil || len(body) > MaxUpload {
+		// The request it would take, at its smallest: the API measured
+		// the body as sent, so this is never more.
+		var body bytes.Buffer
+		enc := json.NewEncoder(&body)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(u); err != nil {
+			return true, fmt.Errorf("%s: an upload the site should have refused (bad_request)", name)
+		}
+		if body.Len()-1 > MaxUpload {
 			return true, fmt.Errorf("%s: an upload the site should have refused (too_large)", name)
 		}
 		// The anchor's time, under the anchor key of the document's
@@ -185,11 +193,12 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 			return nil, err
 		}
 	}
-	// The lists, as the site would have them after these uploads.
-	want := mem.Objects[indexPath]
+	// The entry, as the site would have it after these uploads: from the
+	// archive, which isn't pruned (results may be anchored long after the
+	// close, and their index update drops the vote).
 	var es []IndexEntry
-	if err := json.Unmarshal(want, &es); err != nil || len(es) != 1 {
-		return nil, fmt.Errorf("site: the check's own index: %v", err)
+	if err := json.Unmarshal(mem.Objects[archivePath(p.OpensAt)], &es); err != nil || len(es) != 1 {
+		return nil, fmt.Errorf("site: the check's own archive: %v", err)
 	}
 	for _, l := range []struct {
 		name, path string
@@ -242,8 +251,9 @@ func compareListing(name string, served []byte, want IndexEntry, pruned bool, no
 	diff("closes_at", got.ClosesAt == want.ClosesAt)
 	diff("extended", got.Extended == want.Extended)
 	diff("published", got.Published == want.Published)
-	diff("unhandled", (got.Unhandled == nil) == (want.Unhandled == nil) &&
-		(got.Unhandled == nil || *got.Unhandled == *want.Unhandled))
+	// An entry from before the site listed unhandled lacks it: only a
+	// value that differs is reported.
+	diff("unhandled", got.Unhandled == nil || want.Unhandled != nil && *got.Unhandled == *want.Unhandled)
 	return out
 }
 

@@ -51,9 +51,10 @@ each document's SHA-256, for readers to compare what they were served;
 it (an upload not finished); `listing` names each way `index.json` or
 the month's archive differs from the documents (such as
 `index: closes_at` or `archive: missing`; the index may drop a vote 30
-days after its close). A `listing` entry doesn't fail the check: the
-lists are rewritten after each document, and may lag behind an upload
-not finished. Only a 404 is taken as not published.
+days after its close; an entry from before the site listed `unhandled`
+lacks it, which isn't reported). A `listing` entry doesn't fail the
+check: the lists are rewritten after each document, and may lag behind
+an upload not finished. Only a 404 is taken as not published.
 `-trusted-root <file>` uses a Sigstore trusted root file instead of
 fetching it.
 

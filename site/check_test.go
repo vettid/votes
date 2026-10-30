@@ -136,7 +136,7 @@ func TestCheckListing(t *testing.T) {
 		want string
 	}{
 		"closes_at":         {edit(indexPath, func(e *IndexEntry) { e.ClosesAt++ }), "index: closes_at"},
-		"unhandled":         {edit(indexPath, func(e *IndexEntry) { e.Unhandled = nil }), "index: unhandled"},
+		"unhandled":         {edit(indexPath, func(e *IndexEntry) { n := *e.Unhandled + 1; e.Unhandled = &n }), "index: unhandled"},
 		"published":         {edit(archivePath(f.p.OpensAt), func(e *IndexEntry) { e.Published = false }), "archive: published"},
 		"missing":           {edit(archivePath(f.p.OpensAt), func(e *IndexEntry) { e.ProposalID = "01KC0000000000000000000002" }), "archive: missing"},
 		"archive not there": {func() map[string][]byte { o := maps.Clone(objs); delete(o, archivePath(f.p.OpensAt)); return o }(), "archive: not published"},
@@ -148,6 +148,10 @@ func TestCheckListing(t *testing.T) {
 		if !slices.Contains(rep.Listing, c.want) {
 			t.Fatalf("%s: listing %v, want %q", name, rep.Listing, c.want)
 		}
+	}
+	// An entry from before the site listed unhandled lacks it.
+	if rep, err := check(t, f, edit(indexPath, func(e *IndexEntry) { e.Unhandled = nil }), testID); err != nil || len(rep.Listing) != 0 {
+		t.Fatalf("an entry without unhandled: %v %v", rep, err)
 	}
 	// Long after the close, the index may have dropped it.
 	o := edit(indexPath, func(e *IndexEntry) { e.ProposalID = "01KC0000000000000000000002" })
