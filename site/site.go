@@ -25,11 +25,11 @@ import (
 // MaxUpload bounds a request: Lambda's 6 MB, less the JSON around it.
 const MaxUpload = 6<<20 - 64<<10
 
-// Size caps per document (§4): a proposal's text is at most 16 KiB; an
+// Size caps per document (§4): a proposal is at most 64 KiB; an
 // extension is a few hundred bytes; results carry the proposal, the
 // extensions, roots and the tally; rows grow with the eligible members.
 const (
-	maxProposal  = 256 << 10 // the 16 KiB text, labels and rules, even with every character escaped
+	maxProposal  = vote.MaxProposal // BALLOT-PROTOCOL §3.1, as a member's vault bounds it
 	maxExtension = 4 << 10
 	maxResults   = 512 << 10 // the proposal (in base64) and up to maxExtensions extensions
 	maxBundle    = 64 << 10
