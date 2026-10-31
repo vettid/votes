@@ -93,6 +93,20 @@ func TestPublishServices(t *testing.T) {
 	}
 	kept(1, v1)
 	kept(2, data)
+	// The current pair is cached briefly, so a reader that met a new list
+	// beside the old signature gets the pair on a retry; the copies never
+	// change (VOTES-SITE §3).
+	for k, want := range map[string]string{
+		"v1/services.json":       "public, max-age=10",
+		"v1/services.json.sig":   "public, max-age=10",
+		"v1/services/2.json":     "public, max-age=31536000, immutable",
+		"v1/services/2.json.sig": "public, max-age=31536000, immutable",
+	} {
+		o, err := c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(k)})
+		if err != nil || aws.ToString(o.CacheControl) != want {
+			t.Fatalf("%s: Cache-Control %q (%v), want %q", k, aws.ToString(o.CacheControl), err, want)
+		}
+	}
 	// The current list again: its history is written if missing.
 	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("v1/services/2.json")}); err != nil {
 		t.Fatal(err)
