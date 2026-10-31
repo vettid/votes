@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.4 (2026-10-31), draft. The protocol this site serves is
+**Status:** 0.2.5 (2026-10-31), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -37,6 +37,11 @@ binary a deploy ships has the same hash.)
 **Write-once** is the bucket's conditional write: every document is put
 with `If-None-Match: *`. A `412` means the path exists: the function
 compares the bytes and answers `200` if they are equal and `409` if not.
+The bucket policy enforces it for every principal, the operator's
+included: under `v1/p/` and `v1/services/` (the kept versions of the
+service list) a put without `If-None-Match` and any delete are denied.
+The current `services.json` and its `.sig` are outside both; a publish
+replaces them in place.
 
 ## 3. Paths
 
@@ -129,6 +134,9 @@ function logs ids, types, sizes and error codes.
 
 ## Changes
 
+- **0.2.5 (2026-10-31):** the bucket policy keeps the service list's
+  versions, `services/<version>.json` and `.sig`, write-once and never
+  deleted, as it already did for the proposals' documents (§2).
 - **0.2.4 (2026-10-31):** `services.json` and its `.sig` are cached for
   10 seconds, not 5 minutes, as `votesctl publish-services` writes them:
   a list and a signature from different versions fail to verify until
