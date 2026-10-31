@@ -56,6 +56,20 @@ func TestPublishServices(t *testing.T) {
 	if err := publishList(ctx, c, bucket, key, v1); err != nil {
 		t.Fatal(err)
 	}
+	// Both written by publishList: the current pair is cached briefly, so
+	// a reader that met a list and a signature of different versions gets
+	// the matching pair on a retry; the copies never change (VOTES-SITE §3).
+	for k, want := range map[string]string{
+		"v1/services.json":       "public, max-age=10",
+		"v1/services.json.sig":   "public, max-age=10",
+		"v1/services/1.json":     "public, max-age=31536000, immutable",
+		"v1/services/1.json.sig": "public, max-age=31536000, immutable",
+	} {
+		o, err := c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(k)})
+		if err != nil || aws.ToString(o.CacheControl) != want {
+			t.Fatalf("%s: Cache-Control %q (%v), want %q", k, aws.ToString(o.CacheControl), err, want)
+		}
+	}
 	h := sha256.Sum256(v1)
 	ik2 := bytes.Repeat([]byte{4}, 32)
 	v2 := list(2, h[:], svc, site.Service{ServiceID: site.ServiceID(ik2), Name: "B", IKs: [][]byte{ik2}, AnchorKeys: []site.AnchorKey{}})
