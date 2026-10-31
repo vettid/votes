@@ -50,6 +50,16 @@ func TestPublishServices(t *testing.T) {
 	}
 	svc := site.Service{ServiceID: site.ServiceID(ik), Name: "A", IKs: [][]byte{ik}, AnchorKeys: []site.AnchorKey{}}
 	v1 := list(1, make([]byte, 32), svc)
+	// No copy of a version that has not been the current list: a copy is
+	// written only after the move (VOTES-SITE §3).
+	noCopy := func(version int64, when string) {
+		t.Helper()
+		for _, k := range []string{fmt.Sprintf("v1/services/%d.json", version), fmt.Sprintf("v1/services/%d.json.sig", version)} {
+			if got, _ := get(ctx, c, bucket, k); got.data != nil {
+				t.Fatalf("%s: %s exists", when, k)
+			}
+		}
+	}
 	if err := publishList(ctx, c, bucket, key, list(2, make([]byte, 32), svc)); err == nil {
 		t.Fatal("a first list that isn't version 1")
 	}
@@ -76,6 +86,7 @@ func TestPublishServices(t *testing.T) {
 	if err := publishList(ctx, c, bucket, key, list(2, h[:])); err == nil || !strings.Contains(err.Error(), "dropped") {
 		t.Fatalf("a list that drops a service: %v", err)
 	}
+	noCopy(2, "a list refused by Extends")
 
 	// Interrupted after the signature: the rerun finishes it.
 	data, _ := vote.Canonicalize(v2)
@@ -84,6 +95,13 @@ func TestPublishServices(t *testing.T) {
 	if err := put(ctx, c, bucket, "v1/services.json.sig", sig, "application/octet-stream", cur.tag); err != nil {
 		t.Fatal(err)
 	}
+	// Another list over the interrupted one is refused: the pair doesn't
+	// verify, and neither list gets a copy.
+	other := list(2, h[:], svc, site.Service{ServiceID: site.ServiceID(ik2), Name: "C", IKs: [][]byte{ik2}, AnchorKeys: []site.AnchorKey{}})
+	if err := publishList(ctx, c, bucket, key, other); err == nil || !strings.Contains(err.Error(), "doesn't verify") {
+		t.Fatalf("another list over an interrupted publish: %v", err)
+	}
+	noCopy(2, "another list over an interrupted publish")
 	if err := publishList(ctx, c, bucket, key, v2); err != nil {
 		t.Fatalf("finishing the interrupted publish: %v", err)
 	}
@@ -135,6 +153,36 @@ func TestPublishServices(t *testing.T) {
 	v4 := list(4, h2[:], svc, site.Service{ServiceID: site.ServiceID(ik2), Name: "B2", IKs: [][]byte{ik2}, AnchorKeys: []site.AnchorKey{}})
 	if err := publishList(ctx, c, bucket, key, v4); err == nil || !strings.Contains(err.Error(), "next version is 3") {
 		t.Fatalf("a version gap: %v", err)
+	}
+	noCopy(4, "a version gap")
+	// A move that loses a race after every check passed: another
+	// publisher replaced the signature. The list stays where it was, and
+	// the version that didn't become current gets no copy.
+	v3ok := list(3, h2[:], svc, site.Service{ServiceID: site.ServiceID(ik2), Name: "B3", IKs: [][]byte{ik2}, AnchorKeys: []site.AnchorKey{}})
+	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("v1/services/3.json.sig")}); err != nil {
+		t.Fatal(err)
+	}
+	held, _ := get(ctx, c, bucket, "v1/services.json.sig")
+	ran := false
+	t.Cleanup(func() { beforeMove = func() {} })
+	beforeMove = func() {
+		ran = true
+		if err := put(ctx, c, bucket, "v1/services.json.sig", []byte("another publisher"), "application/octet-stream", held.tag); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := publishList(ctx, c, bucket, key, v3ok)
+	beforeMove = func() {}
+	if !ran || err == nil || !strings.Contains(err.Error(), "changed while publishing") {
+		t.Fatalf("a move over a signature that changed (hook ran: %v): %v", ran, err)
+	}
+	if got, _ := get(ctx, c, bucket, "v1/services.json"); !bytes.Equal(got.data, data) {
+		t.Fatal("the current list moved")
+	}
+	noCopy(3, "a move that lost a race")
+	raced, _ := get(ctx, c, bucket, "v1/services.json.sig")
+	if err := put(ctx, c, bucket, "v1/services.json.sig", held.data, "application/octet-stream", raced.tag); err != nil {
+		t.Fatal(err)
 	}
 	// A missing signature copy of the current list is restored too.
 	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("v1/services/2.json.sig")}); err != nil {

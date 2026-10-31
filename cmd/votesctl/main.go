@@ -201,6 +201,7 @@ func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.P
 	if err := checkVersion(ctx, c, bucket, next.Version, data, sig); err != nil {
 		return err
 	}
+	beforeMove()
 	if !resuming {
 		if err := put(ctx, c, bucket, "v1/services.json.sig", sig, "application/octet-stream", curSig.tag); err != nil {
 			return err
@@ -217,6 +218,10 @@ func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.P
 	fmt.Printf("published service list version %d (%d services)\n", next.Version, len(next.Services))
 	return nil
 }
+
+// beforeMove runs just before publishList moves the current list; a
+// test sets it to make the move lose a race.
+var beforeMove = func() {}
 
 // keepVersion writes a list version's copy, write-once: an object
 // already there must hold the same bytes.
