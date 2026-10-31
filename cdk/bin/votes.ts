@@ -28,6 +28,11 @@ if (siteKey === undefined && ctx('firstDeploy') !== 'true') {
 // Recovery only (README "Clearing a stray version copy").
 const repair = ctx('servicesRepair');
 if (repair !== undefined && repair !== 'true') throw new Error('context "servicesRepair" is true or absent');
+// Confirmed in the environment too, so a value left in cdk.json or
+// ~/.cdk.json can't keep deletes open deploy after deploy.
+if (repair === 'true' && process.env.VOTES_SERVICES_REPAIR !== 'confirm') {
+  throw new Error('servicesRepair=true needs VOTES_SERVICES_REPAIR=confirm in the environment (README "Clearing a stray version copy")');
+}
 const stack = new VotesStack(app, `VotesSite-${envName}`, {
   envName,
   hostName: required('hostName'),

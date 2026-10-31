@@ -261,6 +261,7 @@ export class VotesStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'BucketName', { value: this.bucket.bucketName });
     new cdk.CfnOutput(this, 'SiteKeySecret', { value: siteKeySecret.secretArn });
+    new cdk.CfnOutput(this, 'DistributionId', { value: this.distribution.distributionId });
     new cdk.CfnOutput(this, 'Url', { value: `https://${props.hostName}` });
   }
 }

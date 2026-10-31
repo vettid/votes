@@ -68,6 +68,7 @@ describe('bucket', () => {
     const keep = st.find((x) => x.Sid === 'PublishedNeverDeleted');
     expect(JSON.stringify(keep.Resource)).toContain('/v1/p/*');
     expect(JSON.stringify(keep.Resource)).not.toContain('/v1/services/');
+    expect(keep.Action).toEqual(expect.arrayContaining(['s3:DeleteObject', 's3:DeleteObjectVersion']));
     const versions = st.find((x) => x.Sid === 'ServicesRepairKeepsVersions');
     expect(versions).toMatchObject({ Effect: 'Deny', Principal: { AWS: '*' }, Action: 's3:DeleteObjectVersion' });
     expect(JSON.stringify(versions.Resource)).toContain('/v1/services/*');

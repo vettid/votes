@@ -112,17 +112,28 @@ signed list lands at a version's key (say, a manual upload with the
 wrong number), `publish-services` refuses every later list. To clear it,
 with the owner's go for each step:
 
-1. Deploy with the usual context plus `-c servicesRepair=true`. Synth
-   warns while it is set. Keys under `v1/services/` can then be deleted;
-   their object versions still can't, and puts still need
+1. Deploy with the usual context plus `-c servicesRepair=true`, with
+   `VOTES_SERVICES_REPAIR=confirm` in the environment (synth refuses the
+   flag without it, so a value left in `cdk.json` can't stay on). Synth
+   warns while it is set. Every key under `v1/services/` can then be
+   deleted; their object versions still can't, and puts still need
    `If-None-Match`.
 2. Delete only the stray keys, e.g.
    `aws s3api delete-object --bucket <BucketName> --key v1/services/<n>.json`
    (and `.sig`). This leaves a delete marker; the stray stays in the
-   bucket's version history.
-3. Deploy again **without** `servicesRepair`, and check that `cdk diff`
-   shows nothing.
+   bucket's version history. A wrong key hides a good copy, which
+   `publish-services` doesn't rewrite unless it is the current version's:
+   restore one with `get-object --version-id <its version>` and
+   `put-object --if-none-match '*'`.
+3. Deploy again **without** `servicesRepair` (and without the variable),
+   then check the live policy, not `cdk diff`, which reads the same
+   context: `aws s3api get-bucket-policy --bucket <BucketName>` must have
+   no `ServicesRepairKeepsVersions`, and `PublishedNeverDeleted` must
+   name both `v1/p/*` and `v1/services/*`.
 4. Run `publish-services` again; it writes the missing copy.
+5. If the stray was ever fetched through the site, CloudFront may still
+   serve it: `aws cloudfront create-invalidation --distribution-id
+   <DistributionId> --paths '/v1/services/<n>.json*'`.
 
 ## License
 
