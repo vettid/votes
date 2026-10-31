@@ -55,10 +55,11 @@ type Site struct {
 	Log     *slog.Logger
 
 	// The last service list that passed ParseServiceList, with the exact
-	// bytes it was parsed from: read-only once cached.
+	// bytes and the site key it was checked under: read-only once cached.
 	listMu   sync.Mutex
 	listData []byte
 	listSig  []byte
+	listKey  ed25519.PublicKey
 	list     *ServiceList
 }
 
@@ -151,7 +152,7 @@ func archivePath(opensAt int64) string {
 // services reads and checks the service list. Both objects are read on
 // every call, so a new list counts at once; the check and parse (up to
 // MaxServiceList bytes) are skipped when the pair is byte for byte the
-// one checked last. Only a pair that passed is kept.
+// one checked last, under the same site key. Only a pair that passed is kept.
 func (s *Site) services(ctx context.Context) (*ServiceList, error) {
 	data, _, err := s.Store.Get(ctx, "v1/services.json")
 	if err != nil {
@@ -163,14 +164,14 @@ func (s *Site) services(ctx context.Context) (*ServiceList, error) {
 	}
 	s.listMu.Lock()
 	defer s.listMu.Unlock()
-	if s.list != nil && bytes.Equal(data, s.listData) && bytes.Equal(sig, s.listSig) {
+	if s.list != nil && bytes.Equal(data, s.listData) && bytes.Equal(sig, s.listSig) && s.SiteKey.Equal(s.listKey) {
 		return s.list, nil
 	}
 	l, err := ParseServiceList(data, sig, s.SiteKey)
 	if err != nil {
 		return nil, err
 	}
-	s.listData, s.listSig, s.list = data, sig, l
+	s.listData, s.listSig, s.listKey, s.list = data, sig, bytes.Clone(s.SiteKey), l
 	return l, nil
 }
 

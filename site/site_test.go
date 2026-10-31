@@ -541,8 +541,15 @@ func TestServiceListCache(t *testing.T) {
 		t.Fatal("a changed signature accepted")
 	}
 	bad[0] ^= 1
-	if l, err := s.services(ctx); err != nil || l.Version != 2 {
-		t.Fatalf("the good pair again: %v", err)
+	// The failures left the kept list alone.
+	if l, err := s.services(ctx); err != nil || l != second {
+		t.Fatalf("the good pair again not kept: %v", err)
+	}
+	// Another site key: checked again, and this list fails under it.
+	other := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{9}, 32))
+	s.SiteKey = other.Public().(ed25519.PublicKey)
+	if _, err := s.services(ctx); err == nil {
+		t.Fatal("a list kept under another site key")
 	}
 }
 
