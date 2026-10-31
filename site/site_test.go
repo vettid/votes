@@ -500,6 +500,59 @@ func TestServiceListStrict(t *testing.T) {
 	}
 }
 
+// The checked list is kept while its bytes are unchanged; any change to
+// either object is checked again, and a pair that fails is never kept.
+func TestServiceListCache(t *testing.T) {
+	f := loadFixture(t)
+	s, st := newSite(t, f, time.Unix(1_800_000_000, 0))
+	ctx := context.Background()
+	first, err := s.services(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, err := s.services(ctx); err != nil || again != first {
+		t.Fatalf("unchanged pair parsed again (%v)", err)
+	}
+
+	// The next version: read at once.
+	next := f.list()
+	next.Version, next.Previous = 2, sha(st.Objects["v1/services.json"])
+	putList(t, st.MemStorage, next, siteKey())
+	second, err := s.services(ctx)
+	if err != nil || second == first || second.Version != 2 {
+		t.Fatalf("new list not read: %v", err)
+	}
+
+	// A list beside another list's signature (a publish half done) fails,
+	// every time, and the list checked last is not served in its place.
+	good := st.Objects["v1/services.json"]
+	st.Objects["v1/services.json"] = bytes.Replace(good, []byte(`"version":2`), []byte(`"version":3`), 1)
+	for i := 0; i < 2; i++ {
+		if _, err := s.services(ctx); err == nil {
+			t.Fatal("a list under another list's signature accepted")
+		}
+	}
+	// Only the signature changed: checked again too.
+	st.Objects["v1/services.json"] = good
+	bad := append([]byte{}, st.Objects["v1/services.json.sig"]...)
+	bad[0] ^= 1
+	st.Objects["v1/services.json.sig"] = bad
+	if _, err := s.services(ctx); err == nil {
+		t.Fatal("a changed signature accepted")
+	}
+	bad[0] ^= 1
+	// The failures left the kept list alone.
+	if l, err := s.services(ctx); err != nil || l != second {
+		t.Fatalf("the good pair again not kept: %v", err)
+	}
+	// Another site key: checked again, and this list fails under it.
+	other := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{9}, 32))
+	s.SiteKey = other.Public().(ed25519.PublicKey)
+	if _, err := s.services(ctx); err == nil {
+		t.Fatal("a list kept under another site key")
+	}
+}
+
 // The service list's bounds (BALLOT-PROTOCOL §3.3).
 func TestServiceListBounds(t *testing.T) {
 	f := loadFixture(t)
