@@ -7,11 +7,12 @@ import { LAMBDA_TIMEOUT_SECONDS, VotesStack, validSiteKey } from '../lib/votes-s
 // A fixed public test value, not a real key: 32 bytes of 0x07.
 const SITE_KEY = Buffer.alloc(32, 7).toString('base64');
 
-function stack(envName: string, sigstore: 'staging' | 'production', extra: { siteKey?: string; region?: string } = {}): VotesStack {
+function stack(envName: string, sigstore: 'staging' | 'production', extra: { siteKey?: string; region?: string; servicesRepair?: boolean } = {}): VotesStack {
   const app = new cdk.App();
   return new VotesStack(app, `VotesSite-${envName}`, {
     envName, hostName: 'votes.example.org', hostedZoneId: 'Z123', zoneName: 'example.org', sigstore,
     siteKey: 'siteKey' in extra ? extra.siteKey : SITE_KEY,
+    servicesRepair: extra.servicesRepair,
     lambdaCode: lambda.Code.fromAsset(path.join(__dirname, 'fake-api')),
     env: { account: '123456789012', region: extra.region ?? 'us-east-1' },
   });
@@ -55,6 +56,24 @@ describe('bucket', () => {
       expect(paths).not.toContain('services.json');
       expect(r).toHaveLength(2);
     }
+    expect(st.find((x) => x.Sid === 'ServicesRepairKeepsVersions')).toBeUndefined();
+  });
+
+  test('servicesRepair: a key under v1/services/ can be deleted, its versions cannot, puts stay conditional', () => {
+    const s = stack('staging', 'staging', { servicesRepair: true });
+    const p = Object.values(Template.fromStack(s).findResources('AWS::S3::BucketPolicy'))[0] as any;
+    const st: any[] = p.Properties.PolicyDocument.Statement;
+    const once = st.find((x) => x.Sid === 'PublishedWriteOnce');
+    expect(JSON.stringify(once.Resource)).toContain('/v1/services/*');
+    const keep = st.find((x) => x.Sid === 'PublishedNeverDeleted');
+    expect(JSON.stringify(keep.Resource)).toContain('/v1/p/*');
+    expect(JSON.stringify(keep.Resource)).not.toContain('/v1/services/');
+    expect(keep.Action).toEqual(expect.arrayContaining(['s3:DeleteObject', 's3:DeleteObjectVersion']));
+    const versions = st.find((x) => x.Sid === 'ServicesRepairKeepsVersions');
+    expect(versions).toMatchObject({ Effect: 'Deny', Principal: { AWS: '*' }, Action: 's3:DeleteObjectVersion' });
+    expect(JSON.stringify(versions.Resource)).toContain('/v1/services/*');
+    const warn = s.node.metadata.filter((m) => m.type === 'aws:cdk:warning').map((m) => String(m.data));
+    expect(warn.join(' ')).toContain('servicesRepair');
   });
 });
 

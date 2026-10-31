@@ -37,6 +37,12 @@ export interface VotesStackProps extends cdk.StackProps {
    * Absent only on the first deploy, which makes the key's secret: uploads
    * are refused until a deploy sets it. */
   readonly siteKey?: string;
+  /** Recovery only, for one deploy with the owner's go: lets a key under
+   * v1/services/ be deleted, to clear a stray object at a version's key
+   * (README "Clearing a stray version copy"). The delete leaves a delete
+   * marker: earlier object versions still can't be deleted, and puts
+   * still need If-None-Match. The next deploy, without it, closes it. */
+  readonly servicesRepair?: boolean;
   /** The function's code; by default `cmd/votes-api` built for arm64. */
   readonly lambdaCode?: lambda.Code;
 }
@@ -104,11 +110,20 @@ export class VotesStack extends cdk.Stack {
       actions: ['s3:PutObject'], resources: writeOnce,
       conditions: { Null: { 's3:if-none-match': 'true' } },
     }));
+    const repair = props.servicesRepair === true;
     this.bucket.addToResourcePolicy(new iam.PolicyStatement({
       sid: 'PublishedNeverDeleted', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()],
       actions: ['s3:DeleteObject', 's3:DeleteObjectVersion'],
-      resources: writeOnce,
+      resources: repair ? [this.bucket.arnForObjects('v1/p/*')] : writeOnce,
     }));
+    if (repair) {
+      // A delete only hides a stray: its object versions stay.
+      this.bucket.addToResourcePolicy(new iam.PolicyStatement({
+        sid: 'ServicesRepairKeepsVersions', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()],
+        actions: ['s3:DeleteObjectVersion'], resources: [this.bucket.arnForObjects('v1/services/*')],
+      }));
+      cdk.Annotations.of(this).addWarning('servicesRepair: keys under v1/services/ can be deleted until the next deploy without it');
+    }
 
     // The site's signing key for the service list: a generated secret the
     // operator's votesctl derives the key from. The function never reads
@@ -246,6 +261,7 @@ export class VotesStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'BucketName', { value: this.bucket.bucketName });
     new cdk.CfnOutput(this, 'SiteKeySecret', { value: siteKeySecret.secretArn });
+    new cdk.CfnOutput(this, 'DistributionId', { value: this.distribution.distributionId });
     new cdk.CfnOutput(this, 'Url', { value: `https://${props.hostName}` });
   }
 }

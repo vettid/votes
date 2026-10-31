@@ -43,8 +43,12 @@ service list) a put or copy without `If-None-Match` and any delete are
 denied, and so is a multipart upload (its parts carry no condition). The
 current `services.json` and its `.sig` are outside both; a publish
 replaces them in place. A stray object at the next version's key can't
-be removed, and `publish-services` refuses a copy that holds other bytes,
-so clearing one takes an owner-approved change to the bucket policy.
+be removed, and `publish-services` refuses a copy that holds other bytes;
+clearing one takes a recovery deploy (`servicesRepair`, with the owner's
+go), which allows deletes under `v1/services/` until the next deploy
+without it but
+still keeps every object version (README, "Clearing a stray version
+copy").
 
 ## 3. Paths
 
@@ -139,7 +143,8 @@ function logs ids, types, sizes and error codes.
 
 - **0.2.5 (2026-10-31):** the bucket policy keeps the service list's
   versions, `services/<version>.json` and `.sig`, write-once and never
-  deleted, as it already did for the proposals' documents (§2).
+  deleted, as it already did for the proposals' documents (§2), with a
+  recovery deploy for a stray object at a version's key.
 - **0.2.4 (2026-10-31):** `services.json` and its `.sig` are cached for
   10 seconds, not 5 minutes, as `votesctl publish-services` writes them:
   a list and a signature from different versions fail to verify until
