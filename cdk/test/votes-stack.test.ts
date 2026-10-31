@@ -37,16 +37,24 @@ describe('bucket', () => {
     });
   });
 
-  test('published documents: written only with If-None-Match, never deleted, for every principal', () => {
+  test('published documents and service-list versions: written only with If-None-Match, never deleted, for every principal', () => {
     const p = Object.values(t.findResources('AWS::S3::BucketPolicy'))[0] as any;
     const st: any[] = p.Properties.PolicyDocument.Statement;
     const once = st.find((x) => x.Sid === 'PublishedWriteOnce');
     expect(once).toMatchObject({ Effect: 'Deny', Principal: { AWS: '*' }, Action: 's3:PutObject',
       Condition: { Null: { 's3:if-none-match': 'true' } } });
-    expect(JSON.stringify(once.Resource)).toContain('/v1/p/*');
     const keep = st.find((x) => x.Sid === 'PublishedNeverDeleted');
     expect(keep).toMatchObject({ Effect: 'Deny', Principal: { AWS: '*' } });
     expect(keep.Action).toEqual(expect.arrayContaining(['s3:DeleteObject', 's3:DeleteObjectVersion']));
+    // Proposals' documents and the kept versions of the service list; not
+    // the current list, which a publish replaces with If-Match.
+    for (const r of [once.Resource, keep.Resource]) {
+      const paths = JSON.stringify(r);
+      expect(paths).toContain('/v1/p/*');
+      expect(paths).toContain('/v1/services/*');
+      expect(paths).not.toContain('services.json');
+      expect(r).toHaveLength(2);
+    }
   });
 });
 

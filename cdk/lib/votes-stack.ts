@@ -94,17 +94,20 @@ export class VotesStack extends cdk.Stack {
       objectOwnership: s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
-    // Write-once, enforced by S3 for every principal: a published document
-    // is written only with If-None-Match: * and never deleted (§2).
+    // Write-once, enforced by S3 for every principal: a published document,
+    // and each kept version of the service list, is written only with
+    // If-None-Match: * and never deleted (§2). The current list
+    // (v1/services.json and .sig) is outside both and is replaced in place.
+    const writeOnce = [this.bucket.arnForObjects('v1/p/*'), this.bucket.arnForObjects('v1/services/*')];
     this.bucket.addToResourcePolicy(new iam.PolicyStatement({
       sid: 'PublishedWriteOnce', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()],
-      actions: ['s3:PutObject'], resources: [this.bucket.arnForObjects('v1/p/*')],
+      actions: ['s3:PutObject'], resources: writeOnce,
       conditions: { Null: { 's3:if-none-match': 'true' } },
     }));
     this.bucket.addToResourcePolicy(new iam.PolicyStatement({
       sid: 'PublishedNeverDeleted', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()],
       actions: ['s3:DeleteObject', 's3:DeleteObjectVersion'],
-      resources: [this.bucket.arnForObjects('v1/p/*')],
+      resources: writeOnce,
     }));
 
     // The site's signing key for the service list: a generated secret the
