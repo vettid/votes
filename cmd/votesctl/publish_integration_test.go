@@ -126,6 +126,9 @@ func TestPublishServices(t *testing.T) {
 	kept(1, v1)
 	kept(2, data)
 	// The current list again: its history is written if missing.
+	// (LocalStack has no bucket policy; in a deployed bucket a copy is never
+	// deleted, and these deletes stand for a copy that was never written:
+	// a list published before copies were kept, or a failed keepVersion.)
 	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("v1/services/2.json")}); err != nil {
 		t.Fatal(err)
 	}
@@ -185,6 +188,7 @@ func TestPublishServices(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A missing signature copy of the current list is restored too.
+	// (A copy never written, as above.)
 	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("v1/services/2.json.sig")}); err != nil {
 		t.Fatal(err)
 	}

@@ -39,9 +39,12 @@ with `If-None-Match: *`. A `412` means the path exists: the function
 compares the bytes and answers `200` if they are equal and `409` if not.
 The bucket policy enforces it for every principal, the operator's
 included: under `v1/p/` and `v1/services/` (the kept versions of the
-service list) a put without `If-None-Match` and any delete are denied.
-The current `services.json` and its `.sig` are outside both; a publish
-replaces them in place.
+service list) a put or copy without `If-None-Match` and any delete are
+denied, and so is a multipart upload (its parts carry no condition). The
+current `services.json` and its `.sig` are outside both; a publish
+replaces them in place. A stray object at the next version's key can't
+be removed, and `publish-services` refuses a copy that holds other bytes,
+so clearing one takes an owner-approved change to the bucket policy.
 
 ## 3. Paths
 
