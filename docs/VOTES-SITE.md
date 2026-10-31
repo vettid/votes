@@ -45,7 +45,8 @@ current `services.json` and its `.sig` are outside both; a publish
 replaces them in place. A stray object at the next version's key can't
 be removed, and `publish-services` refuses a copy that holds other bytes;
 clearing one takes a recovery deploy (`servicesRepair`, with the owner's
-go), which allows deletes under `v1/services/` until the next deploy but
+go), which allows deletes under `v1/services/` until the next deploy
+without it but
 still keeps every object version (README, "Clearing a stray version
 copy").
 
