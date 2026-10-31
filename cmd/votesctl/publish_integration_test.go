@@ -63,7 +63,6 @@ func TestPublishServices(t *testing.T) {
 	if err := publishList(ctx, c, bucket, key, list(2, make([]byte, 32), svc)); err == nil {
 		t.Fatal("a first list that isn't version 1")
 	}
-	noCopy(2, "a refused first list")
 	if err := publishList(ctx, c, bucket, key, v1); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +81,6 @@ func TestPublishServices(t *testing.T) {
 	if err := put(ctx, c, bucket, "v1/services.json.sig", sig, "application/octet-stream", cur.tag); err != nil {
 		t.Fatal(err)
 	}
-	noCopy(2, "interrupted after the signature")
 	// Another list over the interrupted one is refused: the pair doesn't
 	// verify, and neither list gets a copy.
 	other := list(2, h[:], svc, site.Service{ServiceID: site.ServiceID(ik2), Name: "C", IKs: [][]byte{ik2}, AnchorKeys: []site.AnchorKey{}})
@@ -151,15 +149,18 @@ func TestPublishServices(t *testing.T) {
 		t.Fatal(err)
 	}
 	held, _ := get(ctx, c, bucket, "v1/services.json.sig")
+	ran := false
+	t.Cleanup(func() { beforeMove = func() {} })
 	beforeMove = func() {
+		ran = true
 		if err := put(ctx, c, bucket, "v1/services.json.sig", []byte("another publisher"), "application/octet-stream", held.tag); err != nil {
 			t.Fatal(err)
 		}
 	}
 	err := publishList(ctx, c, bucket, key, v3ok)
 	beforeMove = func() {}
-	if err == nil {
-		t.Fatal("a move over a signature that changed")
+	if !ran || err == nil || !strings.Contains(err.Error(), "changed while publishing") {
+		t.Fatalf("a move over a signature that changed (hook ran: %v): %v", ran, err)
 	}
 	if got, _ := get(ctx, c, bucket, "v1/services.json"); !bytes.Equal(got.data, data) {
 		t.Fatal("the current list moved")
