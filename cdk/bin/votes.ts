@@ -25,6 +25,9 @@ const siteKey = ctx('siteKey');
 if (siteKey === undefined && ctx('firstDeploy') !== 'true') {
   throw new Error('context "siteKey" is required (votesctl site-key); only the first deploy may pass firstDeploy=true instead');
 }
+// Recovery only (README "Clearing a stray version copy").
+const repair = ctx('servicesRepair');
+if (repair !== undefined && repair !== 'true') throw new Error('context "servicesRepair" is true or absent');
 const stack = new VotesStack(app, `VotesSite-${envName}`, {
   envName,
   hostName: required('hostName'),
@@ -32,6 +35,7 @@ const stack = new VotesStack(app, `VotesSite-${envName}`, {
   zoneName: required('zoneName'),
   sigstore,
   siteKey,
+  servicesRepair: repair === 'true',
   // Pinned: CloudFront's certificate must be in us-east-1.
   env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: 'us-east-1' },
   description: `votes.vettid.org (${envName})`,

@@ -104,6 +104,26 @@ environment. None has a default.
    limited, since the list only grows); one interrupted half-way is
    finished by running the same command again.
 
+### Clearing a stray version copy
+
+The bucket policy keeps everything under `v1/services/` write-once and
+never deleted (VOTES-SITE §2). If an object that isn't that version's
+signed list lands at a version's key (say, a manual upload with the
+wrong number), `publish-services` refuses every later list. To clear it,
+with the owner's go for each step:
+
+1. Deploy with the usual context plus `-c servicesRepair=true`. Synth
+   warns while it is set. Keys under `v1/services/` can then be deleted;
+   their object versions still can't, and puts still need
+   `If-None-Match`.
+2. Delete only the stray keys, e.g.
+   `aws s3api delete-object --bucket <BucketName> --key v1/services/<n>.json`
+   (and `.sig`). This leaves a delete marker; the stray stays in the
+   bucket's version history.
+3. Deploy again **without** `servicesRepair`, and check that `cdk diff`
+   shows nothing.
+4. Run `publish-services` again; it writes the missing copy.
+
 ## License
 
 AGPL-3.0 (see [LICENSE](LICENSE)).
