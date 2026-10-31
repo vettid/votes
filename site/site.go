@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/vettid/service-vault/vote"
@@ -52,6 +53,13 @@ type Site struct {
 	SiteKey ed25519.PublicKey // signs the service list
 	Now     func() time.Time
 	Log     *slog.Logger
+
+	// The last service list that passed ParseServiceList, with the exact
+	// bytes it was parsed from: read-only once cached.
+	listMu   sync.Mutex
+	listData []byte
+	listSig  []byte
+	list     *ServiceList
 }
 
 // Upload is a request's body.
@@ -140,7 +148,10 @@ func archivePath(opensAt int64) string {
 	return "v1/archive/" + time.Unix(opensAt, 0).UTC().Format("2006-01") + ".json"
 }
 
-// services reads and checks the service list.
+// services reads and checks the service list. Both objects are read on
+// every call, so a new list counts at once; the check and parse (up to
+// MaxServiceList bytes) are skipped when the pair is byte for byte the
+// one checked last. Only a pair that passed is kept.
 func (s *Site) services(ctx context.Context) (*ServiceList, error) {
 	data, _, err := s.Store.Get(ctx, "v1/services.json")
 	if err != nil {
@@ -150,7 +161,17 @@ func (s *Site) services(ctx context.Context) (*ServiceList, error) {
 	if err != nil {
 		return nil, fmt.Errorf("service list signature: %w", err)
 	}
-	return ParseServiceList(data, sig, s.SiteKey)
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
+	if s.list != nil && bytes.Equal(data, s.listData) && bytes.Equal(sig, s.listSig) {
+		return s.list, nil
+	}
+	l, err := ParseServiceList(data, sig, s.SiteKey)
+	if err != nil {
+		return nil, err
+	}
+	s.listData, s.listSig, s.list = data, sig, l
+	return l, nil
 }
 
 // anchor checks u's bundle under one of svc's anchor keys and returns the

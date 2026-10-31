@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.5 (2026-10-31), draft. The protocol this site serves is
+**Status:** 0.2.6 (2026-10-31), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -26,7 +26,7 @@ one: the service's signature and the Rekor anchor catch that.
 | Bucket | Private S3 bucket, versioned, blocking public access. Read only through CloudFront (origin access control). Written only by the upload function, which cannot delete. |
 | CloudFront | `votes.vettid.org`. Serves `/v1/*` from the bucket and `/api/*` from the API. Security headers as vettid.org's sites. No access logs. |
 | Upload API | API Gateway HTTP API → Lambda `votes-api` (Go, arm64). |
-| Service list | `services.json` in this repository, changed only by PR, signed with the site's Ed25519 key and uploaded by the operator (BALLOT-PROTOCOL §3.3). The function checks it under the site's public key on every upload. |
+| Service list | `services.json` in this repository, changed only by PR, signed with the site's Ed25519 key and uploaded by the operator (BALLOT-PROTOCOL §3.3). The function reads it on every upload and checks it under the site's public key whenever its bytes or its signature's differ from the pair it checked last. |
 | Stack | CDK (TypeScript), `VotesSite-staging` and `VotesSite-prod`, as member-service. |
 
 **(chosen; not in the spec:** Lambda rather than an ECS service, because
@@ -141,6 +141,9 @@ function logs ids, types, sizes and error codes.
 
 ## Changes
 
+- **0.2.6 (2026-10-31):** the function keeps the service list it checked
+  last and checks it again only when the list or its signature changes;
+  both are still read on every upload, so a new list counts at once.
 - **0.2.5 (2026-10-31):** the bucket policy keeps the service list's
   versions, `services/<version>.json` and `.sig`, write-once and never
   deleted, as it already did for the proposals' documents (§2), with a
