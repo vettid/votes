@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.6 (2026-10-31), draft. The protocol this site serves is
+**Status:** 0.2.8 (2026-11-02), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -117,7 +117,21 @@ conditional write on their ETag, retrying on a conflict.
 
 **Answers:** `201` published, `200` already published with the same
 bytes, `409` a different document is published there, `422` a check
-failed, `413` too large.
+failed, `413` too large, `503` another store failure. The body is
+`{"published": "<name>", "index_updated": true}`. If the document was
+written but the index update failed, the answer is still `201` (or `200`
+for a re-upload), with `"index_updated": false` and the failure logged:
+the document exists and the index is stale. The index is not rebuilt
+from the stored documents; it is repaired by the next write for the
+same proposal (an extension or the results add the proposal's entry if
+it is missing) or by uploading the same bytes again, which runs the
+index update again. An identical re-upload is not refused for already
+existing, though it can still get `422` (for example `unknown_service`)
+or `503`; a different document for the same path is `409`. Readers must
+not rely on the index's `extended` count to know which `extension-<n>`
+files exist: fetch `extension-<n+1>` until a `404`. Extensions are
+published in order, so there is no gap, but a `404` (which `/v1/*` may
+cache for a short time) only means none yet: check again later.
 
 **Size:** a request is at most 6 MB (Lambda's limit). A results row is
 about 250 bytes, so that holds about 20,000 eligible members. Larger
@@ -141,6 +155,16 @@ function logs ids, types, sizes and error codes.
 
 ## Changes
 
+- **0.2.8 (2026-11-02):** the results always set the index's close in
+  force and extension count (never lower than stored), and an extension
+  sets them from the published extensions, so a re-upload of an earlier
+  extension moves neither backwards; a cached `404` for an extension
+  means none yet.
+- **0.2.7 (2026-11-02):** an upload whose document was written answers
+  `201` even if the index update failed, with `"index_updated": false`
+  in the body (it was `503`, so the publisher could not tell whether the
+  document existed); an identical re-upload answers `200` and finishes
+  the index, and an extension or the results add a missing index entry.
 - **0.2.6 (2026-10-31):** the function keeps the service list it checked
   last and checks it again only when the list or its signature changes;
   both are still read on every upload, so a new list counts at once.

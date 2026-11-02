@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -145,11 +146,18 @@ func post(t *testing.T, s *Site, name string, u *Upload) (int, string) {
 
 func postRaw(t *testing.T, s *Site, name string, body []byte) (int, string) {
 	t.Helper()
+	code, _, why := postBody(s, name, body)
+	return code, why
+}
+
+// postBody is postRaw that also returns the response body.
+func postBody(s *Site, name string, body []byte) (int, string, string) {
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/p/"+testID+"/"+name, bytes.NewReader(body)))
-	var m map[string]string
+	var m map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &m)
-	return rec.Code, m["error"]
+	e, _ := m["error"].(string)
+	return rec.Code, rec.Body.String(), e
 }
 
 func want(t *testing.T, what string, code int, why string, wantCode int, wantWhy string) {
@@ -325,7 +333,7 @@ func TestIndexRetry(t *testing.T) {
 	s, st := newSite(t, f, f.during())
 	st.failIndex = 1
 	code, _ := post(t, s, "proposal", &f.Proposal)
-	want(t, "the index fails", code, "", 503, "")
+	want(t, "the index fails", code, "", 201, "")
 	if st.Objects["v1/p/"+testID+"/proposal.json"] == nil {
 		t.Fatal("the document wasn't written")
 	}
@@ -427,7 +435,7 @@ func TestExtensionIndexRetry(t *testing.T) {
 	post(t, s, "proposal", &f.Proposal)
 	st.failIndex = 1
 	code, _ := post(t, s, "extension-1", &f.Extension)
-	want(t, "the index fails", code, "", 503, "")
+	want(t, "the index fails", code, "", 201, "")
 	code, why := post(t, s, "extension-1", &f.Extension)
 	want(t, "the retry", code, why, 200, "")
 	if es := index(t, st); es[0].Extended != 1 || es[0].ClosesAt != f.e.ClosesAt {
@@ -642,5 +650,148 @@ func TestExtends(t *testing.T) {
 		if Extends(prev, prevData, n) == nil {
 			t.Errorf("%s accepted", name)
 		}
+	}
+}
+
+// A written document answers 201 with index_updated false when only the
+// index update failed; the same upload again finishes the index and an
+// identical re-upload succeeds. A different document is still refused.
+func TestStaleIndex201(t *testing.T) {
+	f := loadFixture(t)
+	s, st := newSite(t, f, f.during())
+	st.failIndex = 5 // every attempt of the retry loop
+	raw, _ := json.Marshal(&f.Proposal)
+	code, body, _ := postBody(s, "proposal", raw)
+	want(t, "the index fails", code, "", 201, "")
+	if !strings.Contains(body, `"index_updated":false`) {
+		t.Fatalf("body %q", body)
+	}
+	if st.Objects["v1/p/"+testID+"/proposal.json"] == nil {
+		t.Fatal("the document wasn't written")
+	}
+	if _, ok := st.Objects[indexPath]; ok {
+		t.Fatal("the index was written")
+	}
+	// The repair: an identical re-upload succeeds and updates the index.
+	st.failIndex = 0
+	code, body, _ = postBody(s, "proposal", raw)
+	want(t, "identical re-upload", code, "", 200, "")
+	if !strings.Contains(body, `"index_updated":true`) {
+		t.Fatalf("body %q", body)
+	}
+	if es := index(t, st); len(es) != 1 {
+		t.Fatalf("index %+v", es)
+	}
+	// An identical re-upload once the index is current is still a success.
+	code, _ = post(t, s, "proposal", &f.Proposal)
+	want(t, "second re-upload", code, "", 200, "")
+	// A different document at the path is refused.
+	st.Objects["v1/p/"+testID+"/proposal.json"] = []byte(`{"other":1}`)
+	code, why := post(t, s, "proposal", &f.Proposal)
+	want(t, "a different document", code, why, 409, "differs")
+}
+
+// The next write repairs an index a failure left behind: an extension
+// after a proposal whose index update failed.
+func TestNextWriteRepairsIndex(t *testing.T) {
+	f := loadFixture(t)
+	s, st := newSite(t, f, f.during())
+	st.failIndex = 5
+	code, _ := post(t, s, "proposal", &f.Proposal)
+	want(t, "the index fails", code, "", 201, "")
+	st.failIndex = 0
+	code, why := post(t, s, "extension-1", &f.Extension)
+	want(t, "the extension", code, why, 201, "")
+	if es := index(t, st); len(es) != 1 || es[0].Extended != 1 {
+		t.Fatalf("index %+v", es)
+	}
+}
+
+// A re-upload while the index still fails answers 200 with the flag.
+func TestReuploadIndexStillFailing(t *testing.T) {
+	f := loadFixture(t)
+	s, st := newSite(t, f, f.during())
+	raw, _ := json.Marshal(&f.Proposal)
+	st.failIndex = 10
+	postBody(s, "proposal", raw)
+	code, body, _ := postBody(s, "proposal", raw)
+	want(t, "re-upload", code, "", 200, "")
+	if !strings.Contains(body, `"index_updated":false`) {
+		t.Fatalf("body %q", body)
+	}
+}
+
+// Results uploaded with a stale index (no entry) repair it.
+func TestResultsRepairIndex(t *testing.T) {
+	f := loadFixture(t)
+	s, st := newSite(t, f, f.during())
+	st.failIndex = 5
+	code, why := post(t, s, "proposal", &f.Proposal)
+	want(t, "proposal", code, why, 201, "")
+	st.failIndex = 0
+	code, why = post(t, s, "extension-1", &f.Extension)
+	want(t, "extension", code, why, 201, "")
+	delete(st.Objects, indexPath) // the stale index
+	at(s, f.closed())
+	code, why = post(t, s, "results", &f.Results)
+	want(t, "results", code, why, 201, "")
+	es := index(t, st)
+	if len(es) != 1 || !es[0].Published || es[0].Unhandled == nil || es[0].Extended != 1 || es[0].ClosesAt != f.e.ClosesAt {
+		t.Fatalf("index %+v", es)
+	}
+}
+
+// Results repair an entry a failed extension update left stale, and an
+// earlier extension uploaded again moves neither the close nor the count
+// backwards.
+func TestResultsRepairStaleEntry(t *testing.T) {
+	f := loadFixture(t)
+	s, st := newSite(t, f, f.during())
+	post(t, s, "proposal", &f.Proposal)
+	st.failIndex = 5
+	code, _ := post(t, s, "extension-1", &f.Extension)
+	want(t, "stale extension", code, "", 201, "")
+	if es := index(t, st); es[0].Extended != 0 {
+		t.Fatalf("index %+v", es)
+	}
+	st.failIndex = 0
+	at(s, f.closed())
+	code, why := post(t, s, "results", &f.Results)
+	want(t, "results", code, why, 201, "")
+	es := index(t, st)
+	if es[0].Extended != 1 || es[0].ClosesAt != f.e.ClosesAt {
+		t.Fatalf("index %+v", es)
+	}
+	code, why = post(t, s, "extension-1", &f.Extension)
+	want(t, "re-upload", code, why, 200, "")
+	if es := index(t, st); es[0].Extended != 1 || es[0].ClosesAt != f.e.ClosesAt || !es[0].Published {
+		t.Fatalf("index %+v", es)
+	}
+}
+
+// An earlier extension uploaded again, after a later one is published,
+// leaves the entry at the later extension's close and count. A second
+// extension can't be anchored offline (the fixture's Sigstore bundles are
+// real), so extension-2 is put in the store as a published document.
+func TestEarlierExtensionAgainKeepsLater(t *testing.T) {
+	f := loadFixture(t)
+	s, st := newSite(t, f, f.during())
+	post(t, s, "proposal", &f.Proposal)
+	code, why := post(t, s, "extension-1", &f.Extension)
+	want(t, "extension-1", code, why, 201, "")
+	later := f.e.ClosesAt + 600
+	doc := fmt.Sprintf(`{"closes_at":%d,"n":2,"outage":{"from":1,"source":"https://status.vettid.org/","to":2},"proposal_id":%q,"v":1}`, later, testID)
+	st.Objects["v1/p/"+testID+"/extension-2.json"] = []byte(doc)
+	code, why = post(t, s, "extension-1", &f.Extension)
+	want(t, "extension-1 again", code, why, 200, "")
+	if es := index(t, st); es[0].Extended != 2 || es[0].ClosesAt != later {
+		t.Fatalf("index %+v", es)
+	}
+	// And a rebuilt entry takes the later extension too.
+	delete(st.Objects, indexPath)
+	code, why = post(t, s, "extension-1", &f.Extension)
+	want(t, "rebuilt", code, why, 200, "")
+	if es := index(t, st); es[0].Extended != 2 || es[0].ClosesAt != later {
+		t.Fatalf("rebuilt index %+v", es)
 	}
 }

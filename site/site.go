@@ -125,6 +125,14 @@ func (s *Site) upload(w http.ResponseWriter, r *http.Request) {
 		created, err = s.putExtension(r.Context(), id, n, &u)
 	}
 	var rf *refusal
+	var ie *indexError
+	stale := false
+	if errors.As(err, &ie) {
+		// The document is written; only the index is behind. A retry of
+		// the same upload (or its next write) finishes the index.
+		s.log().Error("index update failed", "proposal_id", id, "name", name, "err", ie.err.Error())
+		created, err, stale = ie.created, nil, true
+	}
 	switch {
 	case errors.As(err, &rf):
 		s.log().Info("upload refused", "proposal_id", id, "name", name, "code", rf.code)
@@ -134,10 +142,29 @@ func (s *Site) upload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "unavailable")
 	case created:
 		s.log().Info("published", "proposal_id", id, "name", name, "size", len(u.Doc))
-		writeJSON(w, http.StatusCreated, map[string]string{"published": name})
+		writeJSON(w, http.StatusCreated, map[string]any{"published": name, "index_updated": !stale})
 	default:
-		writeJSON(w, http.StatusOK, map[string]string{"published": name})
+		writeJSON(w, http.StatusOK, map[string]any{"published": name, "index_updated": !stale})
 	}
+}
+
+// indexError is an index update that failed after the document was
+// written; created is whether this upload wrote it.
+type indexError struct {
+	err     error
+	created bool
+}
+
+func (e *indexError) Error() string { return "index: " + e.err.Error() }
+func (e *indexError) Unwrap() error { return e.err }
+
+// indexed passes the result of the index update on: a failure becomes an
+// indexError so that the upload still answers for the written document.
+func (s *Site) indexed(created bool, err error) (bool, error) {
+	if err != nil {
+		return created, &indexError{err, created}
+	}
+	return created, nil
 }
 
 // Paths (docs/VOTES-SITE.md §3).
@@ -263,7 +290,7 @@ func (s *Site) putProposal(ctx context.Context, id string, u *Upload) (bool, err
 	}
 	// The index changes are idempotent, so a retry also finishes one
 	// that failed after the document was written.
-	return created, s.index(ctx, func(es []IndexEntry) []IndexEntry {
+	return s.indexed(created, s.index(ctx, func(es []IndexEntry) []IndexEntry {
 		for _, e := range es {
 			if e.ProposalID == id {
 				return es
@@ -271,7 +298,20 @@ func (s *Site) putProposal(ctx context.Context, id string, u *Upload) (bool, err
 		}
 		return append(es, IndexEntry{ProposalID: id, ServiceID: svc.ServiceID, ProposalHash: sha(u.Doc),
 			OpensAt: p.OpensAt, ClosesAt: p.ClosesAt})
-	}, p.OpensAt)
+	}, p.OpensAt))
+}
+
+// withEntry adds the proposal's entry, as its proposal upload would have,
+// when the index lacks it (an earlier index update failed), so that the
+// next write repairs the index.
+func withEntry(es []IndexEntry, id string, svc *Service, pdoc []byte, p *vote.Proposal) []IndexEntry {
+	for _, e := range es {
+		if e.ProposalID == id {
+			return es
+		}
+	}
+	return append(es, IndexEntry{ProposalID: id, ServiceID: svc.ServiceID, ProposalHash: sha(pdoc),
+		OpensAt: p.OpensAt, ClosesAt: p.ClosesAt})
 }
 
 func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload) (bool, error) {
@@ -327,14 +367,32 @@ func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload) (b
 	if err != nil {
 		return false, err
 	}
-	return created, s.index(ctx, func(es []IndexEntry) []IndexEntry {
+	// The close in force and the number of extensions are the published
+	// ones, so that a re-upload of an earlier extension (or a rebuilt
+	// entry) never moves either backwards.
+	cl, cnt := e.ClosesAt, n
+	for i := n + 1; i <= maxExtensions; i++ {
+		raw, err := s.published(ctx, docPath(id, "extension-"+strconv.Itoa(i)))
+		if err != nil {
+			return created, err
+		}
+		if raw == nil {
+			break
+		}
+		if x, err := vote.ParseExtension(raw); err == nil && x.ClosesAt > cl {
+			cl = x.ClosesAt
+		}
+		cnt = i
+	}
+	return s.indexed(created, s.index(ctx, func(es []IndexEntry) []IndexEntry {
+		es = withEntry(es, id, svc, pdoc, p)
 		for i := range es {
-			if es[i].ProposalID == id && e.ClosesAt > es[i].ClosesAt {
-				es[i].ClosesAt, es[i].Extended = e.ClosesAt, n
+			if es[i].ProposalID == id {
+				es[i].ClosesAt, es[i].Extended = max(es[i].ClosesAt, cl), max(es[i].Extended, cnt)
 			}
 		}
 		return es
-	}, p.OpensAt)
+	}, p.OpensAt))
 }
 
 // closeInForce is the close extension n extends: the proposal's, or
@@ -411,14 +469,18 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 		return false, err
 	}
 	unhandled := res.Counts.Unhandled
-	return created, s.index(ctx, func(es []IndexEntry) []IndexEntry {
+	return s.indexed(created, s.index(ctx, func(es []IndexEntry) []IndexEntry {
+		es = withEntry(es, id, svc, pdoc, p)
 		for i := range es {
 			if es[i].ProposalID == id {
+				// The results are checked against the published
+				// extensions: the close in force and their number.
+				es[i].ClosesAt, es[i].Extended = max(es[i].ClosesAt, closes), max(es[i].Extended, len(res.Extensions))
 				es[i].Published, es[i].Unhandled = true, &unhandled
 			}
 		}
 		return es
-	}, p.OpensAt)
+	}, p.OpensAt))
 }
 
 // uploadShape applies the upload's request-level rules to a decoded
