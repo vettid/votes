@@ -367,11 +367,28 @@ func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload) (b
 	if err != nil {
 		return false, err
 	}
+	// The close in force and the number of extensions are the published
+	// ones, so that a re-upload of an earlier extension (or a rebuilt
+	// entry) never moves either backwards.
+	cl, cnt := e.ClosesAt, n
+	for i := n + 1; i <= maxExtensions; i++ {
+		raw, err := s.published(ctx, docPath(id, "extension-"+strconv.Itoa(i)))
+		if err != nil {
+			return created, err
+		}
+		if raw == nil {
+			break
+		}
+		if x, err := vote.ParseExtension(raw); err == nil && x.ClosesAt > cl {
+			cl = x.ClosesAt
+		}
+		cnt = i
+	}
 	return s.indexed(created, s.index(ctx, func(es []IndexEntry) []IndexEntry {
 		es = withEntry(es, id, svc, pdoc, p)
 		for i := range es {
-			if es[i].ProposalID == id && e.ClosesAt > es[i].ClosesAt {
-				es[i].ClosesAt, es[i].Extended = e.ClosesAt, n
+			if es[i].ProposalID == id {
+				es[i].ClosesAt, es[i].Extended = max(es[i].ClosesAt, cl), max(es[i].Extended, cnt)
 			}
 		}
 		return es
@@ -453,13 +470,12 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 	}
 	unhandled := res.Counts.Unhandled
 	return s.indexed(created, s.index(ctx, func(es []IndexEntry) []IndexEntry {
-		n := len(es)
 		es = withEntry(es, id, svc, pdoc, p)
 		for i := range es {
 			if es[i].ProposalID == id {
-				if len(es) > n { // added here: the close in force
-					es[i].ClosesAt, es[i].Extended = closes, len(res.Extensions)
-				}
+				// The results are checked against the published
+				// extensions: the close in force and their number.
+				es[i].ClosesAt, es[i].Extended = max(es[i].ClosesAt, closes), max(es[i].Extended, len(res.Extensions))
 				es[i].Published, es[i].Unhandled = true, &unhandled
 			}
 		}

@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -737,5 +738,60 @@ func TestResultsRepairIndex(t *testing.T) {
 	es := index(t, st)
 	if len(es) != 1 || !es[0].Published || es[0].Unhandled == nil || es[0].Extended != 1 || es[0].ClosesAt != f.e.ClosesAt {
 		t.Fatalf("index %+v", es)
+	}
+}
+
+// Results repair an entry a failed extension update left stale, and an
+// earlier extension uploaded again moves neither the close nor the count
+// backwards.
+func TestResultsRepairStaleEntry(t *testing.T) {
+	f := loadFixture(t)
+	s, st := newSite(t, f, f.during())
+	post(t, s, "proposal", &f.Proposal)
+	st.failIndex = 5
+	code, _ := post(t, s, "extension-1", &f.Extension)
+	want(t, "stale extension", code, "", 201, "")
+	if es := index(t, st); es[0].Extended != 0 {
+		t.Fatalf("index %+v", es)
+	}
+	st.failIndex = 0
+	at(s, f.closed())
+	code, why := post(t, s, "results", &f.Results)
+	want(t, "results", code, why, 201, "")
+	es := index(t, st)
+	if es[0].Extended != 1 || es[0].ClosesAt != f.e.ClosesAt {
+		t.Fatalf("index %+v", es)
+	}
+	code, why = post(t, s, "extension-1", &f.Extension)
+	want(t, "re-upload", code, why, 200, "")
+	if es := index(t, st); es[0].Extended != 1 || es[0].ClosesAt != f.e.ClosesAt || !es[0].Published {
+		t.Fatalf("index %+v", es)
+	}
+}
+
+// An earlier extension uploaded again, after a later one is published,
+// leaves the entry at the later extension's close and count. A second
+// extension can't be anchored offline (the fixture's Sigstore bundles are
+// real), so extension-2 is put in the store as a published document.
+func TestEarlierExtensionAgainKeepsLater(t *testing.T) {
+	f := loadFixture(t)
+	s, st := newSite(t, f, f.during())
+	post(t, s, "proposal", &f.Proposal)
+	code, why := post(t, s, "extension-1", &f.Extension)
+	want(t, "extension-1", code, why, 201, "")
+	later := f.e.ClosesAt + 600
+	doc := fmt.Sprintf(`{"closes_at":%d,"n":2,"outage":{"from":1,"source":"https://status.vettid.org/","to":2},"proposal_id":%q,"v":1}`, later, testID)
+	st.Objects["v1/p/"+testID+"/extension-2.json"] = []byte(doc)
+	code, why = post(t, s, "extension-1", &f.Extension)
+	want(t, "extension-1 again", code, why, 200, "")
+	if es := index(t, st); es[0].Extended != 2 || es[0].ClosesAt != later {
+		t.Fatalf("index %+v", es)
+	}
+	// And a rebuilt entry takes the later extension too.
+	delete(st.Objects, indexPath)
+	code, why = post(t, s, "extension-1", &f.Extension)
+	want(t, "rebuilt", code, why, 200, "")
+	if es := index(t, st); es[0].Extended != 2 || es[0].ClosesAt != later {
+		t.Fatalf("rebuilt index %+v", es)
 	}
 }

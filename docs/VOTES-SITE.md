@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.7 (2026-11-02), draft. The protocol this site serves is
+**Status:** 0.2.8 (2026-11-02), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -129,7 +129,9 @@ index update again. An identical re-upload is not refused for already
 existing, though it can still get `422` (for example `unknown_service`)
 or `503`; a different document for the same path is `409`. Readers must
 not rely on the index's `extended` count to know which `extension-<n>`
-files exist: fetch `extension-<n+1>` until a `404`.
+files exist: fetch `extension-<n+1>` until a `404`. Extensions are
+published in order, so there is no gap, but a `404` (which `/v1/*` may
+cache for a short time) only means none yet: check again later.
 
 **Size:** a request is at most 6 MB (Lambda's limit). A results row is
 about 250 bytes, so that holds about 20,000 eligible members. Larger
@@ -153,6 +155,11 @@ function logs ids, types, sizes and error codes.
 
 ## Changes
 
+- **0.2.8 (2026-11-02):** the results always set the index's close in
+  force and extension count (never lower than stored), and an extension
+  sets them from the published extensions, so a re-upload of an earlier
+  extension moves neither backwards; a cached `404` for an extension
+  means none yet.
 - **0.2.7 (2026-11-02):** an upload whose document was written answers
   `201` even if the index update failed, with `"index_updated": false`
   in the body (it was `503`, so the publisher could not tell whether the
