@@ -16,6 +16,7 @@ import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as sns from 'aws-cdk-lib/aws-sns';
+import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import { Construct } from 'constructs';
 
 /** The Lambda's timeout: well under the minute between an extension's
@@ -48,6 +49,12 @@ export const MONITOR_OIDC = {
   sub: 'repo:vettid@168311946/votes@1438447065:ref:refs/heads/main',
   jobWorkflowRef: 'vettid/votes/.github/workflows/monitor.yml@refs/heads/main',
 } as const;
+
+/** The WAF's per-address rule on uploads: at most this many requests
+ * under /api/ from one IP address in API_RATE_WINDOW_SECONDS, beyond
+ * which they are blocked (docs/VOTES-SITE.md §4, "Limits"). */
+export const API_RATE_LIMIT = 100;
+export const API_RATE_WINDOW_SECONDS = 300;
 
 export interface VotesStackProps extends cdk.StackProps {
   readonly envName: string;
@@ -117,6 +124,7 @@ export class VotesStack extends cdk.Stack {
   readonly bucket: s3.Bucket;
   readonly fn: lambda.Function;
   readonly distribution: cloudfront.Distribution;
+  readonly webAcl: wafv2.CfnWebACL;
 
   constructor(scope: Construct, id: string, props: VotesStackProps) {
     super(scope, id, props);
@@ -257,6 +265,46 @@ export class VotesStack extends cdk.Stack {
         referrerPolicy: { referrerPolicy: cloudfront.HeadersReferrerPolicy.NO_REFERRER, override: true },
       },
     });
+    // AWS WAF in front of CloudFront (scope CLOUDFRONT, which must be in
+    // us-east-1, as this stack is): one rate rule per source address on
+    // uploads; everything else passes. The stage throttle above is for the
+    // whole API; this keeps one address from taking all of it. Metrics
+    // only, no request sampling or logging: the site keeps no record of
+    // readers (§5).
+    this.webAcl = new wafv2.CfnWebACL(this, 'WebAcl', {
+      name: `${prefix}-web-acl`,
+      scope: 'CLOUDFRONT',
+      defaultAction: { allow: {} },
+      customResponseBodies: { rateLimited: { contentType: 'APPLICATION_JSON', content: '{"error":"rate_limited"}' } },
+      visibilityConfig: { cloudWatchMetricsEnabled: true, metricName: `${prefix}-web-acl`, sampledRequestsEnabled: false },
+      rules: [{
+        name: 'ApiRatePerIp',
+        priority: 0,
+        // 429, not WAF's default 403: a client (the service vault's
+        // publisher) retries a 429 and takes a 403 as a final refusal.
+        action: { block: { customResponse: { responseCode: 429, customResponseBodyKey: 'rateLimited' } } },
+        statement: {
+          rateBasedStatement: {
+            limit: API_RATE_LIMIT,
+            evaluationWindowSec: API_RATE_WINDOW_SECONDS,
+            aggregateKeyType: 'IP',
+            scopeDownStatement: {
+              byteMatchStatement: {
+                fieldToMatch: { uriPath: {} },
+                positionalConstraint: 'STARTS_WITH',
+                searchString: '/api/',
+                // As CloudFront routes it: decoded, then with dot
+                // segments and repeated slashes removed, so /%61pi/,
+                // /./api/, /v1/../api/ and //api/ are all counted.
+                textTransformations: [{ priority: 0, type: 'URL_DECODE' }, { priority: 1, type: 'NORMALIZE_PATH' }],
+              },
+            },
+          },
+        },
+        visibilityConfig: { cloudWatchMetricsEnabled: true, metricName: `${prefix}-api-rate`, sampledRequestsEnabled: false },
+      }],
+    });
+
     const apiDomain = cdk.Fn.select(2, cdk.Fn.split('/', api.apiEndpoint));
     this.distribution = new cloudfront.Distribution(this, 'Cdn', {
       comment: `votes.vettid.org (${props.envName})`,
@@ -265,6 +313,7 @@ export class VotesStack extends cdk.Stack {
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
       // No access logs: the site keeps no record of readers (§5).
       enableLogging: false,
+      webAclId: this.webAcl.attrArn,
       defaultBehavior: {
         // LIST as well as READ, so that a missing document is a 404.
         origin: origins.S3BucketOrigin.withOriginAccessControl(this.bucket, {

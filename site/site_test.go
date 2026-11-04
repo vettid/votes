@@ -8,6 +8,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"filippo.io/edwards25519"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/vettid/service-vault/vote"
 	"github.com/vettid/vettid-vault/vms/suite"
@@ -407,6 +409,73 @@ func TestResultsRefusals(t *testing.T) {
 	want(t, "no rows", code, why, 400, "bad_request")
 	code, why = post(t, s, "results", &f.Results)
 	want(t, "the real results", code, why, 201, "")
+}
+
+// otherSig is another valid Ed25519 signature by seed's key over label ||
+// msg: the same verification, but a random nonce in place of RFC 8032's
+// derived one, so not the bytes suite.Sign makes.
+func otherSig(t *testing.T, seed []byte, label string, msg []byte) []byte {
+	t.Helper()
+	h := sha512.Sum512(seed)
+	a, err := edwards25519.NewScalar().SetBytesWithClamping(h[:32])
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
+	var nonce [64]byte
+	_, _ = rand.Read(nonce[:])
+	r, _ := edwards25519.NewScalar().SetUniformBytes(nonce[:])
+	R := new(edwards25519.Point).ScalarBaseMult(r).Bytes()
+	kh := sha512.New()
+	kh.Write(R)
+	kh.Write(pub)
+	kh.Write([]byte(label))
+	kh.Write(msg)
+	k, _ := edwards25519.NewScalar().SetUniformBytes(kh.Sum(nil))
+	S := edwards25519.NewScalar().MultiplyAdd(k, a, r)
+	sig := append(R, S.Bytes()...)
+	if suite.Verify(pub, label, msg, sig) != nil {
+		t.Fatal("otherSig: doesn't verify")
+	}
+	return sig
+}
+
+// The fixture's proposal and extension with other valid signatures: the
+// same documents, so their anchors still verify.
+func (f *fixture) resigned(t *testing.T) (proposal, extension *Upload) {
+	t.Helper()
+	proposal = mut(f.Proposal, func(u *Upload) {
+		u.Sig = otherSig(t, f.ServiceSeed, vote.LabelProposal, vote.ProposalSigMsg(u.Doc))
+	})
+	m, _ := vote.DocSigMsg(sha(f.Proposal.Doc), f.Extension.Doc)
+	extension = mut(f.Extension, func(u *Upload) { u.Sig = otherSig(t, f.ServiceSeed, vote.LabelExtended, m) })
+	if bytes.Equal(proposal.Sig, f.Proposal.Sig) || bytes.Equal(extension.Sig, f.Extension.Sig) {
+		t.Fatal("resigned: the same signatures")
+	}
+	return proposal, extension
+}
+
+// The results carry each published document's signature byte for byte:
+// another valid signature of the same proposal or extension is refused.
+func TestResultsPublishedSigs(t *testing.T) {
+	f := loadFixture(t)
+	p2, e2 := f.resigned(t)
+	for name, c := range map[string]struct{ proposal, extension *Upload }{
+		"proposal":  {p2, &f.Extension},
+		"extension": {&f.Proposal, e2},
+	} {
+		s, st := newSite(t, f, f.during())
+		code, why := post(t, s, "proposal", c.proposal)
+		want(t, name+": proposal", code, why, 201, "")
+		code, why = post(t, s, "extension-1", c.extension)
+		want(t, name+": extension", code, why, 201, "")
+		at(s, f.closed())
+		code, why = post(t, s, "results", &f.Results)
+		want(t, name+": results with another signature", code, why, 422, "sig_mismatch")
+		if st.Objects[docPath(testID, "results")] != nil {
+			t.Fatalf("%s: results published", name)
+		}
+	}
 }
 
 // Extension n waits for n−1; numbers past 24 aren't routes.

@@ -167,6 +167,24 @@ func TestCheckListing(t *testing.T) {
 	}
 }
 
+// The results' embedded signatures must be the published .sig files: a
+// vote whose proposal or extension is served with another valid
+// signature fails the check, naming the document.
+func TestCheckPublishedSigs(t *testing.T) {
+	f := loadFixture(t)
+	objs := published(t, f, true)
+	p2, e2 := f.resigned(t)
+	for name, sig := range map[string][]byte{"proposal": p2.Sig, "extension-1": e2.Sig} {
+		o := maps.Clone(objs)
+		o[docPath(testID, name)+".sig"] = sig
+		_, err := check(t, f, o, testID)
+		if err == nil || !strings.Contains(err.Error(), "results: sig_mismatch") ||
+			!strings.Contains(err.Error(), "the published "+name+".json.sig") {
+			t.Fatalf("%s served with another signature: %v", name, err)
+		}
+	}
+}
+
 // The upload API's request rules are applied: a part the site should have
 // refused fails the check.
 func TestCheckUploadRules(t *testing.T) {
