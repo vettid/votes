@@ -240,10 +240,7 @@ reports to AWS (**Alerts**, below).
   one. Another partial of the same proposal isn't covered. An entry that
   matches no permanent partial upload (completed, still retryable, or
   wrong) is a mismatch, so the list stays true. Each entry is added by a
-  PR that gives its reason; both lists start empty. `main` is protected
-  (a pull request with one approving review), and `.github/CODEOWNERS`
-  requires the owner's review for `monitor/`, the monitor's workflow and
-  the embedded trusted root (`site/roots/`). **The hashes:** the
+  PR that gives its reason; both lists start empty. **The hashes:** the
   report's `partial_objects` lists, for each partial upload, its served
   objects as the entry takes them (`key` and `sha256`), so an entry is
   copied from the failing run's report; or, by hand,
