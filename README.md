@@ -69,8 +69,9 @@ be completed (an extension past its close; `partial_permanent`) can be
 acknowledged: `-acknowledged <file>` reads a JSON array of
 `{proposal_id, document, reason, acknowledged_at}` (for the monitor,
 `monitor/acknowledged-<env>.json`, each entry added by PR with its
-reason), and a partial it lists is reported in `acknowledged`, not as a
-mismatch; an entry that matches no partial upload is a mismatch.
+reason), and a permanent partial it lists is reported in `acknowledged`,
+not as a mismatch; an entry that matches no permanent partial upload
+(completed, still retryable, or wrong) is a mismatch.
 **`-all`** also walks the service
 list's kept versions, `services/1.json` to the current one, checking
 each signature and that each extends the one before, then checks every

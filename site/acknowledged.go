@@ -56,15 +56,18 @@ func ParseAcknowledged(b []byte) ([]Acknowledgement, error) {
 }
 
 // Acknowledge applies the acknowledgements of this report's proposal: a
-// partial upload they list is reported in Acknowledged and is no longer a
-// mismatch; one they list that isn't partial (completed, or a wrong entry)
-// is a mismatch, so that the list stays true.
+// partial upload they list that the site can no longer complete is
+// reported in Acknowledged and is no longer a mismatch; one they list that
+// isn't such a partial (completed, still retryable, or a wrong entry) is a
+// mismatch, so that the list stays true.
 func (r *Report) Acknowledge(acks []Acknowledgement) {
 	for _, a := range acks {
 		if a.ProposalID != r.ProposalID {
 			continue
 		}
-		if !slices.Contains(r.Partial, a.Document) {
+		// Only a partial the site can never complete may be acknowledged
+		// (PartialPermanent); a retryable one stays a mismatch.
+		if !slices.Contains(r.PartialPermanent, a.Document) {
 			r.Mismatches = append(r.Mismatches, StaleAcknowledgement(a))
 			continue
 		}
@@ -76,7 +79,7 @@ func (r *Report) Acknowledge(acks []Acknowledgement) {
 }
 
 // StaleAcknowledgement is the mismatch for an acknowledgement that
-// matches no partial upload.
+// matches no permanent partial upload.
 func StaleAcknowledgement(a Acknowledgement) string {
-	return "acknowledged: " + a.ProposalID + " " + a.Document + ": not a partial upload (remove the entry)"
+	return "acknowledged: " + a.ProposalID + " " + a.Document + ": not a partial upload the site can no longer complete (remove the entry)"
 }

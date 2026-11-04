@@ -202,9 +202,10 @@ should watch the workflow's status.
   and `-prod.json` (passed with `-acknowledged <file>`) are strict JSON
   arrays of `{proposal_id, document, reason, acknowledged_at}`, with
   `document` such as `extension-2` and `acknowledged_at` a `YYYY-MM-DD`
-  date. A partial upload they list is reported in `acknowledged` and is
-  not a mismatch. An entry that matches no partial upload (completed, or
-  wrong) is a mismatch, so the list stays true. Each entry is added by a
+  date. A permanent partial upload they list is reported in
+  `acknowledged` and is not a mismatch. An entry that matches no
+  permanent partial upload (completed, still retryable, or wrong) is a
+  mismatch, so the list stays true. Each entry is added by a
   PR that gives its reason; both lists start empty.
 - **Fetches:** a network error or a `5xx` is retried twice (after 1 and
   3 seconds) before it counts as a failed check; with `-all`, an index

@@ -289,6 +289,14 @@ func TestCheckPermanentPartial(t *testing.T) {
 		if c.permanent != strings.Contains(strings.Join(rep.Mismatches, "\n"), "(permanent") {
 			t.Fatalf("%s: mismatches %v", name, rep.Mismatches)
 		}
+		// Only a permanent partial may be acknowledged; acknowledging a
+		// retryable one is itself a mismatch.
+		ack := Acknowledgement{ProposalID: testID, Document: "extension-2", Reason: "x", AcknowledgedAt: "2026-11-04"}
+		rep.Acknowledge([]Acknowledgement{ack})
+		stale := slices.Contains(rep.Mismatches, StaleAcknowledgement(ack))
+		if acked := slices.Contains(rep.Acknowledged, "extension-2"); acked != c.permanent || stale == c.permanent {
+			t.Fatalf("%s: acknowledged %v, mismatches %v", name, rep.Acknowledged, rep.Mismatches)
+		}
 	}
 }
 
