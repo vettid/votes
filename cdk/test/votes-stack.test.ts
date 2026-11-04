@@ -176,7 +176,7 @@ describe('edge', () => {
     });
   });
 
-  test('the rule is scoped down to URI paths starting with /api/', () => {
+  test('the rule is scoped down to URI paths starting with /api/, decoded and normalized first', () => {
     const acl = Object.values(t.findResources('AWS::WAFv2::WebACL'))[0] as any;
     const scope = acl.Properties.Rules[0].Statement.RateBasedStatement.ScopeDownStatement;
     expect(scope).toEqual({
@@ -184,7 +184,7 @@ describe('edge', () => {
         FieldToMatch: { UriPath: {} },
         PositionalConstraint: 'STARTS_WITH',
         SearchString: '/api/',
-        TextTransformations: [{ Priority: 0, Type: 'NONE' }],
+        TextTransformations: [{ Priority: 0, Type: 'URL_DECODE' }, { Priority: 1, Type: 'NORMALIZE_PATH' }],
       },
     });
   });

@@ -254,7 +254,10 @@ export class VotesStack extends cdk.Stack {
                 fieldToMatch: { uriPath: {} },
                 positionalConstraint: 'STARTS_WITH',
                 searchString: '/api/',
-                textTransformations: [{ priority: 0, type: 'NONE' }],
+                // As CloudFront routes it: decoded, then with dot
+                // segments and repeated slashes removed, so /%61pi/,
+                // /./api/, /v1/../api/ and //api/ are all counted.
+                textTransformations: [{ priority: 0, type: 'URL_DECODE' }, { priority: 1, type: 'NORMALIZE_PATH' }],
               },
             },
           },

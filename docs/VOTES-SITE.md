@@ -142,7 +142,8 @@ per route or per client: 10 requests a second, bursts of 20, beyond
 which API Gateway answers `429`. In front of it, an AWS WAF web ACL on
 the CloudFront distribution with one rate-based rule: at most 100
 requests in any 5 minutes from one IP address to a path starting with
-`/api/`, beyond which that address's requests there are blocked (`403`)
+`/api/` (after URL-decoding and normalizing it, as CloudFront routes
+it), beyond which that address's requests there are blocked (`403`)
 until its rate falls below the limit. Everything else is allowed. The
 ACL keeps CloudWatch metrics only: request sampling is off, so it keeps
 no source addresses (§5).
@@ -151,7 +152,8 @@ no source addresses (§5).
 
 Nothing. CloudFront access logs are off. The WAF counts requests per
 address only for its rate rule's window, with no logging and no request
-sampling. API Gateway access logs carry the route, status, size and
+sampling; the addresses its rule is blocking at the moment can be read
+through the WAF API while the block lasts, and are gone after. API Gateway access logs carry the route, status, size and
 latency, never the source address. The function logs ids, types, sizes
 and error codes.
 
@@ -166,7 +168,8 @@ and error codes.
 
 - **0.2.9 (2026-11-04):** the limits are as deployed: the stage throttle
   (the whole stage, 10/s, burst 20) and an AWS WAF per-address rate rule
-  on `/api/` (100 requests in 5 minutes), now in the stack; the service
+  on `/api/` (100 requests in 5 minutes, on the decoded and normalized
+  path), now in the stack; the service
   list is the operator's, published with `votesctl publish-services`,
   not a file in this repository.
 
