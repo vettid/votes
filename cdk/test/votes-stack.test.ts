@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import { LAMBDA_TIMEOUT_SECONDS, VotesStack, validSiteKey } from '../lib/votes-stack';
+import { API_RATE_LIMIT, API_RATE_WINDOW_SECONDS, LAMBDA_TIMEOUT_SECONDS, VotesStack, validSiteKey } from '../lib/votes-stack';
 
 // A fixed public test value, not a real key: 32 bytes of 0x07.
 const SITE_KEY = Buffer.alloc(32, 7).toString('base64');
@@ -152,6 +152,47 @@ describe('edge', () => {
     expect(c.Aliases).toEqual(['votes.example.org']);
     expect(c.CacheBehaviors.map((b: any) => b.PathPattern)).toEqual(['/api/*']);
     t.resourceCountIs('AWS::CloudFront::OriginAccessControl', 1);
+  });
+
+  test('a WAF web ACL for CloudFront: allow by default, metrics on, no sampled requests', () => {
+    t.resourceCountIs('AWS::WAFv2::WebACL', 1);
+    t.hasResourceProperties('AWS::WAFv2::WebACL', {
+      Scope: 'CLOUDFRONT',
+      DefaultAction: { Allow: {} },
+      VisibilityConfig: Match.objectLike({ CloudWatchMetricsEnabled: true, SampledRequestsEnabled: false }),
+    });
+  });
+
+  test('its one rule: 100 requests per 5 minutes per IP under /api/, then blocked', () => {
+    expect(API_RATE_LIMIT).toBe(100);
+    expect(API_RATE_WINDOW_SECONDS).toBe(300);
+    const acl = Object.values(t.findResources('AWS::WAFv2::WebACL'))[0] as any;
+    const rules: any[] = acl.Properties.Rules;
+    expect(rules).toHaveLength(1);
+    expect(rules[0]).toMatchObject({
+      Action: { Block: {} },
+      VisibilityConfig: { CloudWatchMetricsEnabled: true },
+      Statement: { RateBasedStatement: { Limit: 100, EvaluationWindowSec: 300, AggregateKeyType: 'IP' } },
+    });
+  });
+
+  test('the rule is scoped down to URI paths starting with /api/', () => {
+    const acl = Object.values(t.findResources('AWS::WAFv2::WebACL'))[0] as any;
+    const scope = acl.Properties.Rules[0].Statement.RateBasedStatement.ScopeDownStatement;
+    expect(scope).toEqual({
+      ByteMatchStatement: {
+        FieldToMatch: { UriPath: {} },
+        PositionalConstraint: 'STARTS_WITH',
+        SearchString: '/api/',
+        TextTransformations: [{ Priority: 0, Type: 'NONE' }],
+      },
+    });
+  });
+
+  test('the distribution is behind the web ACL', () => {
+    const acls = Object.keys(t.findResources('AWS::WAFv2::WebACL'));
+    const d = Object.values(t.findResources('AWS::CloudFront::Distribution'))[0] as any;
+    expect(d.Properties.DistributionConfig.WebACLId).toEqual({ 'Fn::GetAtt': [acls[0], 'Arn'] });
   });
 
   test('the site key secret is retained', () => {

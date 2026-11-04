@@ -13,6 +13,7 @@ import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import { Construct } from 'constructs';
 
 /** The Lambda's timeout: well under the minute between an extension's
@@ -23,6 +24,12 @@ export const LAMBDA_TIMEOUT_SECONDS = 20;
  * enforced by the bucket policy), the index and the archive. Not the
  * service list, which only the operator's votesctl writes. */
 export const WRITE_PATHS = ['v1/p/*', 'v1/index.json', 'v1/archive/*'] as const;
+
+/** The WAF's per-address rule on uploads: at most this many requests
+ * under /api/ from one IP address in API_RATE_WINDOW_SECONDS, beyond
+ * which they are blocked (docs/VOTES-SITE.md §4, "Limits"). */
+export const API_RATE_LIMIT = 100;
+export const API_RATE_WINDOW_SECONDS = 300;
 
 export interface VotesStackProps extends cdk.StackProps {
   readonly envName: string;
@@ -81,6 +88,7 @@ export class VotesStack extends cdk.Stack {
   readonly bucket: s3.Bucket;
   readonly fn: lambda.Function;
   readonly distribution: cloudfront.Distribution;
+  readonly webAcl: wafv2.CfnWebACL;
 
   constructor(scope: Construct, id: string, props: VotesStackProps) {
     super(scope, id, props);
@@ -221,6 +229,40 @@ export class VotesStack extends cdk.Stack {
         referrerPolicy: { referrerPolicy: cloudfront.HeadersReferrerPolicy.NO_REFERRER, override: true },
       },
     });
+    // AWS WAF in front of CloudFront (scope CLOUDFRONT, which must be in
+    // us-east-1, as this stack is): one rate rule per source address on
+    // uploads; everything else passes. The stage throttle above is for the
+    // whole API; this keeps one address from taking all of it. Metrics
+    // only, no request sampling or logging: the site keeps no record of
+    // readers (§5).
+    this.webAcl = new wafv2.CfnWebACL(this, 'WebAcl', {
+      name: `${prefix}-web-acl`,
+      scope: 'CLOUDFRONT',
+      defaultAction: { allow: {} },
+      visibilityConfig: { cloudWatchMetricsEnabled: true, metricName: `${prefix}-web-acl`, sampledRequestsEnabled: false },
+      rules: [{
+        name: 'ApiRatePerIp',
+        priority: 0,
+        action: { block: {} },
+        statement: {
+          rateBasedStatement: {
+            limit: API_RATE_LIMIT,
+            evaluationWindowSec: API_RATE_WINDOW_SECONDS,
+            aggregateKeyType: 'IP',
+            scopeDownStatement: {
+              byteMatchStatement: {
+                fieldToMatch: { uriPath: {} },
+                positionalConstraint: 'STARTS_WITH',
+                searchString: '/api/',
+                textTransformations: [{ priority: 0, type: 'NONE' }],
+              },
+            },
+          },
+        },
+        visibilityConfig: { cloudWatchMetricsEnabled: true, metricName: `${prefix}-api-rate`, sampledRequestsEnabled: false },
+      }],
+    });
+
     const apiDomain = cdk.Fn.select(2, cdk.Fn.split('/', api.apiEndpoint));
     this.distribution = new cloudfront.Distribution(this, 'Cdn', {
       comment: `votes.vettid.org (${props.envName})`,
@@ -229,6 +271,7 @@ export class VotesStack extends cdk.Stack {
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
       // No access logs: the site keeps no record of readers (§5).
       enableLogging: false,
+      webAclId: this.webAcl.attrArn,
       defaultBehavior: {
         // LIST as well as READ, so that a missing document is a 404.
         origin: origins.S3BucketOrigin.withOriginAccessControl(this.bucket, {
