@@ -24,9 +24,9 @@ one: the service's signature and the Rekor anchor catch that.
 | Part | What it is |
 |---|---|
 | Bucket | Private S3 bucket, versioned, blocking public access. Read only through CloudFront (origin access control). Written only by the upload function, which cannot delete. |
-| CloudFront | `votes.vettid.org`. Serves `/v1/*` from the bucket and `/api/*` from the API. Security headers as vettid.org's sites. No access logs. |
+| CloudFront | `votes.vettid.org`. Serves `/v1/*` from the bucket and `/api/*` from the API. Security headers as vettid.org's sites. No access logs. Behind an AWS WAF web ACL with one rate rule (§4, "Limits"). |
 | Upload API | API Gateway HTTP API → Lambda `votes-api` (Go, arm64). |
-| Service list | `services.json` in this repository, changed only by PR, signed with the site's Ed25519 key and uploaded by the operator (BALLOT-PROTOCOL §3.3). The function reads it on every upload and checks it under the site's public key whenever its bytes or its signature's differ from the pair it checked last. |
+| Service list | `services.json`, kept by VettID's operator (a service is added by the owner, BALLOT-PROTOCOL §3.3), not in this repository. The operator's `votesctl publish-services` signs it with the site's Ed25519 key and writes it to the bucket as `v1/services.json` and `.sig`, refusing a list that doesn't extend the published one, and keeps each version as `v1/services/<version>.json` (§3): the bucket's copies are the record of every list. The function reads it on every upload and checks it under the site's public key whenever its bytes or its signature's differ from the pair it checked last. |
 | Stack | CDK (TypeScript), `VotesSite-staging` and `VotesSite-prod`, as member-service. |
 
 **(chosen; not in the spec:** Lambda rather than an ECS service, because
@@ -141,14 +141,27 @@ cache for a short time) only means none yet: check again later.
 about 250 bytes, so that holds about 20,000 eligible members. Larger
 votes need a two-step upload through the bucket; not in 0.2.0.
 
-**Limits:** API Gateway throttling per route, and AWS WAF's rate rule on
-`/api/*`.
+**Limits:** the HTTP API's stage throttle, for the whole stage and not
+per route or per client: 10 requests a second, bursts of 20, beyond
+which API Gateway answers `429`. In front of it, an AWS WAF web ACL on
+the CloudFront distribution with one rate-based rule: at most 100
+requests in any 5 minutes from one IP address to a path starting with
+`/api/` (after URL-decoding and normalizing it, as CloudFront routes
+it), beyond which that address's requests there are answered `429`
+(`{"error":"rate_limited"}`, not WAF's default `403`, since a client
+retries a `429` and takes a `403` as final) until its rate falls below
+the limit. Everything else is allowed. The
+ACL keeps CloudWatch metrics only: request sampling is off, so it keeps
+no source addresses (§5).
 
 ## 5. What the site keeps about readers
 
-Nothing. CloudFront access logs are off. API Gateway access logs carry
-the route, status, size and latency, never the source address. The
-function logs ids, types, sizes and error codes.
+Nothing. CloudFront access logs are off. The WAF counts requests per
+address only for its rate rule's window, with no logging and no request
+sampling; the addresses its rule is blocking at the moment can be read
+through the WAF API while the block lasts, and are gone after. API Gateway access logs carry the route, status, size and
+latency, never the source address. The function logs ids, types, sizes
+and error codes.
 
 ## 6. Deployment
 
@@ -163,6 +176,12 @@ function logs ids, types, sizes and error codes.
   proposal and each extension must be the published `.sig` files byte
   for byte (§4 item 5), or the upload is refused with `sig_mismatch`;
   `votesctl check` fails such a vote, naming the document.
+- **0.2.9 (2026-11-04):** the limits are as deployed: the stage throttle
+  (the whole stage, 10/s, burst 20) and an AWS WAF per-address rate rule
+  on `/api/` (100 requests in 5 minutes, on the decoded and normalized
+  path, answered `429`), now in the stack; the service
+  list is the operator's, published with `votesctl publish-services`,
+  not a file in this repository.
 
 - **0.2.8 (2026-11-02):** the results always set the index's close in
   force and extension count (never lower than stored), and an extension
