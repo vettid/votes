@@ -6,7 +6,9 @@ import { VotesStack } from '../lib/votes-stack';
 // all required: envName, hostName, hostedZoneId, zoneName, sigstore
 // (staging or production), and siteKey (the site's public key from
 // `votesctl site-key`) on every deploy but the first, which passes
-// firstDeploy=true instead. See README "Deployment".
+// firstDeploy=true instead. Optional, together: alarmTopicArn and
+// githubOidcProviderArn, for the monitor's alerts and heartbeat
+// (docs/VOTES-SITE.md §7). See README "Deployment".
 const app = new cdk.App();
 const ctx = (key: string): string | undefined => {
   const v = app.node.tryGetContext(key);
@@ -41,6 +43,8 @@ const stack = new VotesStack(app, `VotesSite-${envName}`, {
   sigstore,
   siteKey,
   servicesRepair: repair === 'true',
+  alarmTopicArn: ctx('alarmTopicArn'),
+  githubOidcProviderArn: ctx('githubOidcProviderArn'),
   // Pinned: CloudFront's certificate must be in us-east-1.
   env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: 'us-east-1' },
   description: `votes.vettid.org (${envName})`,

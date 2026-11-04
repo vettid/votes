@@ -1,0 +1,158 @@
+name: monitor
+
+# Checks what each votes site serves, hourly, as an observer would
+# (README "Checking a vote"): `votesctl check -all` walks the service
+# list's kept versions and checks every proposal in the index and the
+# archive. The job fails on a failed check (exit 1) or a mismatch (exit 3,
+# "ok": false), and the report is in its log.
+#
+# The site keys are public. Staging's is the member vaults' release config
+# (vettid-vault, enclave/releasecfg/staging.json, vote_site_key), used
+# unless the repository variable VOTES_STAGING_SITE_KEY overrides it.
+# Production's is not published yet: set the repository variable
+# VOTES_PROD_SITE_KEY to it (`votesctl site-key`) once production is
+# deployed; until then its check is skipped with a warning.
+#
+# Partial uploads the site can never complete are listed, each by PR with
+# its reason, in monitor/acknowledged-<env>.json (docs/VOTES-SITE.md §7).
+#
+# Alerts (docs/VOTES-SITE.md §7). GitHub mails a failed run only to
+# whoever last changed the cron line, and disables a schedule after 60
+# days without activity in the repository, so a run also reports to AWS:
+# it assumes the stack's monitor role through GitHub's OIDC provider
+# (only this workflow, on main, may), then publishes a failed run (a
+# mismatch or an error) to the alert topic, or puts the heartbeat after a
+# successful check. The heartbeat's alarm, three hours without one,
+# notifies the same topic: it catches a schedule that stopped. The role
+# and the topic are repository variables (not secrets: neither is one),
+# per environment: VOTES_<STAGING|PROD>_MONITOR_ROLE_ARN (the stack's
+# MonitorRoleArn output) and VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN (its
+# alarmTopicArn). While either is unset the run warns and reports to no
+# one but GitHub.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The stack's region (cdk/bin/votes.ts pins it): the heartbeat's alarm
+  # is there.
+  AWS_REGION: us-east-1
+  HEARTBEAT_NAMESPACE_PREFIX: VettID/Votes/
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # the OIDC token the monitor role is assumed with
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: staging
+            site: https://votes.staging.vettid.org
+            sigstore: staging
+            key_var: VOTES_STAGING_SITE_KEY
+            default_key: c4dqg2ssGVylbO9Xnpdv4zopmzx9S++4KgxMWOyhXJQ=
+            role_var: VOTES_STAGING_MONITOR_ROLE_ARN
+            topic_var: VOTES_STAGING_ALERT_TOPIC_ARN
+          - env: prod
+            site: https://votes.vettid.org
+            sigstore: production
+            key_var: VOTES_PROD_SITE_KEY
+            default_key: ""
+            role_var: VOTES_PROD_MONITOR_ROLE_ARN
+            topic_var: VOTES_PROD_ALERT_TOPIC_ARN
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: build votesctl
+        run: CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/votesctl" ./cmd/votesctl
+      - name: embedded trusted root's age
+        if: matrix.env == 'staging'
+        run: |
+          at=$(date -d "$(cat site/roots/embedded_at)" +%s)
+          days=$(( ($(date +%s) - at) / 86400 ))
+          echo "the embedded Sigstore trusted roots are $days days old"
+          if [ "$days" -gt 60 ]; then
+            echo "::warning::the embedded Sigstore trusted roots are $days days old: refresh them (go generate ./site) before 90"
+          fi
+      - name: votesctl check -all (${{ matrix.env }})
+        id: check
+        env:
+          SITE: ${{ matrix.site }}
+          SIGSTORE: ${{ matrix.sigstore }}
+          SITE_KEY: ${{ vars[matrix.key_var] || matrix.default_key }}
+          KEY_VAR: ${{ matrix.key_var }}
+        run: |
+          if [ -z "$SITE_KEY" ]; then
+            echo "::warning::$SITE not checked: set the repository variable $KEY_VAR to its site key"
+            exit 0
+          fi
+          code=0
+          "$RUNNER_TEMP/votesctl" check -all -site "$SITE" -sigstore "$SIGSTORE" -site-key "$SITE_KEY" \
+            -acknowledged "monitor/acknowledged-${{ matrix.env }}.json" || code=$?
+          echo "checked=true" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+      # Reporting to AWS: after the check, whatever its outcome, unless
+      # the run was cancelled. A run from another branch can't assume the
+      # role, so it doesn't try.
+      - name: alerts not configured
+        if: ${{ !cancelled() && (vars[matrix.role_var] == '' || vars[matrix.topic_var] == '') }}
+        env:
+          ROLE_VAR: ${{ matrix.role_var }}
+          TOPIC_VAR: ${{ matrix.topic_var }}
+          ENV_NAME: ${{ matrix.env }}
+        run: |
+          echo "::warning::$ENV_NAME: no alert or heartbeat sent: set the repository variables $ROLE_VAR and $TOPIC_VAR (docs/VOTES-SITE.md §7)"
+      - name: AWS credentials (the monitor role)
+        id: aws
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && vars[matrix.role_var] != '' && vars[matrix.topic_var] != '' }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars[matrix.role_var] }}
+          role-session-name: votes-monitor-${{ matrix.env }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: alert (a failed run)
+        if: ${{ failure() && steps.aws.outcome == 'success' }}
+        env:
+          TOPIC_ARN: ${{ vars[matrix.topic_var] }}
+          CODE: ${{ steps.check.outputs.code }}
+          ENV_NAME: ${{ matrix.env }}
+          SITE: ${{ matrix.site }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$CODE" in
+            3) what="mismatches (votesctl check exit 3)" ;;
+            1) what="a check failed (votesctl check exit 1)" ;;
+            "") what="the run failed before the check" ;;
+            *) what="votesctl check exit $CODE" ;;
+          esac
+          region=$(cut -d: -f4 <<<"$TOPIC_ARN")
+          aws sns publish --region "$region" --topic-arn "$TOPIC_ARN" \
+            --subject "votes monitor ($ENV_NAME): failed" \
+            --message "$(printf 'The votes monitor failed for %s (%s): %s.\nThe report is in the log of the run: %s\n' "$ENV_NAME" "$SITE" "$what" "$RUN_URL")"
+      # Only after a check that ran: a skipped one (no site key) puts none.
+      - name: heartbeat (a successful check)
+        if: ${{ success() && steps.check.outputs.checked == 'true' && steps.aws.outcome == 'success' }}
+        env:
+          ENV_NAME: ${{ matrix.env }}
+        run: |
+          aws cloudwatch put-metric-data --region "$AWS_REGION" --namespace "${HEARTBEAT_NAMESPACE_PREFIX}${{ matrix.env }}" \
+            --metric-name MonitorHeartbeat --dimensions "env=$ENV_NAME" --value 1 --unit Count

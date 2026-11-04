@@ -12,6 +12,14 @@
 //	    (BALLOT-PROTOCOL §8.4): every document is put through the upload
 //	    API's own checks, each at its anchor's time, and the results
 //	    against the rows; prints a JSON report, or fails
+//	votesctl check -all [-since YYYY-MM] -site-key <base64> [...]
+//	    checks the service list's kept versions as a chain, and every
+//	    proposal in index.json and the archive; prints one JSON report
+//
+// check exits 0 when every check held and the report has ok true; 1 when
+// a check failed (with -all, the report is printed first and names each);
+// 2 for a usage error; 3 when the checks held but the report has ok false:
+// a mismatch (docs/VOTES-SITE.md §7).
 //
 // The site's key is derived from its Secrets Manager secret as
 // Ed25519(seed = SHA-256(secret string)).
@@ -27,7 +35,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -62,19 +69,7 @@ func main() {
 		_ = fs.Parse(os.Args[2:])
 		err = publish(ctx, *secret, *bucket, *in)
 	case "check":
-		fs := flag.NewFlagSet("check", flag.ExitOnError)
-		base := fs.String("site", "https://votes.vettid.org", "the site")
-		key := fs.String("site-key", "", "the site's public key (base64), from its release config")
-		instance := fs.String("sigstore", site.Production, "the Sigstore instance the votes are anchored in")
-		rootFile := fs.String("trusted-root", "", "a Sigstore trusted root file, instead of fetching it")
-		_ = fs.Parse(os.Args[2:])
-		if fs.NArg() != 1 {
-			usage()
-		}
-		var anchors *site.Anchors
-		if anchors, err = anchorsFor(*instance, *rootFile); err == nil {
-			err = checkVote(ctx, os.Stdout, httpFetcher(*base, noRedirects()), anchors, *key, fs.Arg(0), time.Now())
-		}
+		os.Exit(runCheck(ctx, os.Args[2:], os.Stdout, os.Stderr))
 	default:
 		usage()
 	}
@@ -86,7 +81,8 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: votesctl site-key -secret <arn> | publish-services -secret <arn> -bucket <name> -in <file>\n"+
-		"       votesctl check -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] <proposal_id>")
+		"       votesctl check -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] <proposal_id>\n"+
+		"       votesctl check -all [-since YYYY-MM] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>]")
 	os.Exit(2)
 }
 

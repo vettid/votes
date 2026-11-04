@@ -5,6 +5,11 @@
 // or production: the instance whose trusted root bundles are checked
 // against) and VOTES_SITE_KEY (the site's Ed25519 public key, base64,
 // which signs the service list).
+//
+// The trusted root is fetched through the instance's TUF repository at a
+// cold start and at most once a day after; a cold start whose fetch fails
+// runs on the root embedded in the build, unless that is over 90 days
+// old (site.NewAnchors).
 package main
 
 import (
@@ -45,6 +50,9 @@ func run(ctx context.Context, listen string, log *slog.Logger) error {
 	anchors, err := site.NewAnchors(instance)
 	if err != nil {
 		return err
+	}
+	if src := anchors.RootSource(); src != site.RootFromTUF {
+		log.Warn("trusted root: the TUF fetch failed; using the embedded root", "source", src)
 	}
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {

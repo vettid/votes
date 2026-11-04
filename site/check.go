@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
@@ -21,7 +22,23 @@ import (
 // API's request-level rules (parts and sizes) are applied too. The index
 // and the month's archive are compared with what the documents show;
 // a difference is reported, not refused, since the lists are rewritten
-// after a document is published and may lag behind a failed upload.
+// after a document is published and may lag behind a failed upload; one
+// that lasts past ListingGrace is a mismatch, as is a partial upload, or
+// an anchor whose two times differ by more than MaxSkew (Report.Mismatches).
+
+// ListingGrace is how long after the latest document's anchor time the
+// index and the archive may still differ from the documents, and how long
+// after its timestamp an upload may stay partial, before the check calls
+// it a mismatch: an upload anchors, then writes its parts and the lists
+// within seconds, and a failed one is retried at the service's next
+// reconcile.
+const ListingGrace = 10 * time.Minute
+
+// MaxSkew bounds the difference between a bundle's RFC 3161 time and the
+// time Rekor integrated its entry: a service anchors a document by
+// getting both within seconds, so a larger gap means a clock that is off,
+// or a timestamp held back before it was logged.
+const MaxSkew = 10 * time.Minute
 
 // Fetcher reads one published object by path (v1/...): nil, nil when it
 // isn't published.
@@ -48,19 +65,41 @@ type Report struct {
 	// Partial names documents whose signature, bundle or rows are
 	// published without the document: an upload not finished.
 	Partial []string
+	// PartialObjects are each partial upload's served objects, by name,
+	// in key order: what an acknowledgement must list (Acknowledge).
+	PartialObjects map[string][]Object
+	// PartialPermanent names the partial uploads the site can no longer
+	// complete: an extension whose close in force has passed, or once the
+	// results are published (the site refuses it then, §4 item 5). A
+	// retry can't clear one; see partialMismatch.
+	PartialPermanent []string
+	// Acknowledged names the partial uploads an acknowledged list covers
+	// (Acknowledge): reported, not mismatches.
+	Acknowledged []string
 	// Listing names each way index.json or the month's archive differs
 	// from the documents ("archive: missing", "index: closes_at", …).
 	Listing []string
+	// Skew is each document's RFC 3161 time less its Rekor time, by name.
+	Skew map[string]time.Duration
+	// Mismatches are what a monitor fails on: Listing entries past
+	// ListingGrace after the latest anchor, partial uploads past it (or
+	// that can't be dated), and anchors whose times differ by more than
+	// MaxSkew. Empty when the vote is served as it should be.
+	Mismatches []string
 
-	serviceIK []byte
+	serviceIK         []byte
+	partialMismatches map[string]string // each partial's entry in Mismatches
 }
 
 // ErrNotPublished is a proposal the site doesn't serve.
 var ErrNotPublished = errors.New("site: the proposal isn't published")
 
 // Check checks proposal id as served by fetch, under the site's key, at
-// now (for whether the index may have dropped it).
-func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte, id string, now time.Time) (*Report, error) {
+// now (for whether the index may have dropped it). modified is an
+// object's Last-Modified: it dates a partial upload that has no bundle
+// for its grace (nil, or an error: such a partial is a mismatch at once).
+func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte, id string, now time.Time,
+	modified func(ctx context.Context, path string) (time.Time, error)) (*Report, error) {
 	if !vote.ValidProposalID(id) {
 		return nil, errors.New("site: not a proposal id")
 	}
@@ -81,7 +120,10 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 	if err != nil {
 		return nil, err
 	}
-	rep := &Report{ProposalID: id, Anchored: map[string]time.Time{}, Hashes: map[string][]byte{}}
+	rep := &Report{ProposalID: id, Anchored: map[string]time.Time{}, Hashes: map[string][]byte{}, Skew: map[string]time.Duration{}}
+	partialAt := map[string]time.Time{}    // a partial upload's verified timestamp, when it has one
+	partialMod := map[string]time.Time{}   // or, without a bundle, its signature's Last-Modified
+	partialClose := map[string]time.Time{} // a partial extension's close in force
 	// put fetches a document's parts and puts it as the site would have
 	// at its anchor's time; found is false when the document isn't there.
 	put := func(name string, rows bool, f func(*Upload) (bool, error)) (found bool, err error) {
@@ -98,6 +140,30 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		if u.Doc == nil {
 			if u.Sig != nil || u.Bundle != nil {
 				rep.Partial = append(rep.Partial, name)
+				if rep.PartialObjects == nil {
+					rep.PartialObjects = map[string][]Object{}
+				}
+				for _, o := range []struct {
+					key string
+					b   []byte
+				}{{base + ".sig", u.Sig}, {base + ".sigstore.json", u.Bundle}} {
+					if o.b != nil {
+						rep.PartialObjects[name] = append(rep.PartialObjects[name], objectOf(o.key, o.b))
+					}
+				}
+				switch {
+				case u.Bundle != nil:
+					if ts, err := anchors.TimestampOf(u.Bundle); err == nil {
+						partialAt[name] = ts
+					}
+				case modified != nil:
+					// The site writes the signature, then the bundle, within
+					// a second: a signature alone is an upload that stopped
+					// there, dated by when the store wrote it.
+					if t, err := modified(ctx, base+".sig"); err == nil && !t.IsZero() {
+						partialMod[name] = t
+					}
+				}
 			}
 			return false, nil
 		}
@@ -129,15 +195,22 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		if svc == nil {
 			return true, fmt.Errorf("%s: the service isn't listed", name)
 		}
-		ts, err := s.anchor(svc, u)
+		at, err := s.anchorTimes(svc, u)
 		if err != nil {
 			return true, fmt.Errorf("%s: %w", name, err)
 		}
+		ts := at.TSA
 		clock = ts
 		if _, err := f(u); err != nil {
 			return true, fmt.Errorf("%s: %w", name, err)
 		}
 		rep.Anchored[name] = ts
+		if !at.Rekor.IsZero() {
+			rep.Skew[name] = at.TSA.Sub(at.Rekor)
+		}
+		if m := skewMismatch(name, at); m != "" {
+			rep.Mismatches = append(rep.Mismatches, m)
+		}
 		rep.Hashes[name] = sha(u.Doc)
 		if u.Rows != nil {
 			rep.Hashes["rows"] = sha(u.Rows)
@@ -178,6 +251,9 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		}
 		if !found {
 			gap = n
+			if slices.Contains(rep.Partial, name) {
+				partialClose[name] = time.Unix(rep.ClosesAt, 0)
+			}
 			continue
 		}
 		e, _ := vote.ParseExtension(mem.Objects[docPath(id, name)])
@@ -210,7 +286,61 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		}
 		rep.Listing = append(rep.Listing, compareListing(l.name, b, es[0], l.pruned, now)...)
 	}
+	var latest time.Time
+	for _, t := range rep.Anchored {
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	if now.Sub(latest) > ListingGrace {
+		for _, l := range rep.Listing {
+			rep.Mismatches = append(rep.Mismatches, "listing: "+l)
+		}
+	}
+	for _, name := range rep.Partial {
+		c, ext := partialClose[name]
+		permanent := ext && (rep.Results != nil || !now.Before(c))
+		if permanent {
+			rep.PartialPermanent = append(rep.PartialPermanent, name)
+		}
+		t, dated := partialAt[name]
+		mod, byMod := partialMod[name]
+		if m := partialMismatch(name, t, dated, mod, byMod, permanent, now); m != "" {
+			rep.Mismatches = append(rep.Mismatches, m)
+			if rep.partialMismatches == nil {
+				rep.partialMismatches = map[string]string{}
+			}
+			rep.partialMismatches[name] = m
+		}
+	}
 	return rep, nil
+}
+
+// partialMismatch is the mismatch a partial upload makes, or "": one
+// past ListingGrace after its bundle's timestamp, or, with no bundle,
+// after its signature's Last-Modified (mod, when byMod); one that can't
+// be dated either way is one at once. A permanent one
+// (Report.PartialPermanent) is a mismatch past the grace too, and stays
+// one on every later check, as nothing can complete it, until it is on
+// the acknowledged list (Acknowledge).
+func partialMismatch(name string, at time.Time, dated bool, mod time.Time, byMod, permanent bool, now time.Time) string {
+	suffix := ""
+	if permanent {
+		suffix = " (permanent: the site can no longer complete it)"
+	}
+	switch {
+	case dated:
+		if now.Sub(at) > ListingGrace {
+			return "partial: " + name + ": since " + at.UTC().Format(time.RFC3339) + suffix
+		}
+	case byMod:
+		if now.Sub(mod) > ListingGrace {
+			return "partial: " + name + ": since " + mod.UTC().Format(time.RFC3339) + " (its signature's Last-Modified; no bundle)" + suffix
+		}
+	default:
+		return "partial: " + name + ": no verified timestamp" + suffix
+	}
+	return ""
 }
 
 // compareListing compares a served list with the entry the documents
@@ -255,6 +385,19 @@ func compareListing(name string, served []byte, want IndexEntry, pruned bool, no
 	// value that differs is reported.
 	diff("unhandled", got.Unhandled == nil || want.Unhandled != nil && *got.Unhandled == *want.Unhandled)
 	return out
+}
+
+// skewMismatch names an anchor whose RFC 3161 and Rekor times differ by
+// more than MaxSkew, or that has no Rekor time; "" when they agree.
+func skewMismatch(name string, at AnchorTimes) string {
+	d := at.TSA.Sub(at.Rekor)
+	switch {
+	case at.Rekor.IsZero():
+		return "skew: " + name + ": no Rekor integrated time"
+	case d > MaxSkew || d < -MaxSkew:
+		return fmt.Sprintf("skew: %s: the RFC 3161 time is %s from Rekor's", name, d.Round(time.Second))
+	}
+	return ""
 }
 
 // serviceOf is the identity key of a document's service: the proposal's
