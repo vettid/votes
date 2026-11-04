@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.8 (2026-11-02), draft. The protocol this site serves is
+**Status:** 0.2.10 (2026-11-04), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -95,7 +95,11 @@ credential: the service's signature is the authentication.
    - results: uploaded and anchored at least a minute after the final
      `closes_at`, when collection ends (BALLOT-PROTOCOL §7); they pass the observer's check (BALLOT-
      PROTOCOL §8.4) and contain the published proposal and extensions
-     byte for byte, and `rows` hashes to their `rows_hash`.
+     byte for byte, each with its published signature: the `sig` the
+     results carry for the proposal, and for each extension, is byte
+     for byte its published `.sig` (another valid signature of the same
+     document is refused, `sig_mismatch`); and `rows` hashes to their
+     `rows_hash`.
 6. **Write-once** (§2): the signature, the bundle and any rows go up
    first and the document last, so a document is never there without
    them; a retry fills in what a failed upload left out. Anything an
@@ -154,6 +158,11 @@ function logs ids, types, sizes and error codes.
   member-service.
 
 ## Changes
+
+- **0.2.10 (2026-11-04):** the results' embedded signatures of the
+  proposal and each extension must be the published `.sig` files byte
+  for byte (§4 item 5), or the upload is refused with `sig_mismatch`;
+  `votesctl check` fails such a vote, naming the document.
 
 - **0.2.8 (2026-11-02):** the results always set the index's close in
   force and extension count (never lower than stored), and an extension
