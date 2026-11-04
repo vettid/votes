@@ -12,6 +12,13 @@ name: monitor
 # Production's is not published yet: set the repository variable
 # VOTES_PROD_SITE_KEY to it (`votesctl site-key`) once production is
 # deployed; until then its check is skipped with a warning.
+#
+# Partial uploads the site can never complete are listed, each by PR with
+# its reason, in monitor/acknowledged-<env>.json (docs/VOTES-SITE.md §7).
+#
+# GitHub disables a scheduled workflow after 60 days without activity in
+# the repository, and mails its failures to whoever last changed the cron
+# line: watch the workflow's status, not only the mail.
 
 on:
   schedule:
@@ -73,4 +80,5 @@ jobs:
             echo "::warning::$SITE not checked: set the repository variable $KEY_VAR to its site key"
             exit 0
           fi
-          "$RUNNER_TEMP/votesctl" check -all -site "$SITE" -sigstore "$SIGSTORE" -site-key "$SITE_KEY"
+          "$RUNNER_TEMP/votesctl" check -all -site "$SITE" -sigstore "$SIGSTORE" -site-key "$SITE_KEY" \
+            -acknowledged "monitor/acknowledged-${{ matrix.env }}.json"

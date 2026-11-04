@@ -93,3 +93,31 @@ func TestAnchorVector(t *testing.T) {
 		t.Error("an altered entry verified")
 	}
 }
+
+// VerifyTimes reads the Rekor time from the verified inclusion promise:
+// an entry without one has none.
+func TestVerifyTimesRekor(t *testing.T) {
+	f := loadFixture(t)
+	s, _ := newSite(t, f, f.during())
+	at, err := s.Anchors.VerifyTimes(f.Proposal.Bundle, f.Proposal.Doc, f.AnchorKey)
+	if err != nil || at.Rekor.Unix() != 1793354334 || at.TSA.IsZero() {
+		t.Fatalf("times %+v %v", at, err)
+	}
+	var bm map[string]any
+	_ = json.Unmarshal(f.Proposal.Bundle, &bm)
+	e := bm["verificationMaterial"].(map[string]any)["tlogEntries"].([]any)[0].(map[string]any)
+	delete(e, "inclusionPromise")
+	noPromise, _ := json.Marshal(bm)
+	if at, err := s.Anchors.VerifyTimes(noPromise, f.Proposal.Doc, f.AnchorKey); err == nil && !at.Rekor.IsZero() {
+		t.Fatalf("a Rekor time without a promise: %+v", at)
+	}
+	// A promise for another time doesn't verify.
+	e2 := map[string]any{}
+	_ = json.Unmarshal(f.Proposal.Bundle, &e2)
+	ent := e2["verificationMaterial"].(map[string]any)["tlogEntries"].([]any)[0].(map[string]any)
+	ent["integratedTime"] = "1793354999"
+	moved, _ := json.Marshal(e2)
+	if _, err := s.Anchors.VerifyTimes(moved, f.Proposal.Doc, f.AnchorKey); err == nil {
+		t.Fatal("a moved integrated time verified")
+	}
+}

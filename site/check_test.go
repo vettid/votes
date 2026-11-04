@@ -261,3 +261,85 @@ func TestSkewMismatch(t *testing.T) {
 		}
 	}
 }
+
+// A partial extension is permanent once the close it extends has passed
+// or the results are out; the results' partial never is.
+func TestCheckPermanentPartial(t *testing.T) {
+	f := loadFixture(t)
+	s, _ := newSite(t, f, f.during())
+	ext2 := docPath(testID, "extension-2") + ".sig"
+	for name, c := range map[string]struct {
+		results   bool
+		now       time.Time
+		permanent bool
+	}{
+		"before its close":      {false, time.Unix(f.e.ClosesAt-60, 0), false},
+		"after its close":       {false, time.Unix(f.e.ClosesAt, 0), true},
+		"after the results are": {true, f.closed(), true},
+	} {
+		o := published(t, f, c.results)
+		o[ext2] = f.Extension.Sig
+		rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, c.now)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got := slices.Contains(rep.PartialPermanent, "extension-2"); got != c.permanent || !slices.Contains(rep.Partial, "extension-2") {
+			t.Fatalf("%s: partial %v, permanent %v", name, rep.Partial, rep.PartialPermanent)
+		}
+		if c.permanent != strings.Contains(strings.Join(rep.Mismatches, "\n"), "(permanent") {
+			t.Fatalf("%s: mismatches %v", name, rep.Mismatches)
+		}
+	}
+}
+
+// An acknowledged partial is reported, not a mismatch; an unlisted one
+// is a mismatch; an acknowledgement that matches no partial is one too.
+func TestAcknowledged(t *testing.T) {
+	f := loadFixture(t)
+	s, _ := newSite(t, f, f.during())
+	o := published(t, f, true)
+	o[docPath(testID, "extension-2")+".sig"] = f.Extension.Sig
+	check := func(acks []Acknowledgement) *Report {
+		t.Helper()
+		rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, f.closed())
+		if err != nil {
+			t.Fatal(err)
+		}
+		rep.Acknowledge(acks)
+		return rep
+	}
+	if rep := check(nil); len(rep.Mismatches) != 1 || !strings.HasPrefix(rep.Mismatches[0], "partial: extension-2") {
+		t.Fatalf("unlisted: %v", rep.Mismatches)
+	}
+	acks, err := ParseAcknowledged([]byte(`[{"proposal_id":"` + testID + `","document":"extension-2","reason":"an upload interrupted after the close","acknowledged_at":"2026-11-04"},
+		{"proposal_id":"01KC0000000000000000000002","document":"results","reason":"another vote's","acknowledged_at":"2026-11-04"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep := check(acks); len(rep.Mismatches) != 0 || !slices.Equal(rep.Acknowledged, []string{"extension-2"}) {
+		t.Fatalf("acknowledged: %v %v", rep.Mismatches, rep.Acknowledged)
+	}
+	stale := []Acknowledgement{acks[0], {ProposalID: testID, Document: "results", Reason: "x", AcknowledgedAt: "2026-11-04"}}
+	if rep := check(stale); !slices.Equal(rep.Mismatches, []string{StaleAcknowledgement(stale[1])}) {
+		t.Fatalf("stale: %v", rep.Mismatches)
+	}
+
+	for name, bad := range map[string]string{
+		"not an array":   `{}`,
+		"null":           `null`,
+		"another member": `[{"proposal_id":"` + testID + `","document":"results","reason":"x","acknowledged_at":"2026-11-04","by":"y"}]`,
+		"no reason":      `[{"proposal_id":"` + testID + `","document":"results","reason":"","acknowledged_at":"2026-11-04"}]`,
+		"a bad date":     `[{"proposal_id":"` + testID + `","document":"results","reason":"x","acknowledged_at":"4 Nov"}]`,
+		"a bad document": `[{"proposal_id":"` + testID + `","document":"rows","reason":"x","acknowledged_at":"2026-11-04"}]`,
+		"twice": `[{"proposal_id":"` + testID + `","document":"results","reason":"x","acknowledged_at":"2026-11-04"},
+			{"proposal_id":"` + testID + `","document":"results","reason":"y","acknowledged_at":"2026-11-04"}]`,
+		"trailing data": `[] []`,
+	} {
+		if _, err := ParseAcknowledged([]byte(bad)); err == nil {
+			t.Errorf("%s: parsed", name)
+		}
+	}
+	if acks, err := ParseAcknowledged([]byte("[]\n")); err != nil || len(acks) != 0 {
+		t.Fatalf("the empty list: %v", err)
+	}
+}

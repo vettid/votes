@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,7 +92,7 @@ func TestCheckCommand(t *testing.T) {
 	key := base64.StdEncoding.EncodeToString(sk.Public().(ed25519.PublicKey))
 	other := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	var out bytes.Buffer
-	if ok, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, time.Now()); err != nil || !ok {
+	if ok, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, nil, time.Now()); err != nil || !ok {
 		t.Fatal(ok, err)
 	}
 	if !bytes.Contains(out.Bytes(), []byte(`"unhandled": 0`)) {
@@ -110,7 +112,7 @@ func TestCheckCommand(t *testing.T) {
 	all := func() (allReport, bool, error) {
 		t.Helper()
 		var out bytes.Buffer
-		ok, err := checkAll(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, "2026-10", time.Now())
+		ok, err := checkAll(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), httpModified(srv.URL, noRedirects()), anchors, key, "2026-10", nil, time.Now())
 		var rep allReport
 		if jerr := json.Unmarshal(out.Bytes(), &rep); jerr != nil {
 			t.Fatalf("%v: %s", jerr, out.Bytes())
@@ -147,7 +149,7 @@ func TestCheckCommand(t *testing.T) {
 	es[0].Extended = 0
 	store.Objects["v1/index.json"], _ = json.Marshal(es)
 	out.Reset()
-	ok, err = checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, time.Now())
+	ok, err = checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, nil, time.Now())
 	if err != nil || ok || !bytes.Contains(out.Bytes(), []byte(`"listing: index: extended"`)) {
 		t.Fatalf("a stale listing: %v %v %s", ok, err, out.Bytes())
 	}
@@ -182,13 +184,62 @@ func TestCheckCommand(t *testing.T) {
 		}
 	}
 
+	// An index that doesn't parse: the report is still written, naming it,
+	// with the proposals the archive lists.
+	store.Objects["v1/index.json"] = []byte("not json")
+	if rep, ok, err := all(); !errors.Is(err, errChecksFailed) || ok || len(rep.Lists) != 1 || len(rep.Proposals) != 1 {
+		t.Fatalf("an unreadable index: %+v %v %v", rep, ok, err)
+	}
+	store.Objects["v1/index.json"] = idx
+
+	// -acknowledged: a partial upload on the list leaves ok true; one not
+	// on it is a mismatch, and so is an entry that matches no partial.
+	dir := t.TempDir()
+	ackFile := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	entry := func(doc string) string {
+		return `{"proposal_id":"` + p.ProposalID + `","document":"` + doc + `","reason":"an upload interrupted after the close","acknowledged_at":"2026-11-04"}`
+	}
+	ext2 := "v1/p/" + p.ProposalID + "/extension-2.json.sig"
+	store.Objects[ext2] = f.Extension.Sig
+	for _, c := range []struct {
+		name, body string
+		all        bool
+		want       int
+	}{
+		{"an unlisted partial", `[]`, false, exitMismatch},
+		{"an unlisted partial, -all", `[]`, true, exitMismatch},
+		{"an acknowledged partial", "[" + entry("extension-2") + "]", false, exitOK},
+		{"an acknowledged partial, -all", "[" + entry("extension-2") + "]", true, exitOK},
+		{"a stale entry", "[" + entry("extension-2") + "," + entry("results") + "]", false, exitMismatch},
+		{"a stale entry, -all", "[" + entry("extension-2") + "," + entry("results") + "]", true, exitMismatch},
+		{"another proposal's, -all", "[" + entry("extension-2") + `,{"proposal_id":"01KC0000000000000000000009","document":"results","reason":"x","acknowledged_at":"2026-11-04"}]`, true, exitMismatch},
+		{"not a list", `{}`, false, exitFailed},
+	} {
+		a := args("-site-key", key, "-acknowledged", ackFile("acks.json", c.body))
+		if c.all {
+			a = append(a, "-all")
+		} else {
+			a = append(a, p.ProposalID)
+		}
+		if got := code(a); got != c.want {
+			t.Errorf("%s: exit %d, want %d", c.name, got, c.want)
+		}
+	}
+	delete(store.Objects, ext2)
+
 	// Another site key, or a changed row, fails the check.
-	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, other, p.ProposalID, time.Now()); err == nil {
+	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, other, p.ProposalID, nil, time.Now()); err == nil {
 		t.Fatal("checked under another site key")
 	}
 	rows := "v1/p/" + p.ProposalID + "/rows.json"
 	store.Objects[rows] = append(bytes.Clone(store.Objects[rows]), '\n')
-	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, time.Now()); err == nil {
+	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, nil, time.Now()); err == nil {
 		t.Fatal("checked with a changed row")
 	}
 }
@@ -222,5 +273,66 @@ func TestHTTPFetcher(t *testing.T) {
 		if _, err := fetch(ctx, p); err == nil {
 			t.Fatalf("%s: no error", p)
 		}
+	}
+}
+
+// A 5xx or a network error is retried; other answers aren't.
+func TestHTTPFetcherRetries(t *testing.T) {
+	saved := fetchRetries
+	fetchRetries = []time.Duration{time.Millisecond, time.Millisecond}
+	defer func() { fetchRetries = saved }()
+	var mu sync.Mutex
+	calls := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls[r.URL.Path]++
+		n := calls[r.URL.Path]
+		mu.Unlock()
+		switch {
+		case r.URL.Path == "/v1/flaky" && n < 3:
+			http.Error(w, "", http.StatusBadGateway)
+		case r.URL.Path == "/v1/flaky":
+			_, _ = w.Write([]byte("x"))
+		case r.URL.Path == "/v1/denied":
+			http.Error(w, "", http.StatusForbidden)
+		default:
+			http.Error(w, "", http.StatusServiceUnavailable)
+		}
+	}))
+	defer srv.Close()
+	fetch, ctx := httpFetcher(srv.URL, noRedirects()), context.Background()
+	if b, err := fetch(ctx, "v1/flaky"); err != nil || string(b) != "x" || calls["/v1/flaky"] != 3 {
+		t.Fatalf("flaky: %q %v after %d", b, err, calls["/v1/flaky"])
+	}
+	if _, err := fetch(ctx, "v1/down"); err == nil || calls["/v1/down"] != 3 {
+		t.Fatalf("down: %v after %d", err, calls["/v1/down"])
+	}
+	if _, err := fetch(ctx, "v1/denied"); err == nil || calls["/v1/denied"] != 1 {
+		t.Fatalf("denied: %v after %d", err, calls["/v1/denied"])
+	}
+	// A network error: a server that is gone.
+	addr := srv.URL
+	srv.Close()
+	if _, err := httpFetcher(addr, noRedirects())(ctx, "v1/flaky"); err == nil {
+		t.Fatal("a closed server answered")
+	}
+}
+
+func TestHTTPModified(t *testing.T) {
+	at := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/v1/services.json" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Last-Modified", at.Format(http.TimeFormat))
+	}))
+	defer srv.Close()
+	modified := httpModified(srv.URL, noRedirects())
+	if got, err := modified(context.Background(), "v1/services.json"); err != nil || !got.Equal(at) {
+		t.Fatalf("modified: %v %v", got, err)
+	}
+	if _, err := modified(context.Background(), "v1/other"); err == nil {
+		t.Fatal("a 404 gave a time")
 	}
 }

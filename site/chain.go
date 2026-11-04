@@ -6,6 +6,9 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"strconv"
+	"time"
+
+	"github.com/vettid/service-vault/vote"
 )
 
 // ChainReport is what a walk of the service list's kept versions found
@@ -27,8 +30,12 @@ type ChainReport struct {
 // previous, and each Extends the one before it with the next version; the
 // current version's copy is the current list. A link that can't be
 // checked because a copy is missing is reported in Mismatches, with the
-// copy; a copy that doesn't verify or doesn't chain is an error.
-func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.PublicKey) (*ChainReport, error) {
+// copy; a copy that doesn't verify or doesn't chain is an error. The
+// current version's copy is written just after the list (§3), so its
+// absence is a mismatch only ListingGrace after services.json was last
+// modified, as modified says (nil, or an error: at once).
+func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.PublicKey, now time.Time,
+	modified func(ctx context.Context, path string) (time.Time, error)) (*ChainReport, error) {
 	cur, curSig, err := fetchPair(ctx, fetch, "v1/services.json")
 	if err != nil {
 		return nil, err
@@ -46,7 +53,7 @@ func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.Publi
 	link := func(name string, l *ServiceList, data []byte) error {
 		switch {
 		case l.Version == 1:
-			if !bytes.Equal(l.Previous, make([]byte, len(l.Previous))) {
+			if !bytes.Equal(l.Previous, make([]byte, vote.HashLen)) {
 				return fmt.Errorf("site: %s: the first version names a previous list", name)
 			}
 		case prev != nil:
@@ -67,7 +74,9 @@ func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.Publi
 			return nil, err
 		}
 		if data == nil || sig == nil {
-			rep.Mismatches = append(rep.Mismatches, "services/"+strconv.FormatInt(v, 10)+": not published")
+			if v != current.Version || !recent(ctx, modified, now) {
+				rep.Mismatches = append(rep.Mismatches, "services/"+strconv.FormatInt(v, 10)+": not published")
+			}
 			if v == current.Version {
 				// The list itself still chains to the copy before it.
 				if err := link("services.json", current, cur); err != nil {
@@ -100,6 +109,15 @@ func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.Publi
 		rep.Mismatches = append(rep.Mismatches, "services/"+strconv.FormatInt(current.Version+1, 10)+": published past the current version")
 	}
 	return rep, nil
+}
+
+// recent reports whether services.json changed within ListingGrace.
+func recent(ctx context.Context, modified func(context.Context, string) (time.Time, error), now time.Time) bool {
+	if modified == nil {
+		return false
+	}
+	t, err := modified(ctx, "v1/services.json")
+	return err == nil && !t.IsZero() && now.Sub(t) <= ListingGrace
 }
 
 // fetchPair fetches a list and its signature (path + ".sig").

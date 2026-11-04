@@ -143,10 +143,12 @@ func (a *Anchors) VerifyTimes(bundleJSON, doc, spki []byte) (AnchorTimes, error)
 	if t.TSA.IsZero() {
 		return none, errors.New("site: the bundle has no verified RFC 3161 timestamp")
 	}
-	// The entry was verified above; this reads its integrated time, which
-	// counts only under a verified inclusion promise.
-	if lts, err := verify.VerifyTlogEntry(&b, material, 1, true); err == nil && len(lts) > 0 {
-		t.Rekor = lts[0].Time
+	// The verifier checked the entry, and its inclusion promise when it
+	// has one (an entry whose promise fails is skipped, and one entry is
+	// required): with a single entry, a promised integrated time is
+	// signed by the log.
+	if es, err := b.TlogEntries(); err == nil && len(es) == 1 && es[0].HasInclusionPromise() {
+		t.Rekor = es[0].IntegratedTime()
 	}
 	return t, nil
 }

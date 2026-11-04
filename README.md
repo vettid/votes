@@ -64,12 +64,19 @@ difference still there 10 minutes after the latest document's anchor
 time (the lists are rewritten just after each document, so they may lag
 an upload in progress), a `partial` upload 10 minutes after its bundle's
 timestamp (or without a bundle that verifies), or an anchor whose two
-times differ by more than 10 minutes. **`-all`** also walks the service
+times differ by more than 10 minutes. A partial upload that can never
+be completed (an extension past its close; `partial_permanent`) can be
+acknowledged: `-acknowledged <file>` reads a JSON array of
+`{proposal_id, document, reason, acknowledged_at}` (for the monitor,
+`monitor/acknowledged-<env>.json`, each entry added by PR with its
+reason), and a partial it lists is reported in `acknowledged`, not as a
+mismatch; an entry that matches no partial upload is a mismatch.
+**`-all`** also walks the service
 list's kept versions, `services/1.json` to the current one, checking
 each signature and that each extends the one before, then checks every
 proposal in `index.json` and the archive (from 2026-10, or
 `-since YYYY-MM`), and prints one report with each proposal's, a failed
-one as its `error`.
+one as its `error`. A network error or a `5xx` is retried twice.
 
 **Exit codes:** `0` every check held and `ok` is true; `1` a check failed
 (with `-all`, after the report); `2` a usage error; `3` the checks held

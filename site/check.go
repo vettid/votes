@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
@@ -64,6 +65,14 @@ type Report struct {
 	// Partial names documents whose signature, bundle or rows are
 	// published without the document: an upload not finished.
 	Partial []string
+	// PartialPermanent names the partial uploads the site can no longer
+	// complete: an extension whose close in force has passed, or once the
+	// results are published (the site refuses it then, §4 item 5). A
+	// retry can't clear one; see partialMismatch.
+	PartialPermanent []string
+	// Acknowledged names the partial uploads an acknowledged list covers
+	// (Acknowledge): reported, not mismatches.
+	Acknowledged []string
 	// Listing names each way index.json or the month's archive differs
 	// from the documents ("archive: missing", "index: closes_at", …).
 	Listing []string
@@ -75,7 +84,8 @@ type Report struct {
 	// MaxSkew. Empty when the vote is served as it should be.
 	Mismatches []string
 
-	serviceIK []byte
+	serviceIK         []byte
+	partialMismatches map[string]string // each partial's entry in Mismatches
 }
 
 // ErrNotPublished is a proposal the site doesn't serve.
@@ -105,7 +115,8 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		return nil, err
 	}
 	rep := &Report{ProposalID: id, Anchored: map[string]time.Time{}, Hashes: map[string][]byte{}, Skew: map[string]time.Duration{}}
-	partialAt := map[string]time.Time{} // a partial upload's verified timestamp, when it has one
+	partialAt := map[string]time.Time{}    // a partial upload's verified timestamp, when it has one
+	partialClose := map[string]time.Time{} // a partial extension's close in force
 	// put fetches a document's parts and puts it as the site would have
 	// at its anchor's time; found is false when the document isn't there.
 	put := func(name string, rows bool, f func(*Upload) (bool, error)) (found bool, err error) {
@@ -214,6 +225,9 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		}
 		if !found {
 			gap = n
+			if slices.Contains(rep.Partial, name) {
+				partialClose[name] = time.Unix(rep.ClosesAt, 0)
+			}
 			continue
 		}
 		e, _ := vote.ParseExtension(mem.Objects[docPath(id, name)])
@@ -258,14 +272,40 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		}
 	}
 	for _, name := range rep.Partial {
-		switch t, ok := partialAt[name]; {
-		case !ok:
-			rep.Mismatches = append(rep.Mismatches, "partial: "+name+": no verified timestamp")
-		case now.Sub(t) > ListingGrace:
-			rep.Mismatches = append(rep.Mismatches, "partial: "+name+": since "+t.UTC().Format(time.RFC3339))
+		c, ext := partialClose[name]
+		permanent := ext && (rep.Results != nil || !now.Before(c))
+		if permanent {
+			rep.PartialPermanent = append(rep.PartialPermanent, name)
+		}
+		t, dated := partialAt[name]
+		if m := partialMismatch(name, t, dated, permanent, now); m != "" {
+			rep.Mismatches = append(rep.Mismatches, m)
+			if rep.partialMismatches == nil {
+				rep.partialMismatches = map[string]string{}
+			}
+			rep.partialMismatches[name] = m
 		}
 	}
 	return rep, nil
+}
+
+// partialMismatch is the mismatch a partial upload makes, or "": one
+// that can't be dated, or past ListingGrace after its timestamp. A
+// permanent one (Report.PartialPermanent) is a mismatch too, and stays
+// one on every later check, as nothing can complete it, until it is on
+// the acknowledged list (Acknowledge).
+func partialMismatch(name string, at time.Time, dated, permanent bool, now time.Time) string {
+	suffix := ""
+	if permanent {
+		suffix = " (permanent: the site can no longer complete it)"
+	}
+	switch {
+	case !dated:
+		return "partial: " + name + ": no verified timestamp" + suffix
+	case now.Sub(at) > ListingGrace:
+		return "partial: " + name + ": since " + at.UTC().Format(time.RFC3339) + suffix
+	}
+	return ""
 }
 
 // compareListing compares a served list with the entry the documents

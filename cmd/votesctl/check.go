@@ -40,18 +40,27 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	rootFile := fs.String("trusted-root", "", "a Sigstore trusted root file, instead of the embedded one refreshed through TUF")
 	all := fs.Bool("all", false, "check the service list's chain and every proposal the index and the archive list")
 	since := fs.String("since", firstMonth, "with -all: the first archive month read (YYYY-MM)")
+	ackFile := fs.String("acknowledged", "", "a file of acknowledged partial uploads (docs/VOTES-SITE.md §7)")
 	if fs.Parse(args) != nil || *all != (fs.NArg() == 0) || fs.NArg() > 1 {
-		fmt.Fprintln(stderr, "usage: votesctl check [-all [-since YYYY-MM] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>]")
+		fmt.Fprintln(stderr, "usage: votesctl check [-all [-since YYYY-MM] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] [-acknowledged <file>]")
 		return exitUsage
 	}
+	var acks []site.Acknowledgement
 	anchors, err := anchorsFor(*instance, *rootFile)
+	if err == nil && *ackFile != "" {
+		var b []byte
+		if b, err = os.ReadFile(*ackFile); err == nil {
+			acks, err = site.ParseAcknowledged(b)
+		}
+	}
 	ok := false
 	if err == nil {
-		fetch := httpFetcher(*base, noRedirects())
+		c := noRedirects()
+		fetch := httpFetcher(*base, c)
 		if *all {
-			ok, err = checkAll(ctx, stdout, fetch, anchors, *key, *since, time.Now())
+			ok, err = checkAll(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, *since, acks, time.Now())
 		} else {
-			ok, err = checkVote(ctx, stdout, fetch, anchors, *key, fs.Arg(0), time.Now())
+			ok, err = checkVote(ctx, stdout, fetch, anchors, *key, fs.Arg(0), acks, time.Now())
 		}
 	}
 	switch {
@@ -77,33 +86,74 @@ const maxObject = 16 << 20
 // no redirect and takes only a 404 as not published: the site answers
 // 404 for a missing object, so a 403 (WAF, access) is an error, not an
 // absent document.
+//
+// A network error or a 5xx answer is retried after each of fetchRetries;
+// any other answer is final.
 func httpFetcher(base string, c *http.Client) site.Fetcher {
 	base = strings.TrimRight(base, "/")
 	return func(ctx context.Context, path string) ([]byte, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/"+path, nil)
+		for i := 0; ; i++ {
+			b, retry, err := fetchOnce(ctx, c, base, path)
+			if err == nil || !retry || i == len(fetchRetries) {
+				return b, err
+			}
+			select {
+			case <-ctx.Done():
+				return nil, err
+			case <-time.After(fetchRetries[i]):
+			}
+		}
+	}
+}
+
+// fetchRetries are the waits before each retry of a failed fetch.
+var fetchRetries = []time.Duration{time.Second, 3 * time.Second}
+
+// fetchOnce is one GET; retry says whether a failure may pass.
+func fetchOnce(ctx context.Context, c *http.Client, base, path string) (b []byte, retry bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/"+path, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, ctx.Err() == nil, err
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusOK:
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, false, nil
+	default:
+		return nil, resp.StatusCode >= 500, fmt.Errorf("%s: %s", path, resp.Status)
+	}
+	b, err = io.ReadAll(io.LimitReader(resp.Body, maxObject+1))
+	if err != nil {
+		return nil, true, err
+	}
+	if len(b) > maxObject {
+		return nil, false, fmt.Errorf("%s: over %d bytes", path, maxObject)
+	}
+	return b, false, nil
+}
+
+// httpModified is an object's Last-Modified, from a HEAD request.
+func httpModified(base string, c *http.Client) func(context.Context, string) (time.Time, error) {
+	base = strings.TrimRight(base, "/")
+	return func(ctx context.Context, path string) (time.Time, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, base+"/"+path, nil)
 		if err != nil {
-			return nil, err
+			return time.Time{}, err
 		}
 		resp, err := c.Do(req)
 		if err != nil {
-			return nil, err
+			return time.Time{}, err
 		}
-		defer resp.Body.Close()
-		switch resp.StatusCode {
-		case http.StatusOK:
-		case http.StatusNotFound:
-			return nil, nil
-		default:
-			return nil, fmt.Errorf("%s: %s", path, resp.Status)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return time.Time{}, fmt.Errorf("%s: %s", path, resp.Status)
 		}
-		b, err := io.ReadAll(io.LimitReader(resp.Body, maxObject+1))
-		if err != nil {
-			return nil, err
-		}
-		if len(b) > maxObject {
-			return nil, fmt.Errorf("%s: over %d bytes", path, maxObject)
-		}
-		return b, nil
+		return http.ParseTime(resp.Header.Get("Last-Modified"))
 	}
 }
 
@@ -141,6 +191,10 @@ type report struct {
 	Listing []string `json:"listing,omitempty"`
 	// SkewSeconds: each anchor's RFC 3161 time less its Rekor time.
 	SkewSeconds map[string]int64 `json:"skew_seconds,omitempty"`
+	// PartialPermanent: partial uploads the site can no longer complete.
+	PartialPermanent []string `json:"partial_permanent,omitempty"`
+	// Acknowledged: partial uploads on the acknowledged list.
+	Acknowledged []string `json:"acknowledged,omitempty"`
 	// Mismatches: what makes ok false (site.Report.Mismatches).
 	Mismatches []string `json:"mismatches,omitempty"`
 }
@@ -172,7 +226,8 @@ func writeReport(w io.Writer, v any) error {
 // checkVote checks one proposal on a site and writes the report. ok is
 // the report's: false when it has mismatches. err is a check that failed
 // (no report is written).
-func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *site.Anchors, siteKeyB64, id string, now time.Time) (ok bool, err error) {
+func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *site.Anchors, siteKeyB64, id string,
+	acks []site.Acknowledgement, now time.Time) (ok bool, err error) {
 	key, err := decodeSiteKey(siteKeyB64)
 	if err != nil {
 		return false, err
@@ -181,6 +236,7 @@ func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *si
 	if err != nil {
 		return false, err
 	}
+	rep.Acknowledge(acks)
 	out := toReport(rep, now)
 	out.TrustedRoot = anchors.RootSource()
 	return out.OK, writeReport(w, out)
@@ -190,7 +246,7 @@ func toReport(rep *site.Report, now time.Time) report {
 	out := report{OK: len(rep.Mismatches) == 0, ProposalID: rep.ProposalID, ServiceID: rep.ServiceID, ServiceName: rep.ServiceName,
 		Title: rep.Title, Eligible: rep.Eligible, OpensAt: rep.OpensAt, ClosesAt: rep.ClosesAt,
 		Extensions: rep.Extensions, Anchored: map[string]string{}, Hashes: map[string]string{}, Partial: rep.Partial,
-		Listing: rep.Listing, Mismatches: rep.Mismatches}
+		Listing: rep.Listing, PartialPermanent: rep.PartialPermanent, Acknowledged: rep.Acknowledged, Mismatches: rep.Mismatches}
 	if len(rep.Skew) > 0 {
 		out.SkewSeconds = map[string]int64{}
 		for name, d := range rep.Skew {
@@ -226,7 +282,13 @@ type allReport struct {
 	Errors      int         `json:"errors"`
 	Services    servicesOut `json:"services"`
 	Months      []string    `json:"months"` // the archive months read
-	Proposals   []report    `json:"proposals"`
+	// Lists: the index or an archive month that couldn't be read (each
+	// counted in Errors); their proposals may be missing below.
+	Lists []string `json:"lists,omitempty"`
+	// StaleAcknowledged: acknowledgements of proposals not checked here
+	// (a proposal's own are in its mismatches).
+	StaleAcknowledged []string `json:"stale_acknowledged,omitempty"`
+	Proposals         []report `json:"proposals"`
 }
 
 type servicesOut struct {
@@ -244,8 +306,10 @@ var errChecksFailed = errors.New("checks failed: see the report's errors")
 // index.json or in the archive's months from since (YYYY-MM) to now's,
 // and the months of the index's entries, and writes one report. ok is
 // false on any mismatch or error; err is errChecksFailed when a check
-// failed (the report is still written), or a failure to list.
-func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *site.Anchors, siteKeyB64, since string, now time.Time) (ok bool, err error) {
+// failed, or the index or an archive month couldn't be read (the
+// report is still written, naming each).
+func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, modified func(context.Context, string) (time.Time, error),
+	anchors *site.Anchors, siteKeyB64, since string, acks []site.Acknowledgement, now time.Time) (ok bool, err error) {
 	key, err := decodeSiteKey(siteKeyB64)
 	if err != nil {
 		return false, err
@@ -255,7 +319,7 @@ func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *sit
 		return false, errors.New("-since: a month, YYYY-MM")
 	}
 	out := allReport{TrustedRoot: anchors.RootSource(), Months: []string{}, Proposals: []report{}}
-	if c, err := site.CheckServiceChain(ctx, fetch, key); err != nil {
+	if c, err := site.CheckServiceChain(ctx, fetch, key, now, modified); err != nil {
 		out.Services.Error = err.Error()
 		out.Errors++
 	} else {
@@ -276,9 +340,13 @@ func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *sit
 		}
 		return es, nil
 	}
+	listFailed := func(err error) {
+		out.Lists = append(out.Lists, err.Error())
+		out.Errors++
+	}
 	es, err := list("v1/index.json")
 	if err != nil {
-		return false, err
+		listFailed(err)
 	}
 	for _, e := range es {
 		ids[e.ProposalID] = true
@@ -290,7 +358,8 @@ func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *sit
 	for _, m := range slices.Sorted(maps.Keys(months)) {
 		es, err := list("v1/archive/" + m + ".json")
 		if err != nil {
-			return false, err
+			listFailed(err)
+			continue
 		}
 		if es != nil {
 			out.Months = append(out.Months, m)
@@ -306,10 +375,16 @@ func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *sit
 			out.Errors++
 			continue
 		}
+		rep.Acknowledge(acks)
 		out.Proposals = append(out.Proposals, toReport(rep, now))
 	}
+	for _, a := range acks {
+		if !ids[a.ProposalID] {
+			out.StaleAcknowledged = append(out.StaleAcknowledged, site.StaleAcknowledgement(a))
+		}
+	}
 
-	out.OK = out.Errors == 0 && len(out.Services.Mismatches) == 0
+	out.OK = out.Errors == 0 && len(out.Services.Mismatches) == 0 && len(out.StaleAcknowledged) == 0
 	for _, p := range out.Proposals {
 		out.OK = out.OK && p.OK
 	}

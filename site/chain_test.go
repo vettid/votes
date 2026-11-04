@@ -1,6 +1,7 @@
 package site
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vettid/service-vault/vote"
 	"github.com/vettid/vettid-vault/vms/suite"
@@ -49,7 +51,7 @@ func chainSite(t *testing.T, f *fixture) (map[string][]byte, [][]byte) {
 }
 
 func chainCheck(objs map[string][]byte) (*ChainReport, error) {
-	return CheckServiceChain(context.Background(), fetcher(objs), siteKey().Public().(ed25519.PublicKey))
+	return CheckServiceChain(context.Background(), fetcher(objs), siteKey().Public().(ed25519.PublicKey), time.Now(), nil)
 }
 
 func TestServiceChain(t *testing.T) {
@@ -76,7 +78,32 @@ func TestServiceChain(t *testing.T) {
 			t.Fatalf("%s: %+v %v", name, rep, err)
 		}
 	}
+	// The current version's copy may lag services.json by ListingGrace.
 	o := maps.Clone(objs)
+	delete(o, "v1/services/3.json")
+	published := time.Unix(1793354334, 0)
+	modified := func(_ context.Context, path string) (time.Time, error) {
+		if path != "v1/services.json" {
+			t.Fatalf("modified: %s", path)
+		}
+		return published, nil
+	}
+	key := siteKey().Public().(ed25519.PublicKey)
+	if rep, err := CheckServiceChain(context.Background(), fetcher(o), key, published.Add(ListingGrace), modified); err != nil || len(rep.Mismatches) != 0 {
+		t.Fatalf("the current copy within the grace: %+v %v", rep, err)
+	}
+	if rep, err := CheckServiceChain(context.Background(), fetcher(o), key, published.Add(ListingGrace+time.Second), modified); err != nil ||
+		!slices.Equal(rep.Mismatches, []string{"services/3: not published"}) {
+		t.Fatalf("the current copy past the grace: %+v %v", rep, err)
+	}
+	o = maps.Clone(objs)
+	delete(o, "v1/services/2.json")
+	if rep, err := CheckServiceChain(context.Background(), fetcher(o), key, published, modified); err != nil ||
+		!slices.Equal(rep.Mismatches, []string{"services/2: not published"}) {
+		t.Fatalf("an earlier copy has no grace: %+v %v", rep, err)
+	}
+
+	o = maps.Clone(objs)
 	o["v1/services/4.json"] = objs["v1/services/3.json"]
 	if rep, err := chainCheck(o); err != nil || !slices.Contains(rep.Mismatches, "services/4: published past the current version") {
 		t.Fatalf("a stray past the current version: %+v %v", rep, err)
@@ -94,11 +121,20 @@ func TestServiceChain(t *testing.T) {
 	l3.Version, l3.Previous = 3, sha(objs["v1/services/2.json"])
 	l3.Services[0].Name = "Another name"
 	alt, altSig := signedList(t, l3, siteKey())
+	// The first version's previous is 32 zero bytes: an empty or a
+	// nonzero one doesn't verify as a list, or doesn't start the chain.
+	l1 := f.list()
+	l1.Previous = []byte{}
+	empty, emptySig := signedList(t, l1, siteKey())
+	l1.Previous = bytes.Repeat([]byte{1}, 32)
+	nonzero, nonzeroSig := signedList(t, l1, siteKey())
 	for name, c := range map[string]struct {
 		change func(map[string][]byte)
 		want   string
 	}{
 		"another key's signature": {func(o map[string][]byte) { o["v1/services/2.json"], o["v1/services/2.json.sig"] = foreign, foreignSig }, "signature"},
+		"an empty previous":       {func(o map[string][]byte) { o["v1/services/1.json"], o["v1/services/1.json.sig"] = empty, emptySig }, "fields"},
+		"a nonzero previous":      {func(o map[string][]byte) { o["v1/services/1.json"], o["v1/services/1.json.sig"] = nonzero, nonzeroSig }, "names a previous"},
 		"a dropped service":       {func(o map[string][]byte) { o["v1/services/2.json"], o["v1/services/2.json.sig"] = dropped, droppedSig }, "dropped"},
 		"a copy of another version": {func(o map[string][]byte) {
 			o["v1/services/2.json"], o["v1/services/2.json.sig"] = o["v1/services/1.json"], o["v1/services/1.json.sig"]

@@ -170,14 +170,19 @@ which fails on exit code 1 or 3. It takes staging's site key from the
 member vaults' release config, and production's from the repository
 variable `VOTES_PROD_SITE_KEY` (skipped, with a warning, until it is
 set); `VOTES_STAGING_SITE_KEY` overrides staging's. It also warns when
-the embedded trusted roots are over 60 days old.
+the embedded trusted roots are over 60 days old. GitHub disables a
+scheduled workflow after 60 days without activity in the repository, and
+mails its failures only to whoever last changed its cron line: someone
+should watch the workflow's status.
 
 - **The service list's chain:** `services/1.json` to the current
   version's copy, each with its `.sig` under the site key, each holding
   its version and extending the one before (the first with an all-zero
   `previous`), the current copy byte for byte `services.json`. A copy
   that doesn't verify or chain is an error; a missing copy, or one past
-  the current version, is a mismatch.
+  the current version, is a mismatch, except the current version's copy
+  in the 10 minutes after `services.json` was last modified (its
+  `Last-Modified`), as it is written just after the list (§3).
 - **Every proposal** in `index.json` and in the archive's months, from
   the site's first (2026-10, or `-since`) to the current one and those
   of the index's entries, each checked as `votesctl check <id>` does.
@@ -189,7 +194,22 @@ the embedded trusted roots are over 60 days old.
   minutes, or that has no integrated time (`skew_seconds` has each
   difference). A service anchors and uploads within seconds, so either
   gap means a failed upload not yet retried, a clock that is off, or a
-  timestamp held back before it was logged.
+  timestamp held back before it was logged. A partial extension whose
+  close has passed, or after the results, can never be completed: the
+  report lists it in `partial_permanent`, and it stays a mismatch on
+  every run until it is acknowledged.
+- **Acknowledged partial uploads:** `monitor/acknowledged-staging.json`
+  and `-prod.json` (passed with `-acknowledged <file>`) are strict JSON
+  arrays of `{proposal_id, document, reason, acknowledged_at}`, with
+  `document` such as `extension-2` and `acknowledged_at` a `YYYY-MM-DD`
+  date. A partial upload they list is reported in `acknowledged` and is
+  not a mismatch. An entry that matches no partial upload (completed, or
+  wrong) is a mismatch, so the list stays true. Each entry is added by a
+  PR that gives its reason; both lists start empty.
+- **Fetches:** a network error or a `5xx` is retried twice (after 1 and
+  3 seconds) before it counts as a failed check; with `-all`, an index
+  or archive month that can't be read or parsed is an error in the
+  report (`lists`), which is still printed, with the rest checked.
 - **Exit codes:** `0` every check held and `ok` is true; `1` a check
   failed (with `-all`, the report is printed first and each failure is
   in it as `error`); `2` a usage error; `3` the checks held but `ok` is
@@ -201,7 +221,9 @@ the embedded trusted roots are over 60 days old.
   false for a listing difference or a partial upload past 10 minutes,
   or an anchor whose RFC 3161 and Rekor times differ by over 10 minutes;
   `-all` walks the service list's kept versions and checks every
-  proposal listed; documented exit codes; a scheduled workflow runs it
+  proposal listed; permanent partial uploads can be acknowledged, by PR,
+  in `monitor/acknowledged-<env>.json`; network fetches are retried;
+  documented exit codes; a scheduled workflow runs it
   hourly on staging and production. The trusted root is embedded in the
   build and refreshed through TUF at most once a day; a start that
   can't reach TUF runs on the embedded root if it is at most 90 days old
