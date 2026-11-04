@@ -38,7 +38,8 @@ anchor in Rekor under the service's registered anchor key, the timing as
 anchored (the proposal and each extension timestamped before the close
 they precede, the results after collection ended; when each was uploaded
 is the site's word), the extensions (numbered without gaps, 24 at most,
-exactly those the results list), the results against the rows and
+exactly those the results list, each with the signature it was
+published with), the results against the rows and
 the tags, and the upload API's request rules (each part present, the
 signature's length, the size limits). It prints a JSON report or fails with the first check that
 didn't hold. The report's `status` is `open` (before the close in force

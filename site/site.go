@@ -432,6 +432,12 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 	if res.ProposalID != id || !bytes.Equal(res.Proposal.Doc, pdoc) {
 		return false, refuse(http.StatusUnprocessableEntity, "bad_document", "not the published proposal")
 	}
+	// The signatures they carry are the published ones too, byte for
+	// byte: another valid signature of the same document is still not
+	// what members and observers were served.
+	if err := s.samePublishedSig(ctx, id, "proposal", res.Proposal.Sig); err != nil {
+		return false, err
+	}
 	// The extensions are exactly the published ones.
 	closes := p.ClosesAt
 	for i := 1; ; i++ {
@@ -447,6 +453,9 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 		}
 		if len(res.Extensions) < i || !bytes.Equal(res.Extensions[i-1].Doc, ext) {
 			return false, refuse(http.StatusUnprocessableEntity, "bad_document", "not the published extensions")
+		}
+		if err := s.samePublishedSig(ctx, id, "extension-"+strconv.Itoa(i), res.Extensions[i-1].Sig); err != nil {
+			return false, err
 		}
 		e, _ := vote.ParseExtension(ext)
 		closes = e.ClosesAt
@@ -481,6 +490,20 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 		}
 		return es
 	}, p.OpensAt))
+}
+
+// samePublishedSig refuses a signature the results embed for a published
+// document (name) that isn't byte for byte its published .sig.
+func (s *Site) samePublishedSig(ctx context.Context, id, name string, sig []byte) error {
+	pub, err := s.published(ctx, docPath(id, name)+".sig")
+	if err != nil {
+		return err
+	}
+	if pub == nil || !bytes.Equal(pub, sig) {
+		return refuse(http.StatusUnprocessableEntity, "sig_mismatch",
+			"the results' signature of "+name+" isn't the published "+name+".json.sig")
+	}
+	return nil
 }
 
 // uploadShape applies the upload's request-level rules to a decoded
