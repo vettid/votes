@@ -65,6 +65,9 @@ type Report struct {
 	// Partial names documents whose signature, bundle or rows are
 	// published without the document: an upload not finished.
 	Partial []string
+	// PartialObjects are each partial upload's served objects, by name,
+	// in key order: what an acknowledgement must list (Acknowledge).
+	PartialObjects map[string][]Object
 	// PartialPermanent names the partial uploads the site can no longer
 	// complete: an extension whose close in force has passed, or once the
 	// results are published (the site refuses it then, §4 item 5). A
@@ -92,8 +95,11 @@ type Report struct {
 var ErrNotPublished = errors.New("site: the proposal isn't published")
 
 // Check checks proposal id as served by fetch, under the site's key, at
-// now (for whether the index may have dropped it).
-func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte, id string, now time.Time) (*Report, error) {
+// now (for whether the index may have dropped it). modified is an
+// object's Last-Modified: it dates a partial upload that has no bundle
+// for its grace (nil, or an error: such a partial is a mismatch at once).
+func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte, id string, now time.Time,
+	modified func(ctx context.Context, path string) (time.Time, error)) (*Report, error) {
 	if !vote.ValidProposalID(id) {
 		return nil, errors.New("site: not a proposal id")
 	}
@@ -116,6 +122,7 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 	}
 	rep := &Report{ProposalID: id, Anchored: map[string]time.Time{}, Hashes: map[string][]byte{}, Skew: map[string]time.Duration{}}
 	partialAt := map[string]time.Time{}    // a partial upload's verified timestamp, when it has one
+	partialMod := map[string]time.Time{}   // or, without a bundle, its signature's Last-Modified
 	partialClose := map[string]time.Time{} // a partial extension's close in force
 	// put fetches a document's parts and puts it as the site would have
 	// at its anchor's time; found is false when the document isn't there.
@@ -133,9 +140,28 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		if u.Doc == nil {
 			if u.Sig != nil || u.Bundle != nil {
 				rep.Partial = append(rep.Partial, name)
-				if u.Bundle != nil {
+				if rep.PartialObjects == nil {
+					rep.PartialObjects = map[string][]Object{}
+				}
+				for _, o := range []struct {
+					key string
+					b   []byte
+				}{{base + ".sig", u.Sig}, {base + ".sigstore.json", u.Bundle}} {
+					if o.b != nil {
+						rep.PartialObjects[name] = append(rep.PartialObjects[name], objectOf(o.key, o.b))
+					}
+				}
+				switch {
+				case u.Bundle != nil:
 					if ts, err := anchors.TimestampOf(u.Bundle); err == nil {
 						partialAt[name] = ts
+					}
+				case modified != nil:
+					// The site writes the signature, then the bundle, within
+					// a second: a signature alone is an upload that stopped
+					// there, dated by when the store wrote it.
+					if t, err := modified(ctx, base+".sig"); err == nil && !t.IsZero() {
+						partialMod[name] = t
 					}
 				}
 			}
@@ -278,7 +304,8 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 			rep.PartialPermanent = append(rep.PartialPermanent, name)
 		}
 		t, dated := partialAt[name]
-		if m := partialMismatch(name, t, dated, permanent, now); m != "" {
+		mod, byMod := partialMod[name]
+		if m := partialMismatch(name, t, dated, mod, byMod, permanent, now); m != "" {
 			rep.Mismatches = append(rep.Mismatches, m)
 			if rep.partialMismatches == nil {
 				rep.partialMismatches = map[string]string{}
@@ -290,20 +317,28 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 }
 
 // partialMismatch is the mismatch a partial upload makes, or "": one
-// that can't be dated, or past ListingGrace after its timestamp. A
-// permanent one (Report.PartialPermanent) is a mismatch too, and stays
+// past ListingGrace after its bundle's timestamp, or, with no bundle,
+// after its signature's Last-Modified (mod, when byMod); one that can't
+// be dated either way is one at once. A permanent one
+// (Report.PartialPermanent) is a mismatch past the grace too, and stays
 // one on every later check, as nothing can complete it, until it is on
 // the acknowledged list (Acknowledge).
-func partialMismatch(name string, at time.Time, dated, permanent bool, now time.Time) string {
+func partialMismatch(name string, at time.Time, dated bool, mod time.Time, byMod, permanent bool, now time.Time) string {
 	suffix := ""
 	if permanent {
 		suffix = " (permanent: the site can no longer complete it)"
 	}
 	switch {
-	case !dated:
+	case dated:
+		if now.Sub(at) > ListingGrace {
+			return "partial: " + name + ": since " + at.UTC().Format(time.RFC3339) + suffix
+		}
+	case byMod:
+		if now.Sub(mod) > ListingGrace {
+			return "partial: " + name + ": since " + mod.UTC().Format(time.RFC3339) + " (its signature's Last-Modified; no bundle)" + suffix
+		}
+	default:
 		return "partial: " + name + ": no verified timestamp" + suffix
-	case now.Sub(at) > ListingGrace:
-		return "partial: " + name + ": since " + at.UTC().Format(time.RFC3339) + suffix
 	}
 	return ""
 }

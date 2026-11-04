@@ -3,6 +3,8 @@ package site
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"maps"
@@ -41,7 +43,7 @@ func fetcher(objs map[string][]byte) Fetcher {
 func check(t *testing.T, f *fixture, objs map[string][]byte, id string) (*Report, error) {
 	t.Helper()
 	s, _ := newSite(t, f, f.during())
-	return Check(context.Background(), fetcher(objs), s.Anchors, s.SiteKey, id, f.closed())
+	return Check(context.Background(), fetcher(objs), s.Anchors, s.SiteKey, id, f.closed(), nil)
 }
 
 // A published vote checks from the site's files alone; one whose files
@@ -157,7 +159,7 @@ func TestCheckListing(t *testing.T) {
 	o := edit(indexPath, func(e *IndexEntry) { e.ProposalID = "01KC0000000000000000000002" })
 	s, _ := newSite(t, f, f.during())
 	later := f.closed().Add(IndexWindow + time.Hour)
-	if rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, later); err != nil || len(rep.Listing) != 0 {
+	if rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, later, nil); err != nil || len(rep.Listing) != 0 {
 		t.Fatalf("an index past its window: %v %v", rep, err)
 	}
 	if rep, err := check(t, f, o, testID); err != nil || !slices.Contains(rep.Listing, "index: missing") {
@@ -189,9 +191,10 @@ func TestCheckMismatches(t *testing.T) {
 	f := loadFixture(t)
 	objs := published(t, f, true)
 	s, _ := newSite(t, f, f.during())
+	var modified func(context.Context, string) (time.Time, error)
 	at := func(o map[string][]byte, now time.Time) *Report {
 		t.Helper()
-		rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, now)
+		rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, now, modified)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -236,10 +239,28 @@ func TestCheckMismatches(t *testing.T) {
 	if rep := at(o, ts.Add(ListingGrace+time.Second)); len(rep.Mismatches) != 1 || !strings.HasPrefix(rep.Mismatches[0], "partial: results: since ") {
 		t.Fatalf("a partial upload past the grace: %v", rep.Mismatches)
 	}
-	// A signature alone can't be dated.
+	// A signature alone has no verified time: it is dated by its
+	// Last-Modified, and is a mismatch at once without one.
 	delete(o, base+".sigstore.json")
 	if rep := at(o, ts); !slices.Equal(rep.Mismatches, []string{"partial: results: no verified timestamp"}) {
 		t.Fatalf("an undated partial upload: %v", rep.Mismatches)
+	}
+	modified = func(_ context.Context, path string) (time.Time, error) {
+		if path != base+".sig" {
+			t.Fatalf("Last-Modified of %s", path)
+		}
+		return ts, nil
+	}
+	if rep := at(o, ts.Add(ListingGrace)); len(rep.Partial) != 1 || len(rep.Mismatches) != 0 {
+		t.Fatalf("a signature alone within the grace: %v %v", rep.Partial, rep.Mismatches)
+	}
+	want := "partial: results: since " + ts.UTC().Format(time.RFC3339) + " (its signature's Last-Modified; no bundle)"
+	if rep := at(o, ts.Add(ListingGrace+time.Second)); !slices.Equal(rep.Mismatches, []string{want}) {
+		t.Fatalf("a signature alone past the grace: %v", rep.Mismatches)
+	}
+	modified = func(context.Context, string) (time.Time, error) { return time.Time{}, errors.New("no answer") }
+	if rep := at(o, ts); !slices.Equal(rep.Mismatches, []string{"partial: results: no verified timestamp"}) {
+		t.Fatalf("a signature alone with no Last-Modified: %v", rep.Mismatches)
 	}
 }
 
@@ -279,7 +300,7 @@ func TestCheckPermanentPartial(t *testing.T) {
 	} {
 		o := published(t, f, c.results)
 		o[ext2] = f.Extension.Sig
-		rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, c.now)
+		rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, c.now, nil)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -291,7 +312,8 @@ func TestCheckPermanentPartial(t *testing.T) {
 		}
 		// Only a permanent partial may be acknowledged; acknowledging a
 		// retryable one is itself a mismatch.
-		ack := Acknowledgement{ProposalID: testID, Document: "extension-2", Reason: "x", AcknowledgedAt: "2026-11-04"}
+		ack := Acknowledgement{ProposalID: testID, Document: "extension-2", Reason: "x", AcknowledgedAt: "2026-11-04",
+			Objects: []Object{objectOf(ext2, f.Extension.Sig)}}
 		rep.Acknowledge([]Acknowledgement{ack})
 		stale := slices.Contains(rep.Mismatches, StaleAcknowledgement(ack))
 		if acked := slices.Contains(rep.Acknowledged, "extension-2"); acked != c.permanent || stale == c.permanent {
@@ -300,48 +322,118 @@ func TestCheckPermanentPartial(t *testing.T) {
 	}
 }
 
-// An acknowledged partial is reported, not a mismatch; an unlisted one
-// is a mismatch; an acknowledgement that matches no partial is one too.
+// An acknowledged partial is reported, not a mismatch, while its served
+// objects are exactly the entry's; an unlisted one is a mismatch, and so
+// is an acknowledgement that matches no partial, or whose objects differ
+// from those served.
 func TestAcknowledged(t *testing.T) {
 	f := loadFixture(t)
 	s, _ := newSite(t, f, f.during())
 	o := published(t, f, true)
-	o[docPath(testID, "extension-2")+".sig"] = f.Extension.Sig
+	sigKey := docPath(testID, "extension-2") + ".sig"
+	bundleKey := docPath(testID, "extension-2") + ".sigstore.json"
+	o[sigKey] = f.Extension.Sig
+	now := f.closed()
 	check := func(acks []Acknowledgement) *Report {
 		t.Helper()
-		rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, f.closed())
+		rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, now, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		rep.Acknowledge(acks)
 		return rep
 	}
-	if rep := check(nil); len(rep.Mismatches) != 1 || !strings.HasPrefix(rep.Mismatches[0], "partial: extension-2") {
+	rep := check(nil)
+	if len(rep.Mismatches) != 1 || !strings.HasPrefix(rep.Mismatches[0], "partial: extension-2") {
 		t.Fatalf("unlisted: %v", rep.Mismatches)
 	}
-	acks, err := ParseAcknowledged([]byte(`[{"proposal_id":"` + testID + `","document":"extension-2","reason":"an upload interrupted after the close","acknowledged_at":"2026-11-04"},
-		{"proposal_id":"01KC0000000000000000000002","document":"results","reason":"another vote's","acknowledged_at":"2026-11-04"}]`))
+	sigHash := hex.EncodeToString(sha(f.Extension.Sig))
+	if want := []Object{{sigKey, sigHash}}; !slices.Equal(rep.PartialObjects["extension-2"], want) {
+		t.Fatalf("partial objects %v, want %v", rep.PartialObjects, want)
+	}
+	entry := func(objects string) string {
+		return `{"proposal_id":"` + testID + `","document":"extension-2","reason":"an upload interrupted after the close","acknowledged_at":"2026-11-04",
+			"objects":[` + objects + `]}`
+	}
+	obj := func(key, h string) string { return `{"key":"` + key + `","sha256":"` + h + `"}` }
+	acks, err := ParseAcknowledged([]byte(`[` + entry(obj(sigKey, sigHash)) + `,
+		{"proposal_id":"01KC0000000000000000000002","document":"results","reason":"another vote's","acknowledged_at":"2026-11-04",
+			"objects":[{"key":"v1/p/01KC0000000000000000000002/results.json.sig","sha256":"` + sigHash + `"}]}]`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rep := check(acks); len(rep.Mismatches) != 0 || !slices.Equal(rep.Acknowledged, []string{"extension-2"}) {
 		t.Fatalf("acknowledged: %v %v", rep.Mismatches, rep.Acknowledged)
 	}
-	stale := []Acknowledgement{acks[0], {ProposalID: testID, Document: "results", Reason: "x", AcknowledgedAt: "2026-11-04"}}
+	stale := []Acknowledgement{acks[0], {ProposalID: testID, Document: "results", Reason: "x", AcknowledgedAt: "2026-11-04",
+		Objects: []Object{{docPath(testID, "results") + ".sig", sigHash}}}}
 	if rep := check(stale); !slices.Equal(rep.Mismatches, []string{StaleAcknowledgement(stale[1])}) {
 		t.Fatalf("stale: %v", rep.Mismatches)
 	}
 
+	// The entry names the objects: another signature at the name, an
+	// object added to it, or one listed that isn't served, is a
+	// mismatch, and the partial is not acknowledged.
+	differs := func(name string, acks []Acknowledgement, want string) {
+		t.Helper()
+		rep := check(acks)
+		if len(rep.Acknowledged) != 0 ||
+			!slices.Contains(rep.Mismatches, "acknowledged: "+testID+" extension-2: the served objects differ from the entry's ("+want+")") {
+			t.Fatalf("%s: acknowledged %v, mismatches %q", name, rep.Acknowledged, rep.Mismatches)
+		}
+	}
+	o[sigKey] = append(bytes.Clone(f.Extension.Sig), 0)
+	differs("a changed signature", acks, "changed: "+sigKey+" is served with sha256 "+hex.EncodeToString(sha(o[sigKey])))
+	o[sigKey] = f.Extension.Sig
+	o[bundleKey] = f.Extension.Bundle
+	differs("an added bundle", acks, "not listed: "+bundleKey+" with sha256 "+hex.EncodeToString(sha(f.Extension.Bundle)))
+	delete(o, bundleKey)
+	withBundle := acks[0]
+	withBundle.Objects = append(slices.Clone(withBundle.Objects), objectOf(bundleKey, f.Extension.Bundle))
+	differs("a listed object not served", []Acknowledgement{withBundle}, "not served: "+bundleKey)
+
+	// Another partial of the same vote isn't covered by the entry: with
+	// extension-2 acknowledged, results left partial past the grace are
+	// still a mismatch.
+	open := published(t, f, false)
+	o = maps.Clone(open)
+	o[sigKey] = f.Extension.Sig
+	o[docPath(testID, "results")+".sig"], o[docPath(testID, "results")+".sigstore.json"] = f.Results.Sig, f.Results.Bundle
+	ts, err := s.Anchors.TimestampOf(f.Results.Bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = ts.Add(ListingGrace + time.Second)
+	if rep := check(acks); !slices.Equal(rep.Acknowledged, []string{"extension-2"}) || len(rep.Mismatches) != 1 ||
+		!strings.HasPrefix(rep.Mismatches[0], "partial: results: since ") {
+		t.Fatalf("another partial: acknowledged %v, mismatches %v", rep.Acknowledged, rep.Mismatches)
+	}
+
+	h := `"` + sigHash + `"`
+	e := func(doc, objects string) string {
+		return `[{"proposal_id":"` + testID + `","document":"` + doc + `","reason":"x","acknowledged_at":"2026-11-04","objects":` + objects + `}]`
+	}
+	sig := func(doc string) string { return docPath(testID, doc) + ".sig" }
 	for name, bad := range map[string]string{
-		"not an array":   `{}`,
-		"null":           `null`,
-		"another member": `[{"proposal_id":"` + testID + `","document":"results","reason":"x","acknowledged_at":"2026-11-04","by":"y"}]`,
-		"no reason":      `[{"proposal_id":"` + testID + `","document":"results","reason":"","acknowledged_at":"2026-11-04"}]`,
-		"a bad date":     `[{"proposal_id":"` + testID + `","document":"results","reason":"x","acknowledged_at":"4 Nov"}]`,
-		"a bad document": `[{"proposal_id":"` + testID + `","document":"rows","reason":"x","acknowledged_at":"2026-11-04"}]`,
-		"twice": `[{"proposal_id":"` + testID + `","document":"results","reason":"x","acknowledged_at":"2026-11-04"},
-			{"proposal_id":"` + testID + `","document":"results","reason":"y","acknowledged_at":"2026-11-04"}]`,
-		"trailing data": `[] []`,
+		"not an array":            `{}`,
+		"null":                    `null`,
+		"another member":          `[{"proposal_id":"` + testID + `","document":"results","reason":"x","acknowledged_at":"2026-11-04","objects":[` + obj(sig("results"), sigHash) + `],"by":"y"}]`,
+		"no reason":               `[{"proposal_id":"` + testID + `","document":"results","reason":"","acknowledged_at":"2026-11-04","objects":[` + obj(sig("results"), sigHash) + `]}]`,
+		"a bad date":              `[{"proposal_id":"` + testID + `","document":"results","reason":"x","acknowledged_at":"4 Nov","objects":[` + obj(sig("results"), sigHash) + `]}]`,
+		"a bad document":          e("rows", `[`+obj(docPath(testID, "rows"), sigHash)+`]`),
+		"twice":                   `[` + entry(obj(sigKey, sigHash)) + `,` + entry(obj(sigKey, sigHash)) + `]`,
+		"trailing data":           `[] []`,
+		"no objects":              e("extension-2", `[]`),
+		"null objects":            e("extension-2", `null`),
+		"objects missing":         `[{"proposal_id":"` + testID + `","document":"extension-2","reason":"x","acknowledged_at":"2026-11-04"}]`,
+		"another proposal's key":  e("extension-2", `[`+obj("v1/p/01KC0000000000000000000002/extension-2.json.sig", sigHash)+`]`),
+		"another document's key":  e("extension-2", `[`+obj(sig("extension-1"), sigHash)+`]`),
+		"the rows' key":           e("results", `[`+obj("v1/p/"+testID+"/rows.json", sigHash)+`]`),
+		"a key twice":             e("extension-2", `[`+obj(sigKey, sigHash)+`,`+obj(sigKey, sigHash)+`]`),
+		"a short hash":            e("extension-2", `[`+obj(sigKey, sigHash[:62])+`]`),
+		"an uppercase hash":       e("extension-2", `[`+obj(sigKey, strings.ToUpper(sigHash))+`]`),
+		"a base64 hash":           e("extension-2", `[{"key":"`+sigKey+`","sha256":"`+base64.StdEncoding.EncodeToString(sha(f.Extension.Sig))+`"}]`),
+		"an object's other field": e("extension-2", `[{"key":"`+sigKey+`","sha256":`+h+`,"size":1}]`),
 	} {
 		if _, err := ParseAcknowledged([]byte(bad)); err == nil {
 			t.Errorf("%s: parsed", name)

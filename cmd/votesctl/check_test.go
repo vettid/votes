@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -92,7 +93,7 @@ func TestCheckCommand(t *testing.T) {
 	key := base64.StdEncoding.EncodeToString(sk.Public().(ed25519.PublicKey))
 	other := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	var out bytes.Buffer
-	if ok, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, nil, time.Now()); err != nil || !ok {
+	if ok, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), nil, anchors, key, p.ProposalID, nil, time.Now()); err != nil || !ok {
 		t.Fatal(ok, err)
 	}
 	if !bytes.Contains(out.Bytes(), []byte(`"unhandled": 0`)) {
@@ -149,7 +150,7 @@ func TestCheckCommand(t *testing.T) {
 	es[0].Extended = 0
 	store.Objects["v1/index.json"], _ = json.Marshal(es)
 	out.Reset()
-	ok, err = checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, nil, time.Now())
+	ok, err = checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), nil, anchors, key, p.ProposalID, nil, time.Now())
 	if err != nil || ok || !bytes.Contains(out.Bytes(), []byte(`"listing: index: extended"`)) {
 		t.Fatalf("a stale listing: %v %v %s", ok, err, out.Bytes())
 	}
@@ -202,11 +203,26 @@ func TestCheckCommand(t *testing.T) {
 		}
 		return path
 	}
-	entry := func(doc string) string {
-		return `{"proposal_id":"` + p.ProposalID + `","document":"` + doc + `","reason":"an upload interrupted after the close","acknowledged_at":"2026-11-04"}`
-	}
 	ext2 := "v1/p/" + p.ProposalID + "/extension-2.json.sig"
 	store.Objects[ext2] = f.Extension.Sig
+	// The report names the partial's objects and their hashes: an entry
+	// is written from them.
+	out.Reset()
+	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), nil, anchors, key, p.ProposalID, nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var partial report
+	_ = json.Unmarshal(out.Bytes(), &partial)
+	sum := sha256.Sum256(f.Extension.Sig)
+	objects := []site.Object{{Key: ext2, SHA256: hex.EncodeToString(sum[:])}}
+	if !slices.Equal(partial.PartialObjects["extension-2"], objects) || !slices.Equal(partial.PartialPermanent, []string{"extension-2"}) {
+		t.Fatalf("the partial's objects: %s", out.Bytes())
+	}
+	objJSON, _ := json.Marshal(objects)
+	entry := func(doc string) string {
+		obj := strings.ReplaceAll(string(objJSON), "extension-2", doc)
+		return `{"proposal_id":"` + p.ProposalID + `","document":"` + doc + `","reason":"an upload interrupted after the close","acknowledged_at":"2026-11-04","objects":` + obj + `}`
+	}
 	for _, c := range []struct {
 		name, body string
 		all        bool
@@ -218,8 +234,11 @@ func TestCheckCommand(t *testing.T) {
 		{"an acknowledged partial, -all", "[" + entry("extension-2") + "]", true, exitOK},
 		{"a stale entry", "[" + entry("extension-2") + "," + entry("results") + "]", false, exitMismatch},
 		{"a stale entry, -all", "[" + entry("extension-2") + "," + entry("results") + "]", true, exitMismatch},
-		{"another proposal's, -all", "[" + entry("extension-2") + `,{"proposal_id":"01KC0000000000000000000009","document":"results","reason":"x","acknowledged_at":"2026-11-04"}]`, true, exitMismatch},
+		{"another proposal's, -all", "[" + entry("extension-2") + `,{"proposal_id":"01KC0000000000000000000009","document":"results","reason":"x","acknowledged_at":"2026-11-04","objects":[{"key":"v1/p/01KC0000000000000000000009/results.json.sig","sha256":"` + objects[0].SHA256 + `"}]}]`, true, exitMismatch},
+		{"a changed hash", strings.Replace("["+entry("extension-2")+"]", objects[0].SHA256, strings.Repeat("0", 64), 1), false, exitMismatch},
+		{"a changed hash, -all", strings.Replace("["+entry("extension-2")+"]", objects[0].SHA256, strings.Repeat("0", 64), 1), true, exitMismatch},
 		{"not a list", `{}`, false, exitFailed},
+		{"an entry without objects", `[{"proposal_id":"` + p.ProposalID + `","document":"extension-2","reason":"x","acknowledged_at":"2026-11-04"}]`, false, exitFailed},
 	} {
 		a := args("-site-key", key, "-acknowledged", ackFile("acks.json", c.body))
 		if c.all {
@@ -234,12 +253,12 @@ func TestCheckCommand(t *testing.T) {
 	delete(store.Objects, ext2)
 
 	// Another site key, or a changed row, fails the check.
-	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, other, p.ProposalID, nil, time.Now()); err == nil {
+	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), nil, anchors, other, p.ProposalID, nil, time.Now()); err == nil {
 		t.Fatal("checked under another site key")
 	}
 	rows := "v1/p/" + p.ProposalID + "/rows.json"
 	store.Objects[rows] = append(bytes.Clone(store.Objects[rows]), '\n')
-	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, nil, time.Now()); err == nil {
+	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), nil, anchors, key, p.ProposalID, nil, time.Now()); err == nil {
 		t.Fatal("checked with a changed row")
 	}
 }

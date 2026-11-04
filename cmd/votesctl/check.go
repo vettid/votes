@@ -60,7 +60,7 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		if *all {
 			ok, err = checkAll(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, *since, acks, time.Now())
 		} else {
-			ok, err = checkVote(ctx, stdout, fetch, anchors, *key, fs.Arg(0), acks, time.Now())
+			ok, err = checkVote(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, fs.Arg(0), acks, time.Now())
 		}
 	}
 	switch {
@@ -191,6 +191,9 @@ type report struct {
 	Listing []string `json:"listing,omitempty"`
 	// SkewSeconds: each anchor's RFC 3161 time less its Rekor time.
 	SkewSeconds map[string]int64 `json:"skew_seconds,omitempty"`
+	// PartialObjects: each partial upload's served objects, by key and
+	// hex SHA-256; an acknowledged list's entry names them as here.
+	PartialObjects map[string][]site.Object `json:"partial_objects,omitempty"`
 	// PartialPermanent: partial uploads the site can no longer complete.
 	PartialPermanent []string `json:"partial_permanent,omitempty"`
 	// Acknowledged: partial uploads on the acknowledged list.
@@ -226,13 +229,14 @@ func writeReport(w io.Writer, v any) error {
 // checkVote checks one proposal on a site and writes the report. ok is
 // the report's: false when it has mismatches. err is a check that failed
 // (no report is written).
-func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *site.Anchors, siteKeyB64, id string,
+func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, modified func(context.Context, string) (time.Time, error),
+	anchors *site.Anchors, siteKeyB64, id string,
 	acks []site.Acknowledgement, now time.Time) (ok bool, err error) {
 	key, err := decodeSiteKey(siteKeyB64)
 	if err != nil {
 		return false, err
 	}
-	rep, err := site.Check(ctx, fetch, anchors, key, id, now)
+	rep, err := site.Check(ctx, fetch, anchors, key, id, now, modified)
 	if err != nil {
 		return false, err
 	}
@@ -246,7 +250,7 @@ func toReport(rep *site.Report, now time.Time) report {
 	out := report{OK: len(rep.Mismatches) == 0, ProposalID: rep.ProposalID, ServiceID: rep.ServiceID, ServiceName: rep.ServiceName,
 		Title: rep.Title, Eligible: rep.Eligible, OpensAt: rep.OpensAt, ClosesAt: rep.ClosesAt,
 		Extensions: rep.Extensions, Anchored: map[string]string{}, Hashes: map[string]string{}, Partial: rep.Partial,
-		Listing: rep.Listing, PartialPermanent: rep.PartialPermanent, Acknowledged: rep.Acknowledged, Mismatches: rep.Mismatches}
+		Listing: rep.Listing, PartialObjects: rep.PartialObjects, PartialPermanent: rep.PartialPermanent, Acknowledged: rep.Acknowledged, Mismatches: rep.Mismatches}
 	if len(rep.Skew) > 0 {
 		out.SkewSeconds = map[string]int64{}
 		for name, d := range rep.Skew {
@@ -369,7 +373,7 @@ func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, modified fun
 		}
 	}
 	for _, id := range slices.Sorted(maps.Keys(ids)) {
-		rep, err := site.Check(ctx, fetch, anchors, key, id, now)
+		rep, err := site.Check(ctx, fetch, anchors, key, id, now, modified)
 		if err != nil {
 			out.Proposals = append(out.Proposals, report{ProposalID: id, Error: err.Error()})
 			out.Errors++
