@@ -170,10 +170,10 @@ which fails on exit code 1 or 3. It takes staging's site key from the
 member vaults' release config, and production's from the repository
 variable `VOTES_PROD_SITE_KEY` (skipped, with a warning, until it is
 set); `VOTES_STAGING_SITE_KEY` overrides staging's. It also warns when
-the embedded trusted roots are over 60 days old. GitHub disables a
-scheduled workflow after 60 days without activity in the repository, and
-mails its failures only to whoever last changed its cron line: someone
-should watch the workflow's status.
+the embedded trusted roots are over 60 days old. GitHub mails a failed
+run only to whoever last changed the cron line, and disables a schedule
+after 60 days without activity in the repository, so each run also
+reports to AWS (**Alerts**, below).
 
 - **The service list's chain:** `services/1.json` to the current
   version's copy, each with its `.sig` under the site key, each holding
@@ -188,8 +188,11 @@ should watch the workflow's status.
   of the index's entries, each checked as `votesctl check <id>` does.
 - **Mismatches** make the report's `ok` false: a `listing` difference
   still there 10 minutes after the latest document's anchor time; a
-  `partial` upload 10 minutes after its bundle's RFC 3161 time, or one
-  without a bundle that verifies, which can't be dated; and an anchor
+  `partial` upload 10 minutes after its bundle's RFC 3161 time, or, for
+  a signature alone (the site writes the signature, then the bundle),
+  10 minutes after the signature's `Last-Modified`; one whose bundle
+  doesn't verify, or a signature alone with no `Last-Modified`, can't be
+  dated and is a mismatch at once; and an anchor
   whose RFC 3161 time and Rekor integrated time differ by more than 10
   minutes, or that has no integrated time (`skew_seconds` has each
   difference). A service anchors and uploads within seconds, so either
@@ -200,21 +203,65 @@ should watch the workflow's status.
   every run until it is acknowledged.
 - **Acknowledged partial uploads:** `monitor/acknowledged-staging.json`
   and `-prod.json` (passed with `-acknowledged <file>`) are strict JSON
-  arrays of `{proposal_id, document, reason, acknowledged_at}`, with
-  `document` such as `extension-2` and `acknowledged_at` a `YYYY-MM-DD`
-  date. A permanent partial upload they list is reported in
-  `acknowledged` and is not a mismatch. An entry that matches no
-  permanent partial upload (completed, still retryable, or wrong) is a
-  mismatch, so the list stays true. Each entry is added by a
-  PR that gives its reason; both lists start empty.
+  arrays of entries
+
+  ```json
+  {"proposal_id": "<id>", "document": "extension-2", "reason": "<why>",
+   "acknowledged_at": "YYYY-MM-DD",
+   "objects": [{"key": "v1/p/<id>/extension-2.json.sig", "sha256": "<hex>"}]}
+  ```
+
+  with no other members. `objects` names the partial's served objects
+  (its `.json.sig`, its `.json.sigstore.json`, and the document, of
+  those that exist), each by key, under `v1/p/<proposal_id>/` and one of
+  that document's three, and by the SHA-256 of the bytes served, 64
+  lowercase hex digits; at least one, none twice. A permanent partial
+  upload is reported in `acknowledged`, and is not a mismatch, only while
+  the objects served for it are exactly the entry's: one missing, one
+  added (say, a bundle at the same name), or one whose hash differs makes
+  the entry a mismatch that names each difference, and the partial stays
+  one. Another partial of the same proposal isn't covered. An entry that
+  matches no permanent partial upload (completed, still retryable, or
+  wrong) is a mismatch, so the list stays true. Each entry is added by a
+  PR that gives its reason; both lists start empty. **The hashes:** the
+  report's `partial_objects` lists, for each partial upload, its served
+  objects as the entry takes them (`key` and `sha256`), so an entry is
+  copied from the failing run's report; or, by hand,
+  `curl -s https://<site>/<key> | sha256sum` for each key.
 - **Fetches:** a network error or a `5xx` is retried twice (after 1 and
   3 seconds) before it counts as a failed check; with `-all`, an index
   or archive month that can't be read or parsed is an error in the
   report (`lists`), which is still printed, with the rest checked.
 - **Exit codes:** `0` every check held and `ok` is true; `1` a check
-  failed (with `-all`, the report is printed first and each failure is
-  in it as `error`); `2` a usage error; `3` the checks held but `ok` is
-  false.
+  failed, or an argument file (`-acknowledged`, `-trusted-root`) or the
+  trusted root couldn't be read (with `-all`, a failed check's report is
+  printed first, with each failure in it as `error`; this takes
+  precedence over `3`); `2` a usage error; `3` the checks held but `ok`
+  is false (mismatches).
+- **Alerts:** a stack deployed with `alarmTopicArn` (an SNS topic in the
+  stack's region, `us-east-1`) and `githubOidcProviderArn` (the account's
+  existing OIDC provider for `token.actions.githubusercontent.com`; the
+  stack takes it, as an account has one, and makes none) has a role,
+  `vettid-votes-<env>-monitor` (output `MonitorRoleArn`). Only GitHub's
+  OIDC tokens with audience `sts.amazonaws.com`, subject
+  `repo:vettid/votes:ref:refs/heads/main` and `job_workflow_ref`
+  `vettid/votes/.github/workflows/monitor.yml@refs/heads/main` may assume
+  it, and it may only `sns:Publish` to that topic and
+  `cloudwatch:PutMetricData` in the namespace `VettID/Votes`. Each run,
+  on main, assumes it with `aws-actions/configure-aws-credentials`. A
+  failed run (a mismatch, a failed check, or a step before it) publishes
+  to the topic, naming the environment, the exit code and the run. A run
+  whose check succeeded puts the heartbeat: `MonitorHeartbeat` in
+  `VettID/Votes`, dimension `env`, value 1. The stack's alarm
+  `vettid-votes-<env>-monitor-heartbeat` (the hourly sum below 1 for 3
+  hours in a row, missing data breaching) notifies the same topic, and
+  again when it clears: it catches a schedule GitHub disabled, runs that
+  can't reach AWS, a skipped check (production before its site key is
+  set), and failures that go on. The role and the topic are the
+  repository variables `VOTES_<STAGING|PROD>_MONITOR_ROLE_ARN` and
+  `VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN` (not secrets); while either is
+  unset the run warns and sends nothing. A stack without the two
+  contexts has neither the role nor the alarm.
 
 ## Changes
 
@@ -223,10 +270,17 @@ should watch the workflow's status.
   or an anchor whose RFC 3161 and Rekor times differ by over 10 minutes;
   `-all` walks the service list's kept versions and checks every
   proposal listed; permanent partial uploads can be acknowledged, by PR,
-  in `monitor/acknowledged-<env>.json`; network fetches are retried;
-  documented exit codes; a scheduled workflow runs it
-  hourly on staging and production. The trusted root is embedded in the
-  build and refreshed through TUF at most once a day; a start that
+  in `monitor/acknowledged-<env>.json`, each entry naming the partial's
+  served objects by key and SHA-256, which must be exactly those served
+  (the report's `partial_objects` lists them); a signature alone gets
+  the same 10 minutes' grace, from its `Last-Modified`; network fetches
+  are retried; documented exit codes; a scheduled workflow runs it
+  hourly on staging and production, publishes a failed run to an SNS
+  topic through a role it assumes by GitHub OIDC, and puts a heartbeat
+  whose alarm, after 3 hours without one, notifies the same topic (the
+  stack's `alarmTopicArn` and `githubOidcProviderArn`). The trusted root is embedded in the
+  build and refreshed through TUF at most once a day, the fetch made
+  outside the lock so other checks go on with the root in use; a start that
   can't reach TUF runs on the embedded root if it is at most 90 days old
   (§4 item 4).
 

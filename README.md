@@ -63,15 +63,21 @@ published.
 difference still there 10 minutes after the latest document's anchor
 time (the lists are rewritten just after each document, so they may lag
 an upload in progress), a `partial` upload 10 minutes after its bundle's
-timestamp (or without a bundle that verifies), or an anchor whose two
-times differ by more than 10 minutes. A partial upload that can never
-be completed (an extension past its close; `partial_permanent`) can be
-acknowledged: `-acknowledged <file>` reads a JSON array of
-`{proposal_id, document, reason, acknowledged_at}` (for the monitor,
+timestamp (a signature alone: after its `Last-Modified`; a bundle that
+doesn't verify, or no date at all: at once), or an anchor whose two
+times differ by more than 10 minutes. `partial_objects` lists each
+partial upload's served objects, by `key` and hex `sha256`. A partial
+upload that can never be completed (an extension past its close;
+`partial_permanent`) can be acknowledged: `-acknowledged <file>` reads a
+JSON array of `{proposal_id, document, reason, acknowledged_at,
+objects}`, where `objects` is the partial's `[{key, sha256}]` as the
+report's `partial_objects` gives them (for the monitor,
 `monitor/acknowledged-<env>.json`, each entry added by PR with its
-reason), and a permanent partial it lists is reported in `acknowledged`,
-not as a mismatch; an entry that matches no permanent partial upload
-(completed, still retryable, or wrong) is a mismatch.
+reason; VOTES-SITE §7). A permanent partial it lists is reported in
+`acknowledged`, not as a mismatch, only while the objects served for it
+are exactly those listed: a changed hash, an added object or a missing
+one is a mismatch. An entry that matches no permanent partial upload
+(completed, still retryable, or wrong) is a mismatch too.
 **`-all`** also walks the service
 list's kept versions, `services/1.json` to the current one, checking
 each signature and that each extends the one before, then checks every
@@ -79,12 +85,15 @@ proposal in `index.json` and the archive (from 2026-10, or
 `-since YYYY-MM`), and prints one report with each proposal's, a failed
 one as its `error`. A network error or a `5xx` is retried twice.
 
-**Exit codes:** `0` every check held and `ok` is true; `1` a check failed
-(with `-all`, after the report); `2` a usage error; `3` the checks held
-but `ok` is false. The `monitor` workflow runs `check -all` hourly on
-staging and production and fails on `1` or `3` (VOTES-SITE §7; it needs
-the repository variable `VOTES_PROD_SITE_KEY` before production is
-checked).
+**Exit codes:** `0` every check held and `ok` is true; `1` a check failed,
+or a file it was given couldn't be read (with `-all`, after the report;
+it wins over `3`); `2` a usage error; `3` the checks held but `ok` is
+false. The `monitor` workflow runs `check -all` hourly on staging and
+production and fails on `1` or `3` (VOTES-SITE §7; it needs the
+repository variable `VOTES_PROD_SITE_KEY` before production is checked).
+A failed run is published to the alert topic, and a successful one puts
+a heartbeat whose alarm fires after 3 hours without one ("Deployment",
+step 6).
 
 **The trusted root:** Sigstore's, for `-sigstore` (`production` by
 default), fetched through its TUF repository, or, if that fails, the one
@@ -139,6 +148,19 @@ environment. None has a default.
    4,194,304 bytes in all; the number of services and keys is not
    limited, since the list only grows); one interrupted half-way is
    finished by running the same command again.
+6. **The monitor's alerts** (VOTES-SITE §7): deploy with
+   `-c alarmTopicArn=<SNS topic ARN in us-east-1> -c githubOidcProviderArn=<ARN>`,
+   both or neither, on every deploy from then on. The provider is the
+   account's existing one for `token.actions.githubusercontent.com`
+   (`aws iam list-open-id-connect-providers`); the stack doesn't make
+   one. If the account has none, create it once, outside the stack
+   (`aws iam create-open-id-connect-provider --url https://token.actions.githubusercontent.com --client-id-list sts.amazonaws.com`).
+   The deploy makes the role `vettid-votes-<env>-monitor` (output
+   `MonitorRoleArn`) and the heartbeat alarm. Then set the repository
+   variables (Settings, Variables: not secrets)
+   `VOTES_<STAGING|PROD>_MONITOR_ROLE_ARN` to that output and
+   `VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN` to the topic. The alarm fires 3
+   hours after the deploy until the first run that puts a heartbeat.
 
 ### Clearing a stray version copy
 

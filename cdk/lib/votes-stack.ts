@@ -5,6 +5,8 @@ import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cwactions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -13,6 +15,7 @@ import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as sns from 'aws-cdk-lib/aws-sns';
 import { Construct } from 'constructs';
 
 /** The Lambda's timeout: well under the minute between an extension's
@@ -23,6 +26,20 @@ export const LAMBDA_TIMEOUT_SECONDS = 20;
  * enforced by the bucket policy), the index and the archive. Not the
  * service list, which only the operator's votesctl writes. */
 export const WRITE_PATHS = ['v1/p/*', 'v1/index.json', 'v1/archive/*'] as const;
+
+/** The monitor's heartbeat (docs/VOTES-SITE.md §7): each run of
+ * .github/workflows/monitor.yml that finds nothing wrong puts it, with the
+ * dimension env; three hours without one raise the heartbeat alarm. */
+export const HEARTBEAT = { namespace: 'VettID/Votes', metricName: 'MonitorHeartbeat', hours: 3 } as const;
+
+/** What the monitor's role trusts: GitHub's OIDC tokens for the monitor
+ * workflow of vettid/votes, run from main, for STS. */
+export const MONITOR_OIDC = {
+  issuer: 'token.actions.githubusercontent.com',
+  audience: 'sts.amazonaws.com',
+  sub: 'repo:vettid/votes:ref:refs/heads/main',
+  jobWorkflowRef: 'vettid/votes/.github/workflows/monitor.yml@refs/heads/main',
+} as const;
 
 export interface VotesStackProps extends cdk.StackProps {
   readonly envName: string;
@@ -43,6 +60,17 @@ export interface VotesStackProps extends cdk.StackProps {
    * marker: earlier object versions still can't be deleted, and puts
    * still need If-None-Match. The next deploy, without it, closes it. */
   readonly servicesRepair?: boolean;
+  /** The SNS topic the monitor's alerts go to (docs/VOTES-SITE.md §7),
+   * in the stack's region. With it, the stack makes the monitor's role,
+   * which the workflow assumes through GitHub's OIDC provider to publish
+   * a failed run there and to put its heartbeat, and the heartbeat's
+   * alarm, which notifies the topic. Without it, neither. */
+  readonly alarmTopicArn?: string;
+  /** The account's existing OIDC provider for
+   * token.actions.githubusercontent.com (an account has at most one, so
+   * the stack takes it rather than making it). Required with
+   * alarmTopicArn. */
+  readonly githubOidcProviderArn?: string;
   /** The function's code; by default `cmd/votes-api` built for arm64. */
   readonly lambdaCode?: lambda.Code;
 }
@@ -259,9 +287,70 @@ export class VotesStack extends cdk.Stack {
     new route53.ARecord(this, 'AliasA', { zone, recordName: props.hostName, target: alias });
     new route53.AaaaRecord(this, 'AliasAAAA', { zone, recordName: props.hostName, target: alias });
 
+    if (props.alarmTopicArn !== undefined || props.githubOidcProviderArn !== undefined) {
+      this.monitorAlerts(prefix, props);
+    }
+
     new cdk.CfnOutput(this, 'BucketName', { value: this.bucket.bucketName });
     new cdk.CfnOutput(this, 'SiteKeySecret', { value: siteKeySecret.secretArn });
     new cdk.CfnOutput(this, 'DistributionId', { value: this.distribution.distributionId });
     new cdk.CfnOutput(this, 'Url', { value: `https://${props.hostName}` });
+  }
+
+  /** The monitor's role and its heartbeat alarm (docs/VOTES-SITE.md §7). */
+  private monitorAlerts(prefix: string, props: VotesStackProps): void {
+    const topicArn = props.alarmTopicArn;
+    const providerArn = props.githubOidcProviderArn;
+    if (topicArn === undefined || providerArn === undefined) {
+      throw new Error('set both alarmTopicArn and githubOidcProviderArn, or neither: the heartbeat alarm needs the role that puts the heartbeat');
+    }
+    const arn = /^arn:aws[a-z-]*:sns:([a-z0-9-]+):[0-9]{12}:[A-Za-z0-9_-]+$/.exec(topicArn);
+    if (!arn) throw new Error(`alarmTopicArn must be an SNS topic ARN (got "${topicArn}")`);
+    if (!cdk.Token.isUnresolved(this.region) && arn[1] !== this.region) {
+      throw new Error(`alarmTopicArn must be in the stack's region, ${this.region}: a CloudWatch alarm notifies a topic in its own region (got ${arn[1]})`);
+    }
+    if (!/^arn:aws[a-z-]*:iam::[0-9]{12}:oidc-provider\/token\.actions\.githubusercontent\.com$/.test(providerArn)) {
+      throw new Error(`githubOidcProviderArn must be the ARN of the account's token.actions.githubusercontent.com OIDC provider (got "${providerArn}")`);
+    }
+    const topic = sns.Topic.fromTopicArn(this, 'AlarmTopic', topicArn);
+    const provider = iam.OpenIdConnectProvider.fromOpenIdConnectProviderArn(this, 'GitHubOidc', providerArn);
+    const iss = MONITOR_OIDC.issuer;
+    const role = new iam.Role(this, 'MonitorRole', {
+      roleName: `${prefix}-monitor`,
+      description: 'votesctl check -all, hourly (.github/workflows/monitor.yml): alerts and heartbeat only',
+      maxSessionDuration: cdk.Duration.hours(1),
+      assumedBy: new iam.OpenIdConnectPrincipal(provider, {
+        StringEquals: {
+          [`${iss}:aud`]: MONITOR_OIDC.audience,
+          [`${iss}:sub`]: MONITOR_OIDC.sub,
+          [`${iss}:job_workflow_ref`]: MONITOR_OIDC.jobWorkflowRef,
+        },
+      }),
+    });
+    role.addToPolicy(new iam.PolicyStatement({ sid: 'Alert', actions: ['sns:Publish'], resources: [topicArn] }));
+    role.addToPolicy(new iam.PolicyStatement({
+      sid: 'Heartbeat', actions: ['cloudwatch:PutMetricData'], resources: ['*'], // it has no resource-level ARN
+      conditions: { StringEquals: { 'cloudwatch:namespace': HEARTBEAT.namespace } },
+    }));
+    // One run an hour: an hour's sum is 1, or 0 when a run failed (it
+    // alerts on its own) or none ran. Missing data breaches, so a schedule
+    // GitHub disabled, or runs that can't reach AWS, raise it too.
+    const heartbeat = new cloudwatch.Metric({
+      namespace: HEARTBEAT.namespace, metricName: HEARTBEAT.metricName, dimensionsMap: { env: props.envName },
+      statistic: cloudwatch.Stats.SUM, period: cdk.Duration.hours(1),
+    });
+    const alarm = new cloudwatch.Alarm(this, 'MonitorHeartbeatAlarm', {
+      alarmName: `${prefix}-monitor-heartbeat`,
+      alarmDescription: `No successful monitor run for ${props.envName} in ${HEARTBEAT.hours} hours (docs/VOTES-SITE.md §7)`,
+      metric: heartbeat,
+      threshold: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+      evaluationPeriods: HEARTBEAT.hours,
+      datapointsToAlarm: HEARTBEAT.hours,
+      treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+    });
+    alarm.addAlarmAction(new cwactions.SnsAction(topic));
+    alarm.addOkAction(new cwactions.SnsAction(topic));
+    new cdk.CfnOutput(this, 'MonitorRoleArn', { value: role.roleArn });
   }
 }
