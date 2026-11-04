@@ -239,11 +239,14 @@ export class VotesStack extends cdk.Stack {
       name: `${prefix}-web-acl`,
       scope: 'CLOUDFRONT',
       defaultAction: { allow: {} },
+      customResponseBodies: { rateLimited: { contentType: 'APPLICATION_JSON', content: '{"error":"rate_limited"}' } },
       visibilityConfig: { cloudWatchMetricsEnabled: true, metricName: `${prefix}-web-acl`, sampledRequestsEnabled: false },
       rules: [{
         name: 'ApiRatePerIp',
         priority: 0,
-        action: { block: {} },
+        // 429, not WAF's default 403: a client (the service vault's
+        // publisher) retries a 429 and takes a 403 as a final refusal.
+        action: { block: { customResponse: { responseCode: 429, customResponseBodyKey: 'rateLimited' } } },
         statement: {
           rateBasedStatement: {
             limit: API_RATE_LIMIT,

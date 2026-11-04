@@ -143,8 +143,10 @@ which API Gateway answers `429`. In front of it, an AWS WAF web ACL on
 the CloudFront distribution with one rate-based rule: at most 100
 requests in any 5 minutes from one IP address to a path starting with
 `/api/` (after URL-decoding and normalizing it, as CloudFront routes
-it), beyond which that address's requests there are blocked (`403`)
-until its rate falls below the limit. Everything else is allowed. The
+it), beyond which that address's requests there are answered `429`
+(`{"error":"rate_limited"}`, not WAF's default `403`, since a client
+retries a `429` and takes a `403` as final) until its rate falls below
+the limit. Everything else is allowed. The
 ACL keeps CloudWatch metrics only: request sampling is off, so it keeps
 no source addresses (§5).
 
@@ -169,7 +171,7 @@ and error codes.
 - **0.2.9 (2026-11-04):** the limits are as deployed: the stage throttle
   (the whole stage, 10/s, burst 20) and an AWS WAF per-address rate rule
   on `/api/` (100 requests in 5 minutes, on the decoded and normalized
-  path), now in the stack; the service
+  path, answered `429`), now in the stack; the service
   list is the operator's, published with `votesctl publish-services`,
   not a file in this repository.
 

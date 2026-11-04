@@ -163,14 +163,15 @@ describe('edge', () => {
     });
   });
 
-  test('its one rule: 100 requests per 5 minutes per IP under /api/, then blocked', () => {
+  test('its one rule: 100 requests per 5 minutes per IP under /api/, then blocked with 429', () => {
     expect(API_RATE_LIMIT).toBe(100);
     expect(API_RATE_WINDOW_SECONDS).toBe(300);
     const acl = Object.values(t.findResources('AWS::WAFv2::WebACL'))[0] as any;
     const rules: any[] = acl.Properties.Rules;
     expect(rules).toHaveLength(1);
+    expect(acl.Properties.CustomResponseBodies).toEqual({ rateLimited: { ContentType: 'APPLICATION_JSON', Content: '{"error":"rate_limited"}' } });
     expect(rules[0]).toMatchObject({
-      Action: { Block: {} },
+      Action: { Block: { CustomResponse: { ResponseCode: 429, CustomResponseBodyKey: 'rateLimited' } } },
       VisibilityConfig: { CloudWatchMetricsEnabled: true },
       Statement: { RateBasedStatement: { Limit: 100, EvaluationWindowSec: 300, AggregateKeyType: 'IP' } },
     });
