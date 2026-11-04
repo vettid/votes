@@ -14,3 +14,9 @@ paths = ['''^site/testdata/vote\.json$''', '''^site/testdata/staging_trusted_roo
 [[allowlists]]
 description = "CDK build output once committed by mistake"
 paths = ['''^cdk/cdk\.out/''', '''^cdk/node_modules/''']
+
+# The staging votes site's public key (an Ed25519 public key, base64), the
+# monitor's default for staging in .github/workflows/monitor.yml.
+[[allowlists]]
+description = "the staging votes site's public key"
+regexes = ['''c4dqg2ssGVylbO9Xnpdv4zopmzx9S\+\+4KgxMWOyhXJQ=''']
