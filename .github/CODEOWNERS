@@ -1,0 +1,7 @@
+# A change to the monitor's exceptions, its workflow or its trusted root
+# needs the owner's review (with main protected: a pull request, one
+# approving review, and review from code owners required).
+/monitor/                        @vettid
+/.github/workflows/monitor.yml   @vettid
+/site/roots/                     @vettid
+/.github/CODEOWNERS              @vettid
