@@ -1,0 +1,7 @@
+# The owner reviews a change to the monitor's exceptions, its workflow,
+# its embedded trusted root and this file (main is protected: a pull
+# request, one approving review, and code-owner review are required).
+/monitor/                        @mesmerverse
+/.github/workflows/monitor.yml   @mesmerverse
+/site/roots/                     @mesmerverse
+/.github/CODEOWNERS              @mesmerverse
