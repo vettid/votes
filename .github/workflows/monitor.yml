@@ -42,7 +42,7 @@ env:
   # The stack's region (cdk/bin/votes.ts pins it): the heartbeat's alarm
   # is there.
   AWS_REGION: us-east-1
-  HEARTBEAT_NAMESPACE: VettID/Votes
+  HEARTBEAT_NAMESPACE_PREFIX: VettID/Votes/
 
 concurrency:
   group: monitor
@@ -154,5 +154,5 @@ jobs:
         env:
           ENV_NAME: ${{ matrix.env }}
         run: |
-          aws cloudwatch put-metric-data --region "$AWS_REGION" --namespace "$HEARTBEAT_NAMESPACE" \
+          aws cloudwatch put-metric-data --region "$AWS_REGION" --namespace "${HEARTBEAT_NAMESPACE_PREFIX}${{ matrix.env }}" \
             --metric-name MonitorHeartbeat --dimensions "env=$ENV_NAME" --value 1 --unit Count

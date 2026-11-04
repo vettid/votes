@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import { HEARTBEAT, LAMBDA_TIMEOUT_SECONDS, MONITOR_OIDC, VotesStack, validSiteKey } from '../lib/votes-stack';
+import { HEARTBEAT, heartbeatNamespace, LAMBDA_TIMEOUT_SECONDS, MONITOR_OIDC, VotesStack, validSiteKey } from '../lib/votes-stack';
 
 // A fixed public test value, not a real key: 32 bytes of 0x07.
 const SITE_KEY = Buffer.alloc(32, 7).toString('base64');
@@ -192,10 +192,10 @@ describe('monitor alerts', () => {
     expect(st).toMatchObject({ Effect: 'Allow', Action: 'sts:AssumeRoleWithWebIdentity', Principal: { Federated: PROVIDER } });
     expect(st.Condition).toEqual({ StringEquals: {
       'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-      'token.actions.githubusercontent.com:sub': 'repo:vettid/votes:ref:refs/heads/main',
+      'token.actions.githubusercontent.com:sub': 'repo:vettid@168311946/votes@1438447065:ref:refs/heads/main',
       'token.actions.githubusercontent.com:job_workflow_ref': 'vettid/votes/.github/workflows/monitor.yml@refs/heads/main',
     } });
-    expect(MONITOR_OIDC.sub).toBe('repo:vettid/votes:ref:refs/heads/main');
+    expect(MONITOR_OIDC.sub).toBe('repo:vettid@168311946/votes@1438447065:ref:refs/heads/main');
     // No provider is made: the account's is taken.
     m.resourceCountIs('Custom::AWSCDKOpenIdConnectProvider', 0);
     m.resourceCountIs('AWS::IAM::OIDCProvider', 0);
@@ -207,14 +207,14 @@ describe('monitor alerts', () => {
     expect(st).toHaveLength(2);
     expect(st.find((x) => x.Sid === 'Alert')).toEqual({ Sid: 'Alert', Effect: 'Allow', Action: 'sns:Publish', Resource: TOPIC });
     expect(st.find((x) => x.Sid === 'Heartbeat')).toEqual({ Sid: 'Heartbeat', Effect: 'Allow', Action: 'cloudwatch:PutMetricData', Resource: '*',
-      Condition: { StringEquals: { 'cloudwatch:namespace': 'VettID/Votes' } } });
+      Condition: { StringEquals: { 'cloudwatch:namespace': 'VettID/Votes/staging' } } });
   });
 
   test('the heartbeat alarm: three hours without a successful run, missing data breaching, to the topic', () => {
     m.resourceCountIs('AWS::CloudWatch::Alarm', 1);
     m.hasResourceProperties('AWS::CloudWatch::Alarm', {
       AlarmName: 'vettid-votes-staging-monitor-heartbeat',
-      Namespace: HEARTBEAT.namespace, MetricName: 'MonitorHeartbeat', Dimensions: [{ Name: 'env', Value: 'staging' }],
+      Namespace: heartbeatNamespace('staging'), MetricName: 'MonitorHeartbeat', Dimensions: [{ Name: 'env', Value: 'staging' }],
       Statistic: 'Sum', Period: 3600, EvaluationPeriods: 3, DatapointsToAlarm: 3,
       Threshold: 1, ComparisonOperator: 'LessThanThreshold', TreatMissingData: 'breaching',
       AlarmActions: [TOPIC], OKActions: [TOPIC],

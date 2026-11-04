@@ -244,15 +244,18 @@ reports to AWS (**Alerts**, below).
   stack takes it, as an account has one, and makes none) has a role,
   `vettid-votes-<env>-monitor` (output `MonitorRoleArn`). Only GitHub's
   OIDC tokens with audience `sts.amazonaws.com`, subject
-  `repo:vettid/votes:ref:refs/heads/main` and `job_workflow_ref`
+  `repo:vettid@168311946/votes@1438447065:ref:refs/heads/main` (the
+  repository uses GitHub's immutable subjects, with the owner's and the
+  repository's ids) and `job_workflow_ref`
   `vettid/votes/.github/workflows/monitor.yml@refs/heads/main` may assume
   it, and it may only `sns:Publish` to that topic and
-  `cloudwatch:PutMetricData` in the namespace `VettID/Votes`. Each run,
+  `cloudwatch:PutMetricData` in its environment's namespace
+  `VettID/Votes/<env>`. Each run,
   on main, assumes it with `aws-actions/configure-aws-credentials`. A
   failed run (a mismatch, a failed check, or a step before it) publishes
   to the topic, naming the environment, the exit code and the run. A run
   whose check succeeded puts the heartbeat: `MonitorHeartbeat` in
-  `VettID/Votes`, dimension `env`, value 1. The stack's alarm
+  `VettID/Votes/<env>`, dimension `env`, value 1. The stack's alarm
   `vettid-votes-<env>-monitor-heartbeat` (the hourly sum below 1 for 3
   hours in a row, missing data breaching) notifies the same topic, and
   again when it clears: it catches a schedule GitHub disabled, runs that

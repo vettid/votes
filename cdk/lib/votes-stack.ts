@@ -28,16 +28,24 @@ export const LAMBDA_TIMEOUT_SECONDS = 20;
 export const WRITE_PATHS = ['v1/p/*', 'v1/index.json', 'v1/archive/*'] as const;
 
 /** The monitor's heartbeat (docs/VOTES-SITE.md §7): each run of
- * .github/workflows/monitor.yml that finds nothing wrong puts it, with the
- * dimension env; three hours without one raise the heartbeat alarm. */
-export const HEARTBEAT = { namespace: 'VettID/Votes', metricName: 'MonitorHeartbeat', hours: 3 } as const;
+ * .github/workflows/monitor.yml that finds nothing wrong puts it in its
+ * environment's namespace (`VettID/Votes/<env>`, so one environment's role
+ * can't put another's), with the dimension env; three hours without one
+ * raise the heartbeat alarm. */
+export const HEARTBEAT = { namespacePrefix: 'VettID/Votes/', metricName: 'MonitorHeartbeat', hours: 3 } as const;
+
+/** heartbeatNamespace is an environment's heartbeat namespace. */
+export function heartbeatNamespace(envName: string): string { return HEARTBEAT.namespacePrefix + envName; }
 
 /** What the monitor's role trusts: GitHub's OIDC tokens for the monitor
- * workflow of vettid/votes, run from main, for STS. */
+ * workflow of vettid/votes, run from main, for STS. The repository uses
+ * GitHub's immutable subjects (owner and repository ids with the names,
+ * `gh api repos/vettid/votes/actions/oidc/customization/sub`), so `sub`
+ * carries them; a renamed or recreated repository does not match. */
 export const MONITOR_OIDC = {
   issuer: 'token.actions.githubusercontent.com',
   audience: 'sts.amazonaws.com',
-  sub: 'repo:vettid/votes:ref:refs/heads/main',
+  sub: 'repo:vettid@168311946/votes@1438447065:ref:refs/heads/main',
   jobWorkflowRef: 'vettid/votes/.github/workflows/monitor.yml@refs/heads/main',
 } as const;
 
@@ -330,13 +338,13 @@ export class VotesStack extends cdk.Stack {
     role.addToPolicy(new iam.PolicyStatement({ sid: 'Alert', actions: ['sns:Publish'], resources: [topicArn] }));
     role.addToPolicy(new iam.PolicyStatement({
       sid: 'Heartbeat', actions: ['cloudwatch:PutMetricData'], resources: ['*'], // it has no resource-level ARN
-      conditions: { StringEquals: { 'cloudwatch:namespace': HEARTBEAT.namespace } },
+      conditions: { StringEquals: { 'cloudwatch:namespace': heartbeatNamespace(props.envName) } },
     }));
     // One run an hour: an hour's sum is 1, or 0 when a run failed (it
     // alerts on its own) or none ran. Missing data breaches, so a schedule
     // GitHub disabled, or runs that can't reach AWS, raise it too.
     const heartbeat = new cloudwatch.Metric({
-      namespace: HEARTBEAT.namespace, metricName: HEARTBEAT.metricName, dimensionsMap: { env: props.envName },
+      namespace: heartbeatNamespace(props.envName), metricName: HEARTBEAT.metricName, dimensionsMap: { env: props.envName },
       statistic: cloudwatch.Stats.SUM, period: cdk.Duration.hours(1),
     });
     const alarm = new cloudwatch.Alarm(this, 'MonitorHeartbeatAlarm', {
