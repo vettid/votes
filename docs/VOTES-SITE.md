@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.8 (2026-11-02), draft. The protocol this site serves is
+**Status:** 0.2.11 (2026-11-04), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -82,10 +82,18 @@ credential: the service's signature is the authentication.
    document's label (BALLOT-PROTOCOL §3.1, §8.5, §7).
 4. **Anchor:** the bundle verifies with Sigstore's own verifier
    (`sigstore-go`) against the trusted root of the stack's Sigstore
-   instance (staging or production, fetched through its TUF repository):
-   the ECDSA signature over the document under one of the service's
-   listed anchor keys, the Rekor entry and its inclusion proof, and one
-   RFC 3161 timestamp.
+   instance (staging or production): the ECDSA signature over the
+   document under one of the service's listed anchor keys, the Rekor
+   entry and its inclusion proof, and one RFC 3161 timestamp. **The
+   trusted root** is fetched through the instance's TUF repository when
+   the function starts, and again at most once every 24 hours; a fetch
+   that fails, or takes over 5 seconds, keeps the root in use. Both
+   instances' roots are also embedded in the build, with the time they
+   were fetched (`site/roots/embedded_at`; refreshed with
+   `go generate ./site`): a start whose fetch fails runs on the embedded
+   root, unless it is over 90 days old, when the start fails (and so
+   does every upload) until the repository answers or a build with a newer
+   root is deployed. `votesctl check` does the same.
 5. **Order and fields:**
    - a proposal: anchored, and uploaded, before its `closes_at`; the
      same proposal again is accepted at any time (a retry);
@@ -153,7 +161,51 @@ function logs ids, types, sizes and error codes.
 - Deploys need the owner's go, as for the service vault and
   member-service.
 
+## 7. Monitoring
+
+`votesctl check -all` (README, "Checking a vote") checks what the site
+serves, as an observer, and is run hourly against staging and
+production by the `monitor` workflow (`.github/workflows/monitor.yml`),
+which fails on exit code 1 or 3. It takes staging's site key from the
+member vaults' release config, and production's from the repository
+variable `VOTES_PROD_SITE_KEY` (skipped, with a warning, until it is
+set); `VOTES_STAGING_SITE_KEY` overrides staging's. It also warns when
+the embedded trusted roots are over 60 days old.
+
+- **The service list's chain:** `services/1.json` to the current
+  version's copy, each with its `.sig` under the site key, each holding
+  its version and extending the one before (the first with an all-zero
+  `previous`), the current copy byte for byte `services.json`. A copy
+  that doesn't verify or chain is an error; a missing copy, or one past
+  the current version, is a mismatch.
+- **Every proposal** in `index.json` and in the archive's months, from
+  the site's first (2026-10, or `-since`) to the current one and those
+  of the index's entries, each checked as `votesctl check <id>` does.
+- **Mismatches** make the report's `ok` false: a `listing` difference
+  still there 10 minutes after the latest document's anchor time; a
+  `partial` upload 10 minutes after its bundle's RFC 3161 time, or one
+  without a bundle that verifies, which can't be dated; and an anchor
+  whose RFC 3161 time and Rekor integrated time differ by more than 10
+  minutes, or that has no integrated time (`skew_seconds` has each
+  difference). A service anchors and uploads within seconds, so either
+  gap means a failed upload not yet retried, a clock that is off, or a
+  timestamp held back before it was logged.
+- **Exit codes:** `0` every check held and `ok` is true; `1` a check
+  failed (with `-all`, the report is printed first and each failure is
+  in it as `error`); `2` a usage error; `3` the checks held but `ok` is
+  false.
+
 ## Changes
+
+- **0.2.11 (2026-11-04):** `votesctl check` is a monitor (§7): `ok` is
+  false for a listing difference or a partial upload past 10 minutes,
+  or an anchor whose RFC 3161 and Rekor times differ by over 10 minutes;
+  `-all` walks the service list's kept versions and checks every
+  proposal listed; documented exit codes; a scheduled workflow runs it
+  hourly on staging and production. The trusted root is embedded in the
+  build and refreshed through TUF at most once a day; a start that
+  can't reach TUF runs on the embedded root if it is at most 90 days old
+  (§4 item 4).
 
 - **0.2.8 (2026-11-02):** the results always set the index's close in
   force and extension count (never lower than stored), and an extension

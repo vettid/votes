@@ -21,7 +21,23 @@ import (
 // API's request-level rules (parts and sizes) are applied too. The index
 // and the month's archive are compared with what the documents show;
 // a difference is reported, not refused, since the lists are rewritten
-// after a document is published and may lag behind a failed upload.
+// after a document is published and may lag behind a failed upload; one
+// that lasts past ListingGrace is a mismatch, as is a partial upload, or
+// an anchor whose two times differ by more than MaxSkew (Report.Mismatches).
+
+// ListingGrace is how long after the latest document's anchor time the
+// index and the archive may still differ from the documents, and how long
+// after its timestamp an upload may stay partial, before the check calls
+// it a mismatch: an upload anchors, then writes its parts and the lists
+// within seconds, and a failed one is retried at the service's next
+// reconcile.
+const ListingGrace = 10 * time.Minute
+
+// MaxSkew bounds the difference between a bundle's RFC 3161 time and the
+// time Rekor integrated its entry: a service anchors a document by
+// getting both within seconds, so a larger gap means a clock that is off,
+// or a timestamp held back before it was logged.
+const MaxSkew = 10 * time.Minute
 
 // Fetcher reads one published object by path (v1/...): nil, nil when it
 // isn't published.
@@ -51,6 +67,13 @@ type Report struct {
 	// Listing names each way index.json or the month's archive differs
 	// from the documents ("archive: missing", "index: closes_at", …).
 	Listing []string
+	// Skew is each document's RFC 3161 time less its Rekor time, by name.
+	Skew map[string]time.Duration
+	// Mismatches are what a monitor fails on: Listing entries past
+	// ListingGrace after the latest anchor, partial uploads past it (or
+	// that can't be dated), and anchors whose times differ by more than
+	// MaxSkew. Empty when the vote is served as it should be.
+	Mismatches []string
 
 	serviceIK []byte
 }
@@ -81,7 +104,8 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 	if err != nil {
 		return nil, err
 	}
-	rep := &Report{ProposalID: id, Anchored: map[string]time.Time{}, Hashes: map[string][]byte{}}
+	rep := &Report{ProposalID: id, Anchored: map[string]time.Time{}, Hashes: map[string][]byte{}, Skew: map[string]time.Duration{}}
+	partialAt := map[string]time.Time{} // a partial upload's verified timestamp, when it has one
 	// put fetches a document's parts and puts it as the site would have
 	// at its anchor's time; found is false when the document isn't there.
 	put := func(name string, rows bool, f func(*Upload) (bool, error)) (found bool, err error) {
@@ -98,6 +122,11 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		if u.Doc == nil {
 			if u.Sig != nil || u.Bundle != nil {
 				rep.Partial = append(rep.Partial, name)
+				if u.Bundle != nil {
+					if ts, err := anchors.TimestampOf(u.Bundle); err == nil {
+						partialAt[name] = ts
+					}
+				}
 			}
 			return false, nil
 		}
@@ -129,15 +158,22 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		if svc == nil {
 			return true, fmt.Errorf("%s: the service isn't listed", name)
 		}
-		ts, err := s.anchor(svc, u)
+		at, err := s.anchorTimes(svc, u)
 		if err != nil {
 			return true, fmt.Errorf("%s: %w", name, err)
 		}
+		ts := at.TSA
 		clock = ts
 		if _, err := f(u); err != nil {
 			return true, fmt.Errorf("%s: %w", name, err)
 		}
 		rep.Anchored[name] = ts
+		if !at.Rekor.IsZero() {
+			rep.Skew[name] = at.TSA.Sub(at.Rekor)
+		}
+		if m := skewMismatch(name, at); m != "" {
+			rep.Mismatches = append(rep.Mismatches, m)
+		}
 		rep.Hashes[name] = sha(u.Doc)
 		if u.Rows != nil {
 			rep.Hashes["rows"] = sha(u.Rows)
@@ -210,6 +246,25 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		}
 		rep.Listing = append(rep.Listing, compareListing(l.name, b, es[0], l.pruned, now)...)
 	}
+	var latest time.Time
+	for _, t := range rep.Anchored {
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	if now.Sub(latest) > ListingGrace {
+		for _, l := range rep.Listing {
+			rep.Mismatches = append(rep.Mismatches, "listing: "+l)
+		}
+	}
+	for _, name := range rep.Partial {
+		switch t, ok := partialAt[name]; {
+		case !ok:
+			rep.Mismatches = append(rep.Mismatches, "partial: "+name+": no verified timestamp")
+		case now.Sub(t) > ListingGrace:
+			rep.Mismatches = append(rep.Mismatches, "partial: "+name+": since "+t.UTC().Format(time.RFC3339))
+		}
+	}
 	return rep, nil
 }
 
@@ -255,6 +310,19 @@ func compareListing(name string, served []byte, want IndexEntry, pruned bool, no
 	// value that differs is reported.
 	diff("unhandled", got.Unhandled == nil || want.Unhandled != nil && *got.Unhandled == *want.Unhandled)
 	return out
+}
+
+// skewMismatch names an anchor whose RFC 3161 and Rekor times differ by
+// more than MaxSkew, or that has no Rekor time; "" when they agree.
+func skewMismatch(name string, at AnchorTimes) string {
+	d := at.TSA.Sub(at.Rekor)
+	switch {
+	case at.Rekor.IsZero():
+		return "skew: " + name + ": no Rekor integrated time"
+	case d > MaxSkew || d < -MaxSkew:
+		return fmt.Sprintf("skew: %s: the RFC 3161 time is %s from Rekor's", name, d.Round(time.Second))
+	}
+	return ""
 }
 
 // serviceOf is the identity key of a document's service: the proposal's

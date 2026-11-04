@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -86,9 +88,10 @@ func TestCheckCommand(t *testing.T) {
 	}))
 	defer srv.Close()
 	key := base64.StdEncoding.EncodeToString(sk.Public().(ed25519.PublicKey))
+	other := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	var out bytes.Buffer
-	if err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, time.Now()); err != nil {
-		t.Fatal(err)
+	if ok, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, time.Now()); err != nil || !ok {
+		t.Fatal(ok, err)
 	}
 	if !bytes.Contains(out.Bytes(), []byte(`"unhandled": 0`)) {
 		t.Fatalf("no unhandled in the report: %s", out.Bytes())
@@ -97,18 +100,95 @@ func TestCheckCommand(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
 		t.Fatal(err)
 	}
-	if !rep.OK || rep.Status != "counted" || len(rep.Hashes) != 4 || rep.Extensions != 1 || rep.Results == nil || rep.Results.Eligible != p.Eligible || len(rep.Anchored) != 3 {
+	if !rep.OK || rep.Status != "counted" || len(rep.Hashes) != 4 || rep.Extensions != 1 || rep.Results == nil || rep.Results.Eligible != p.Eligible || len(rep.Anchored) != 3 ||
+		len(rep.SkewSeconds) != 3 || rep.Mismatches != nil || rep.TrustedRoot != "file" {
 		t.Fatalf("report %s", out.Bytes())
 	}
 
+	// -all: the service list's chain and every listed proposal. The list
+	// was published before its copy was kept: a mismatch until it is.
+	all := func() (allReport, bool, error) {
+		t.Helper()
+		var out bytes.Buffer
+		ok, err := checkAll(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, "2026-10", time.Now())
+		var rep allReport
+		if jerr := json.Unmarshal(out.Bytes(), &rep); jerr != nil {
+			t.Fatalf("%v: %s", jerr, out.Bytes())
+		}
+		if rep.OK != ok {
+			t.Fatalf("ok %v, report %v", ok, rep.OK)
+		}
+		return rep, ok, err
+	}
+	if rep, ok, err := all(); err != nil || ok || !slices.Equal(rep.Services.Mismatches, []string{"services/1: not published"}) {
+		t.Fatalf("-all without the list's copy: %+v %v %v", rep, ok, err)
+	}
+	store.Objects["v1/services/1.json"], store.Objects["v1/services/1.json.sig"] = list, lsig
+	rep2, ok, err := all()
+	if err != nil || !ok || rep2.Services.Checked != 1 || len(rep2.Proposals) != 1 || !rep2.Proposals[0].OK ||
+		rep2.Proposals[0].ProposalID != p.ProposalID || len(rep2.Months) == 0 {
+		t.Fatalf("-all: %+v %v %v", rep2, ok, err)
+	}
+	// A listed proposal the site doesn't serve is an error, reported with
+	// the rest.
+	idx := store.Objects["v1/index.json"]
+	var es []site.IndexEntry
+	_ = json.Unmarshal(idx, &es)
+	es = append(es, es[0])
+	es[1].ProposalID = "01KC0000000000000000000009"
+	store.Objects["v1/index.json"], _ = json.Marshal(es)
+	if rep, ok, err := all(); !errors.Is(err, errChecksFailed) || ok || rep.Errors != 1 || len(rep.Proposals) != 2 || rep.Proposals[1].Error == "" {
+		t.Fatalf("-all with an unpublished proposal: %+v %v %v", rep, ok, err)
+	}
+	store.Objects["v1/index.json"] = idx
+
+	// Past the grace, a listing difference makes ok false.
+	_ = json.Unmarshal(idx, &es)
+	es[0].Extended = 0
+	store.Objects["v1/index.json"], _ = json.Marshal(es)
+	out.Reset()
+	ok, err = checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, time.Now())
+	if err != nil || ok || !bytes.Contains(out.Bytes(), []byte(`"listing: index: extended"`)) {
+		t.Fatalf("a stale listing: %v %v %s", ok, err, out.Bytes())
+	}
+
+	// The exit codes: 3 for a mismatch, 0 when all is well, 1 for a
+	// failed check, 2 for a usage error.
+	args := func(extra ...string) []string {
+		return append([]string{"-site", srv.URL, "-sigstore", "staging", "-trusted-root", "../../site/testdata/staging_trusted_root.json"}, extra...)
+	}
+	code := func(a []string) int {
+		var stdout, stderr bytes.Buffer
+		return runCheck(context.Background(), a, &stdout, &stderr)
+	}
+	if c := code(args("-site-key", key, p.ProposalID)); c != exitMismatch {
+		t.Fatalf("a mismatch: exit %d", c)
+	}
+	store.Objects["v1/index.json"] = idx
+	for _, c := range []struct {
+		args []string
+		want int
+	}{
+		{args("-site-key", key, p.ProposalID), exitOK},
+		{args("-site-key", key, "-all"), exitOK},
+		{args("-site-key", other, p.ProposalID), exitFailed},
+		{args("-site-key", other, "-all"), exitFailed},
+		{args("-site-key", key), exitUsage},
+		{args("-site-key", key, "-all", p.ProposalID), exitUsage},
+		{args("-site-key", key, "-bogus"), exitUsage},
+	} {
+		if got := code(c.args); got != c.want {
+			t.Errorf("%v: exit %d, want %d", c.args[6:], got, c.want)
+		}
+	}
+
 	// Another site key, or a changed row, fails the check.
-	other := base64.StdEncoding.EncodeToString(make([]byte, 32))
-	if err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, other, p.ProposalID, time.Now()); err == nil {
+	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, other, p.ProposalID, time.Now()); err == nil {
 		t.Fatal("checked under another site key")
 	}
 	rows := "v1/p/" + p.ProposalID + "/rows.json"
 	store.Objects[rows] = append(bytes.Clone(store.Objects[rows]), '\n')
-	if err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, time.Now()); err == nil {
+	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), anchors, key, p.ProposalID, time.Now()); err == nil {
 		t.Fatal("checked with a changed row")
 	}
 }

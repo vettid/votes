@@ -14,7 +14,6 @@ import (
 
 	"github.com/sigstore/sigstore-go/pkg/bundle"
 	"github.com/sigstore/sigstore-go/pkg/root"
-	"github.com/sigstore/sigstore-go/pkg/tuf"
 	"github.com/sigstore/sigstore-go/pkg/verify"
 	"github.com/sigstore/sigstore/pkg/signature"
 )
@@ -23,7 +22,8 @@ import (
 // "Rekor profile") with Sigstore's own verifier, against one instance's
 // trusted root.
 type Anchors struct {
-	trusted root.TrustedMaterial
+	fixed root.TrustedMaterial // given material, never refreshed
+	r     *refresher           // or the instance's, refreshed through TUF
 }
 
 // Sigstore instances, as the service vault's SV_SIGSTORE names them.
@@ -32,48 +32,88 @@ const (
 	Production = "production"
 )
 
-// NewAnchors fetches the instance's trusted root through its TUF
-// repository, with no local cache (Lambda's file system is read-only).
+// NewAnchors checks against the instance's trusted root, fetched through
+// its TUF repository at the start and again at most once per RootRefresh.
+// If the first fetch fails it starts on the embedded root, unless that is
+// over MaxEmbeddedAge old; a later failed fetch keeps the root it has.
 func NewAnchors(instance string) (*Anchors, error) {
-	opts := tuf.DefaultOptions().WithDisableLocalCache()
-	switch instance {
-	case Production:
-	case Staging:
-		opts.Root, opts.RepositoryBaseURL = tuf.StagingRoot(), tuf.StagingMirror
-	default:
-		return nil, fmt.Errorf("site: unknown Sigstore instance %q", instance)
-	}
-	tr, err := root.FetchTrustedRootWithOptions(opts)
+	emb, at, err := EmbeddedRoot(instance)
 	if err != nil {
-		return nil, fmt.Errorf("site: trusted root: %w", err)
+		return nil, err
 	}
-	return &Anchors{trusted: tr}, nil
+	return newAnchorsFrom(emb, at, func() (root.TrustedMaterial, error) {
+		b, err := FetchRootJSON(instance)
+		if err != nil {
+			return nil, err
+		}
+		return root.NewTrustedRootFromJSON(b)
+	}, time.Now)
 }
 
-// NewAnchorsWith checks against given trusted material (tests).
-func NewAnchorsWith(trusted root.TrustedMaterial) *Anchors { return &Anchors{trusted: trusted} }
+func newAnchorsFrom(emb []byte, at time.Time, fetch func() (root.TrustedMaterial, error), now func() time.Time) (*Anchors, error) {
+	r, err := newRefresher(emb, at, fetch, now)
+	if err != nil {
+		return nil, err
+	}
+	return &Anchors{r: r}, nil
+}
+
+// NewAnchorsWith checks against given trusted material: a trusted root
+// file, or tests.
+func NewAnchorsWith(trusted root.TrustedMaterial) *Anchors { return &Anchors{fixed: trusted} }
+
+// RootSource says where the trusted root in use came from: RootFromTUF,
+// RootFromEmbedded, or RootFromFile for given material.
+func (a *Anchors) RootSource() string {
+	if a.r == nil {
+		return RootFromFile
+	}
+	return a.r.from()
+}
+
+func (a *Anchors) trusted() root.TrustedMaterial {
+	if a.r == nil {
+		return a.fixed
+	}
+	return a.r.material()
+}
+
+// AnchorTimes are a bundle's two verified times: the RFC 3161
+// timestamp's, which the site goes by, and the time Rekor integrated the
+// entry, signed in its inclusion promise (zero if it has none).
+type AnchorTimes struct {
+	TSA   time.Time
+	Rekor time.Time
+}
 
 // Verify checks that bundleJSON anchors exactly doc under the anchor key
 // with SubjectPublicKeyInfo spki: the ECDSA P-256 signature over doc, the
 // Rekor entry and its inclusion proof, and one RFC 3161 timestamp. It
 // returns the timestamp's time.
 func (a *Anchors) Verify(bundleJSON, doc, spki []byte) (time.Time, error) {
+	t, err := a.VerifyTimes(bundleJSON, doc, spki)
+	return t.TSA, err
+}
+
+// VerifyTimes is Verify, returning both of the bundle's verified times.
+func (a *Anchors) VerifyTimes(bundleJSON, doc, spki []byte) (AnchorTimes, error) {
+	var none AnchorTimes
 	pub, err := x509.ParsePKIXPublicKey(spki)
 	if err != nil {
-		return time.Time{}, errors.New("site: the anchor key doesn't parse")
+		return none, errors.New("site: the anchor key doesn't parse")
 	}
 	ec, ok := pub.(*ecdsa.PublicKey)
 	if !ok || ec.Curve != elliptic.P256() {
-		return time.Time{}, errors.New("site: the anchor key isn't P-256")
+		return none, errors.New("site: the anchor key isn't P-256")
 	}
 	var b bundle.Bundle
 	if err := b.UnmarshalJSON(bundleJSON); err != nil {
-		return time.Time{}, fmt.Errorf("site: bundle: %w", err)
+		return none, fmt.Errorf("site: bundle: %w", err)
 	}
 	hint := Hint(spki)
 	vc, err := b.VerificationContent()
 	if err != nil || vc.PublicKey() == nil || vc.PublicKey().Hint() != hint {
-		return time.Time{}, errors.New("site: the bundle names another key")
+		return none, errors.New("site: the bundle names another key")
 	}
 	keys := root.NewTrustedPublicKeyMaterial(func(h string) (root.TimeConstrainedVerifier, error) {
 		if h != hint {
@@ -85,25 +125,45 @@ func (a *Anchors) Verify(bundleJSON, doc, spki []byte) (time.Time, error) {
 		}
 		return root.NewExpiringKey(v, time.Time{}, time.Time{}), nil
 	})
-	v, err := verify.NewVerifier(root.TrustedMaterialCollection{a.trusted, keys},
-		verify.WithTransparencyLog(1), verify.WithSignedTimestamps(1))
+	material := root.TrustedMaterialCollection{a.trusted(), keys}
+	v, err := verify.NewVerifier(material, verify.WithTransparencyLog(1), verify.WithSignedTimestamps(1))
 	if err != nil {
-		return time.Time{}, err
+		return none, err
 	}
 	res, err := v.Verify(&b, verify.NewPolicy(verify.WithArtifact(bytes.NewReader(doc)), verify.WithKey()))
 	if err != nil {
-		return time.Time{}, fmt.Errorf("site: bundle: %w", err)
+		return none, fmt.Errorf("site: bundle: %w", err)
 	}
-	var ts time.Time
-	for _, t := range res.VerifiedTimestamps {
-		if t.Type == "TimestampAuthority" {
-			ts = t.Timestamp
+	var t AnchorTimes
+	for _, vt := range res.VerifiedTimestamps {
+		if vt.Type == "TimestampAuthority" {
+			t.TSA = vt.Timestamp
 		}
 	}
-	if ts.IsZero() {
-		return time.Time{}, errors.New("site: the bundle has no verified RFC 3161 timestamp")
+	if t.TSA.IsZero() {
+		return none, errors.New("site: the bundle has no verified RFC 3161 timestamp")
 	}
-	return ts, nil
+	// The entry was verified above; this reads its integrated time, which
+	// counts only under a verified inclusion promise.
+	if lts, err := verify.VerifyTlogEntry(&b, material, 1, true); err == nil && len(lts) > 0 {
+		t.Rekor = lts[0].Time
+	}
+	return t, nil
+}
+
+// TimestampOf is the verified RFC 3161 time of a bundle, without the
+// document it anchors (the timestamp covers the bundle's signature): for
+// dating a partial upload.
+func (a *Anchors) TimestampOf(bundleJSON []byte) (time.Time, error) {
+	var b bundle.Bundle
+	if err := b.UnmarshalJSON(bundleJSON); err != nil {
+		return time.Time{}, fmt.Errorf("site: bundle: %w", err)
+	}
+	ts, err := verify.VerifySignedTimestampWithThreshold(&b, a.trusted(), 1)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("site: bundle: %w", err)
+	}
+	return ts[0].Time, nil
 }
 
 // Hint is how a bundle names the anchor key: base64 of SHA-256 of its

@@ -182,3 +182,82 @@ func TestCheckUploadRules(t *testing.T) {
 		t.Fatalf("a short signature: %v", err)
 	}
 }
+
+// A listing difference, or a partial upload, is a mismatch only past
+// ListingGrace: after the latest anchor, or the partial's own timestamp.
+func TestCheckMismatches(t *testing.T) {
+	f := loadFixture(t)
+	objs := published(t, f, true)
+	s, _ := newSite(t, f, f.during())
+	at := func(o map[string][]byte, now time.Time) *Report {
+		t.Helper()
+		rep, err := Check(context.Background(), fetcher(o), s.Anchors, s.SiteKey, testID, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rep
+	}
+	rep := at(objs, f.closed().Add(24*time.Hour))
+	if len(rep.Mismatches) != 0 || len(rep.Skew) != 3 {
+		t.Fatalf("a vote served as it should be: mismatches %v, skew %v", rep.Mismatches, rep.Skew)
+	}
+	for name, d := range rep.Skew {
+		if d > MaxSkew || d < -MaxSkew {
+			t.Fatalf("%s: skew %s", name, d)
+		}
+	}
+	latest := rep.Anchored["results"]
+
+	o := maps.Clone(objs)
+	var es []IndexEntry
+	_ = json.Unmarshal(o[indexPath], &es)
+	es[0].ClosesAt++
+	o[indexPath], _ = json.Marshal(es)
+	if rep := at(o, latest.Add(ListingGrace)); len(rep.Listing) != 1 || len(rep.Mismatches) != 0 {
+		t.Fatalf("within the grace: %v %v", rep.Listing, rep.Mismatches)
+	}
+	if rep := at(o, latest.Add(ListingGrace+time.Second)); !slices.Equal(rep.Mismatches, []string{"listing: index: closes_at"}) {
+		t.Fatalf("past the grace: %v", rep.Mismatches)
+	}
+
+	// Results whose signature and bundle are there without the document:
+	// dated by the bundle's timestamp.
+	open := published(t, f, false)
+	o = maps.Clone(open)
+	base := docPath(testID, "results")
+	o[base+".sig"], o[base+".sigstore.json"] = f.Results.Sig, f.Results.Bundle
+	ts, err := s.Anchors.TimestampOf(f.Results.Bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep := at(o, ts.Add(ListingGrace)); len(rep.Partial) != 1 || len(rep.Mismatches) != 0 {
+		t.Fatalf("a partial upload within the grace: %v %v", rep.Partial, rep.Mismatches)
+	}
+	if rep := at(o, ts.Add(ListingGrace+time.Second)); len(rep.Mismatches) != 1 || !strings.HasPrefix(rep.Mismatches[0], "partial: results: since ") {
+		t.Fatalf("a partial upload past the grace: %v", rep.Mismatches)
+	}
+	// A signature alone can't be dated.
+	delete(o, base+".sigstore.json")
+	if rep := at(o, ts); !slices.Equal(rep.Mismatches, []string{"partial: results: no verified timestamp"}) {
+		t.Fatalf("an undated partial upload: %v", rep.Mismatches)
+	}
+}
+
+func TestSkewMismatch(t *testing.T) {
+	t0 := time.Unix(1793354334, 0)
+	for _, c := range []struct {
+		tsa, rekor time.Time
+		want       string
+	}{
+		{t0, t0, ""},
+		{t0.Add(MaxSkew), t0, ""},
+		{t0, t0.Add(MaxSkew), ""},
+		{t0.Add(MaxSkew + time.Second), t0, "skew: proposal: the RFC 3161 time is 10m1s from Rekor's"},
+		{t0, t0.Add(MaxSkew + time.Second), "skew: proposal: the RFC 3161 time is -10m1s from Rekor's"},
+		{t0, time.Time{}, "skew: proposal: no Rekor integrated time"},
+	} {
+		if got := skewMismatch("proposal", AnchorTimes{TSA: c.tsa, Rekor: c.rekor}); got != c.want {
+			t.Errorf("%v %v: %q, want %q", c.tsa, c.rekor, got, c.want)
+		}
+	}
+}

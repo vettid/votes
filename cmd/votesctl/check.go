@@ -7,10 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,6 +21,53 @@ import (
 
 	"github.com/vettid/votes/site"
 )
+
+// Exit codes of votesctl check.
+const (
+	exitOK       = 0 // every check held, and ok is true
+	exitFailed   = 1 // a check failed (with -all, the report names each)
+	exitUsage    = 2
+	exitMismatch = 3 // the checks held, but ok is false: a mismatch
+)
+
+// runCheck is votesctl check with its arguments; it returns the exit code.
+func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	base := fs.String("site", "https://votes.vettid.org", "the site")
+	key := fs.String("site-key", "", "the site's public key (base64), from its release config")
+	instance := fs.String("sigstore", site.Production, "the Sigstore instance the votes are anchored in")
+	rootFile := fs.String("trusted-root", "", "a Sigstore trusted root file, instead of the embedded one refreshed through TUF")
+	all := fs.Bool("all", false, "check the service list's chain and every proposal the index and the archive list")
+	since := fs.String("since", firstMonth, "with -all: the first archive month read (YYYY-MM)")
+	if fs.Parse(args) != nil || *all != (fs.NArg() == 0) || fs.NArg() > 1 {
+		fmt.Fprintln(stderr, "usage: votesctl check [-all [-since YYYY-MM] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>]")
+		return exitUsage
+	}
+	anchors, err := anchorsFor(*instance, *rootFile)
+	ok := false
+	if err == nil {
+		fetch := httpFetcher(*base, noRedirects())
+		if *all {
+			ok, err = checkAll(ctx, stdout, fetch, anchors, *key, *since, time.Now())
+		} else {
+			ok, err = checkVote(ctx, stdout, fetch, anchors, *key, fs.Arg(0), time.Now())
+		}
+	}
+	switch {
+	case err != nil:
+		fmt.Fprintln(stderr, "votesctl:", err)
+		return exitFailed
+	case !ok:
+		fmt.Fprintln(stderr, "votesctl: mismatches: see the report")
+		return exitMismatch
+	}
+	return exitOK
+}
+
+// firstMonth is the month the site's first proposal opened in: -all reads
+// the archive from it.
+const firstMonth = "2026-10"
 
 // maxObject bounds one fetched object: the rows of a large vote are the
 // biggest.
@@ -62,9 +112,12 @@ func noRedirects() *http.Client {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
-// report is the check's output.
+// report is the check's output for one proposal. OK is false when it has
+// mismatches, or (under -all) an error.
 type report struct {
 	OK          bool              `json:"ok"`
+	Error       string            `json:"error,omitempty"` // -all: the check that failed
+	TrustedRoot string            `json:"trusted_root,omitempty"`
 	ProposalID  string            `json:"proposal_id"`
 	ServiceID   string            `json:"service_id"`
 	ServiceName string            `json:"service_name"`
@@ -83,8 +136,13 @@ type report struct {
 	Partial []string          `json:"partial,omitempty"`
 	// Listing: where index.json or the month's archive differs from the
 	// documents. Not a failed check: the lists are rewritten after a
-	// document is published, and may lag behind an upload not finished.
+	// document is published, and may lag behind an upload not finished;
+	// past site.ListingGrace it is also in Mismatches.
 	Listing []string `json:"listing,omitempty"`
+	// SkewSeconds: each anchor's RFC 3161 time less its Rekor time.
+	SkewSeconds map[string]int64 `json:"skew_seconds,omitempty"`
+	// Mismatches: what makes ok false (site.Report.Mismatches).
+	Mismatches []string `json:"mismatches,omitempty"`
 }
 
 type results struct {
@@ -97,20 +155,48 @@ type results struct {
 	Unhandled int64 `json:"unhandled"`
 }
 
-// checkVote checks one proposal on a site and writes the report.
-func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *site.Anchors, siteKeyB64, id string, now time.Time) error {
+func decodeSiteKey(siteKeyB64 string) (ed25519.PublicKey, error) {
 	key, err := base64.StdEncoding.DecodeString(siteKeyB64)
 	if err != nil || len(key) != ed25519.PublicKeySize {
-		return errors.New("-site-key: the site's public key, base64 of 32 bytes")
+		return nil, errors.New("-site-key: the site's public key, base64 of 32 bytes")
+	}
+	return key, nil
+}
+
+func writeReport(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+// checkVote checks one proposal on a site and writes the report. ok is
+// the report's: false when it has mismatches. err is a check that failed
+// (no report is written).
+func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *site.Anchors, siteKeyB64, id string, now time.Time) (ok bool, err error) {
+	key, err := decodeSiteKey(siteKeyB64)
+	if err != nil {
+		return false, err
 	}
 	rep, err := site.Check(ctx, fetch, anchors, key, id, now)
 	if err != nil {
-		return err
+		return false, err
 	}
-	out := report{OK: true, ProposalID: rep.ProposalID, ServiceID: rep.ServiceID, ServiceName: rep.ServiceName,
+	out := toReport(rep, now)
+	out.TrustedRoot = anchors.RootSource()
+	return out.OK, writeReport(w, out)
+}
+
+func toReport(rep *site.Report, now time.Time) report {
+	out := report{OK: len(rep.Mismatches) == 0, ProposalID: rep.ProposalID, ServiceID: rep.ServiceID, ServiceName: rep.ServiceName,
 		Title: rep.Title, Eligible: rep.Eligible, OpensAt: rep.OpensAt, ClosesAt: rep.ClosesAt,
 		Extensions: rep.Extensions, Anchored: map[string]string{}, Hashes: map[string]string{}, Partial: rep.Partial,
-		Listing: rep.Listing}
+		Listing: rep.Listing, Mismatches: rep.Mismatches}
+	if len(rep.Skew) > 0 {
+		out.SkewSeconds = map[string]int64{}
+		for name, d := range rep.Skew {
+			out.SkewSeconds[name] = int64(d.Round(time.Second) / time.Second)
+		}
+	}
 	for name, ts := range rep.Anchored {
 		out.Anchored[name] = ts.UTC().Format(time.RFC3339)
 	}
@@ -129,9 +215,111 @@ func checkVote(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *si
 		out.Results = &results{Tally: r.Tally, Eligible: r.Counts.Eligible, Ballots: r.Counts.Ballots, Removed: r.Counts.Removed,
 			Unhandled: r.Counts.Unhandled}
 	}
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(out)
+	return out
+}
+
+// allReport is check -all's output: the service list's chain and every
+// proposal the index and the archive list.
+type allReport struct {
+	OK          bool        `json:"ok"`
+	TrustedRoot string      `json:"trusted_root"`
+	Errors      int         `json:"errors"`
+	Services    servicesOut `json:"services"`
+	Months      []string    `json:"months"` // the archive months read
+	Proposals   []report    `json:"proposals"`
+}
+
+type servicesOut struct {
+	Version    int64    `json:"version"`
+	Checked    int      `json:"checked"`
+	Mismatches []string `json:"mismatches,omitempty"`
+	Error      string   `json:"error,omitempty"`
+}
+
+// errChecksFailed is check -all's error when a check failed somewhere;
+// the report, written first, names each.
+var errChecksFailed = errors.New("checks failed: see the report's errors")
+
+// checkAll checks the service list's chain and every proposal listed in
+// index.json or in the archive's months from since (YYYY-MM) to now's,
+// and the months of the index's entries, and writes one report. ok is
+// false on any mismatch or error; err is errChecksFailed when a check
+// failed (the report is still written), or a failure to list.
+func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, anchors *site.Anchors, siteKeyB64, since string, now time.Time) (ok bool, err error) {
+	key, err := decodeSiteKey(siteKeyB64)
+	if err != nil {
+		return false, err
+	}
+	start, err := time.Parse("2006-01", since)
+	if err != nil {
+		return false, errors.New("-since: a month, YYYY-MM")
+	}
+	out := allReport{TrustedRoot: anchors.RootSource(), Months: []string{}, Proposals: []report{}}
+	if c, err := site.CheckServiceChain(ctx, fetch, key); err != nil {
+		out.Services.Error = err.Error()
+		out.Errors++
+	} else {
+		out.Services = servicesOut{Version: c.Version, Checked: c.Checked, Mismatches: c.Mismatches}
+	}
+
+	// The proposals: the index's, then each month's archive.
+	ids := map[string]bool{}
+	months := map[string]bool{}
+	list := func(path string) ([]site.IndexEntry, error) {
+		b, err := fetch(ctx, path)
+		if err != nil || b == nil {
+			return nil, err
+		}
+		var es []site.IndexEntry
+		if err := json.Unmarshal(b, &es); err != nil {
+			return nil, fmt.Errorf("%s: not a list of entries", path)
+		}
+		return es, nil
+	}
+	es, err := list("v1/index.json")
+	if err != nil {
+		return false, err
+	}
+	for _, e := range es {
+		ids[e.ProposalID] = true
+		months[time.Unix(e.OpensAt, 0).UTC().Format("2006-01")] = true
+	}
+	for m := start; !m.After(now); m = m.AddDate(0, 1, 0) {
+		months[m.Format("2006-01")] = true
+	}
+	for _, m := range slices.Sorted(maps.Keys(months)) {
+		es, err := list("v1/archive/" + m + ".json")
+		if err != nil {
+			return false, err
+		}
+		if es != nil {
+			out.Months = append(out.Months, m)
+		}
+		for _, e := range es {
+			ids[e.ProposalID] = true
+		}
+	}
+	for _, id := range slices.Sorted(maps.Keys(ids)) {
+		rep, err := site.Check(ctx, fetch, anchors, key, id, now)
+		if err != nil {
+			out.Proposals = append(out.Proposals, report{ProposalID: id, Error: err.Error()})
+			out.Errors++
+			continue
+		}
+		out.Proposals = append(out.Proposals, toReport(rep, now))
+	}
+
+	out.OK = out.Errors == 0 && len(out.Services.Mismatches) == 0
+	for _, p := range out.Proposals {
+		out.OK = out.OK && p.OK
+	}
+	if err := writeReport(w, out); err != nil {
+		return false, err
+	}
+	if out.Errors > 0 {
+		return false, errChecksFailed
+	}
+	return out.OK, nil
 }
 
 // anchorsFor is the Sigstore trusted material: from a trusted root file,

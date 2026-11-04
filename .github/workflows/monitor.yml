@@ -1,0 +1,76 @@
+name: monitor
+
+# Checks what each votes site serves, hourly, as an observer would
+# (README "Checking a vote"): `votesctl check -all` walks the service
+# list's kept versions and checks every proposal in the index and the
+# archive. The job fails on a failed check (exit 1) or a mismatch (exit 3,
+# "ok": false), and the report is in its log.
+#
+# The site keys are public. Staging's is the member vaults' release config
+# (vettid-vault, enclave/releasecfg/staging.json, vote_site_key), used
+# unless the repository variable VOTES_STAGING_SITE_KEY overrides it.
+# Production's is not published yet: set the repository variable
+# VOTES_PROD_SITE_KEY to it (`votesctl site-key`) once production is
+# deployed; until then its check is skipped with a warning.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: staging
+            site: https://votes.staging.vettid.org
+            sigstore: staging
+            key_var: VOTES_STAGING_SITE_KEY
+            default_key: c4dqg2ssGVylbO9Xnpdv4zopmzx9S++4KgxMWOyhXJQ=
+          - env: prod
+            site: https://votes.vettid.org
+            sigstore: production
+            key_var: VOTES_PROD_SITE_KEY
+            default_key: ""
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: build votesctl
+        run: CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/votesctl" ./cmd/votesctl
+      - name: embedded trusted root's age
+        if: matrix.env == 'staging'
+        run: |
+          at=$(date -d "$(cat site/roots/embedded_at)" +%s)
+          days=$(( ($(date +%s) - at) / 86400 ))
+          echo "the embedded Sigstore trusted roots are $days days old"
+          if [ "$days" -gt 60 ]; then
+            echo "::warning::the embedded Sigstore trusted roots are $days days old: refresh them (go generate ./site) before 90"
+          fi
+      - name: votesctl check -all (${{ matrix.env }})
+        env:
+          SITE: ${{ matrix.site }}
+          SIGSTORE: ${{ matrix.sigstore }}
+          SITE_KEY: ${{ vars[matrix.key_var] || matrix.default_key }}
+          KEY_VAR: ${{ matrix.key_var }}
+        run: |
+          if [ -z "$SITE_KEY" ]; then
+            echo "::warning::$SITE not checked: set the repository variable $KEY_VAR to its site key"
+            exit 0
+          fi
+          "$RUNNER_TEMP/votesctl" check -all -site "$SITE" -sigstore "$SIGSTORE" -site-key "$SITE_KEY"

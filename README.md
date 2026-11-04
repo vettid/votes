@@ -22,11 +22,14 @@ not deployed.
 ## Checking a vote
 
 Anyone can check a vote from what the site serves (BALLOT-PROTOCOL
-§8.4), with the site's public key (in the member vaults' release config):
+§8.4), with the site's public key (in the member vaults' release config:
+staging's is `vote_site_key` in vettid-vault's
+`enclave/releasecfg/staging.json`):
 
 ```sh
 go build -o votesctl ./cmd/votesctl
 ./votesctl check -site-key <base64> <proposal_id>
+./votesctl check -all -site-key <base64>   # the service list and every proposal
 # staging: -site https://votes.staging.vettid.org -sigstore staging
 ```
 
@@ -52,11 +55,36 @@ it (an upload not finished); `listing` names each way `index.json` or
 the month's archive differs from the documents (such as
 `index: closes_at` or `archive: missing`; the index may drop a vote 30
 days after its close; an entry from before the site listed `unhandled`
-lacks it, which isn't reported). A `listing` entry doesn't fail the
-check: the lists are rewritten after each document, and may lag behind
-an upload not finished. Only a 404 is taken as not published.
-`-trusted-root <file>` uses a Sigstore trusted root file instead of
-fetching it.
+lacks it, which isn't reported); `skew_seconds` is, for each anchor, its
+RFC 3161 time less the time Rekor logged it. Only a 404 is taken as not
+published.
+
+**`ok`** is false when the report has `mismatches`: a `listing`
+difference still there 10 minutes after the latest document's anchor
+time (the lists are rewritten just after each document, so they may lag
+an upload in progress), a `partial` upload 10 minutes after its bundle's
+timestamp (or without a bundle that verifies), or an anchor whose two
+times differ by more than 10 minutes. **`-all`** also walks the service
+list's kept versions, `services/1.json` to the current one, checking
+each signature and that each extends the one before, then checks every
+proposal in `index.json` and the archive (from 2026-10, or
+`-since YYYY-MM`), and prints one report with each proposal's, a failed
+one as its `error`.
+
+**Exit codes:** `0` every check held and `ok` is true; `1` a check failed
+(with `-all`, after the report); `2` a usage error; `3` the checks held
+but `ok` is false. The `monitor` workflow runs `check -all` hourly on
+staging and production and fails on `1` or `3` (VOTES-SITE §7; it needs
+the repository variable `VOTES_PROD_SITE_KEY` before production is
+checked).
+
+**The trusted root:** Sigstore's, for `-sigstore` (`production` by
+default), fetched through its TUF repository, or, if that fails, the one
+embedded in the build, provided it is at most 90 days old
+(`site/roots/embedded_at`; refresh with `go generate ./site` and commit
+the result). The report's `trusted_root` says which (`tuf`, `embedded`
+or `file`). `-trusted-root <file>` uses a Sigstore trusted root file
+instead.
 
 ## Deployment
 

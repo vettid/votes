@@ -205,18 +205,24 @@ func (s *Site) services(ctx context.Context) (*ServiceList, error) {
 // anchor checks u's bundle under one of svc's anchor keys and returns the
 // timestamp's time.
 func (s *Site) anchor(svc *Service, u *Upload) (time.Time, error) {
+	t, err := s.anchorTimes(svc, u)
+	return t.TSA, err
+}
+
+// anchorTimes is anchor, returning the bundle's Rekor time too.
+func (s *Site) anchorTimes(svc *Service, u *Upload) (AnchorTimes, error) {
 	if err := checkProfile(u.Bundle); err != nil {
-		return time.Time{}, refuse(http.StatusUnprocessableEntity, "bad_anchor", err.Error())
+		return AnchorTimes{}, refuse(http.StatusUnprocessableEntity, "bad_anchor", err.Error())
 	}
 	var last error = errors.New("no anchor key")
 	for _, k := range svc.AnchorKeys {
-		ts, err := s.Anchors.Verify(u.Bundle, u.Doc, k.Key)
+		t, err := s.Anchors.VerifyTimes(u.Bundle, u.Doc, k.Key)
 		if err == nil {
-			return ts, nil
+			return t, nil
 		}
 		last = err
 	}
-	return time.Time{}, refuse(http.StatusUnprocessableEntity, "bad_anchor", last.Error())
+	return AnchorTimes{}, refuse(http.StatusUnprocessableEntity, "bad_anchor", last.Error())
 }
 
 // published reads a document this site published, or nil.
