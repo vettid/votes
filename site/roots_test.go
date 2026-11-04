@@ -3,6 +3,7 @@ package site
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -95,5 +96,60 @@ func TestRootRefresh(t *testing.T) {
 	// Given material is never refreshed.
 	if NewAnchorsWith(fetched).RootSource() != RootFromFile {
 		t.Fatal("given material")
+	}
+}
+
+// A refresh is fetched outside the lock: while one caller waits on a
+// slow TUF repository, the others get the root in use at once, and
+// don't fetch it again.
+func TestRootRefreshUnlocked(t *testing.T) {
+	emb, embAt, err := EmbeddedRoot(Staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := root.NewTrustedRootFromJSON(emb)
+	second, _ := root.NewTrustedRootFromJSON(emb)
+	var mu sync.Mutex
+	clock := embAt.Add(time.Hour)
+	now := func() time.Time { mu.Lock(); defer mu.Unlock(); return clock }
+	calls, started, release := 0, make(chan struct{}), make(chan struct{})
+	fetch := func() (root.TrustedMaterial, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			return first, nil
+		}
+		close(started)
+		<-release
+		return second, nil
+	}
+	a, err := newAnchorsFrom(emb, embAt, fetch, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	clock = clock.Add(RootRefresh)
+	mu.Unlock()
+	done := make(chan root.TrustedMaterial)
+	go func() { done <- a.trusted() }()
+	<-started
+	got := make(chan root.TrustedMaterial)
+	go func() { got <- a.trusted() }()
+	select {
+	case tm := <-got:
+		if tm != root.TrustedMaterial(first) {
+			t.Fatal("not the root in use during a refresh")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked on another caller's refresh")
+	}
+	close(release)
+	if tm := <-done; tm != root.TrustedMaterial(second) || a.trusted() != root.TrustedMaterial(second) || a.RootSource() != RootFromTUF {
+		t.Fatal("the refreshed root isn't in use")
+	}
+	if calls != 2 {
+		t.Fatalf("%d fetches", calls)
 	}
 }

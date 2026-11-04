@@ -135,15 +135,28 @@ func newRefresher(embedded []byte, embeddedAt time.Time, fetch func() (root.Trus
 	return r, nil
 }
 
+// material is the root in use. A refresh that is due is claimed under
+// the lock (tried is set first, so one caller fetches) and fetched
+// outside it: a slow TUF repository holds up only the caller that
+// fetches, while the others go on with the root they have.
 func (r *refresher) material() root.TrustedMaterial {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.now().Sub(r.tried) >= RootRefresh {
+	cur := r.current
+	due := r.now().Sub(r.tried) >= RootRefresh
+	if due {
 		r.tried = r.now()
-		if tr, err := r.fetch(); err == nil {
-			r.current, r.source = tr, RootFromTUF
-		}
 	}
+	r.mu.Unlock()
+	if !due {
+		return cur
+	}
+	tr, err := r.fetch()
+	if err != nil {
+		return cur
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.current, r.source = tr, RootFromTUF
 	return r.current
 }
 
