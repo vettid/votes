@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.11 (2026-11-04), draft. The protocol this site serves is
+**Status:** 0.2.12 (2026-11-04), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -286,7 +286,136 @@ reports to AWS (**Alerts**, below).
   unset the run warns and sends nothing. A stack without the two
   contexts has neither the role nor the alarm.
 
+**The Rekor check** (`-rekor`, with `-all`; **draft:** the choices
+marked below await the owner's answer) looks in Rekor for anchors the
+site doesn't show. The profile's `hashedrekord` 0.0.1 entries (§4) are
+only in Rekor v1: `rekor.sigstore.dev` for production and
+`rekor.sigstage.dev` for staging, as `-sigstore`. The `monitor` workflow
+runs it hourly with the rest. The anchor keys are every key in every
+service's `anchor_keys` on the current list (the list keeps past ones).
+The report's `rekor` holds the checkpoint, the counts, each entry
+reported (`unknown`, `pending`, `acknowledged`), `error`, `failures` and
+`mismatches`.
+
+- **The checkpoint:** the active shard's signed checkpoint (`GET
+  /api/v1/log`: tree size and root hash), verified under the log's key in
+  the trusted root (§4 item 4). If the state (below) holds one, a
+  consistency proof from it (`GET /api/v1/log/proof`) must verify. A
+  smaller tree, another root at the same size, or a proof that fails is
+  a mismatch (`rekor: inconsistent`) and the recorded checkpoint is kept,
+  so every later run reports it too; a consistent one replaces it. v1
+  checkpoints have no witness cosignatures, so this shows only that the
+  log never contradicts what this monitor saw before.
+- **The search:** for each anchor key, `POST /api/v1/index/retrieve` by
+  `publicKey` (the key as x509 PEM). Rekor marks it deprecated and
+  best-effort: its results may be incomplete.
+- **Each entry found** is fetched (`POST /api/v1/log/entries/retrieve`,
+  10 UUIDs a request) and verified before its digest is used: a
+  `hashedrekord` 0.0.1 entry naming the anchor key searched for, its
+  ECDSA signature over the digest under that key, its signed entry
+  timestamp and inclusion proof under the log's key, and the proof's
+  checkpoint the run's or consistent with it. One that fails is a
+  mismatch (`rekor: unverified`), whatever its digest.
+- **Unknown digests:** a verified entry whose SHA-256 is no published
+  document's is a mismatch (`rekor: unknown digest`). The digests known
+  are the run's: each proposal's, extension's and results' `hashes`, the
+  documents a partial upload's bundle anchors (already reported as
+  `partial`), and each service-list version's. One integrated less than
+  10 minutes (`ListingGrace`) before the run is `pending`, not a
+  mismatch, as its upload may not be done. An anchor that will never be
+  published (an upload the site refused, a test) is a mismatch on every
+  run until it is acknowledged.
+- **Staging's scan:** on staging only, the check also reads every entry
+  of the active shard from the tree size scanned last to the run's, 10
+  by log index a request (about 14,000 entries a day, so some 60
+  requests a run), and keeps those signed by an anchor key, each
+  verified and compared as above. One the search didn't return, though
+  integrated before the search began, is a mismatch, `rekor: index gap`
+  **(chosen, pending the owner: an alarm, not a warning)**: the search
+  is production's only check, so a sign that it misses entries has to
+  reach someone, and a warning in the run's log reaches no one.
+  Production gains millions of entries a day and is never scanned.
+- **Search unavailable:** a network error, a `429` or a `5xx` is retried
+  within the run (**Pacing**). A search, checkpoint or proof that still
+  fails is `rekor.error` and adds one to `failures` in the state, which
+  a run that completes resets; at 3 consecutive runs it is a mismatch,
+  `rekor: search unavailable` **(chosen, pending the owner: 3, as the
+  heartbeat alarm's 3 hours: an outage of an hour or two, within Rekor's
+  99.5% availability objective, passes, and one that lasts is raised as
+  soon as a stopped monitor would be)**. A `404` or `410` from the
+  search (the endpoint is gone, as in Rekor v2) is the mismatch at once.
+- **Pacing:** Rekor's rate limits are undocumented. Requests go one at
+  a time, at least 250 ms apart, at most 1,000 an instance a run; a
+  network error, a `429` or a `5xx` is retried after 1, 2, 4 and 8
+  seconds (longer if `Retry-After` says so). At the cap the run stops:
+  the scan resumes next run from where it stopped, and a search or fetch
+  left undone counts as a failure, as above. Every entry found is
+  fetched on every run, so the requests grow with the anchors; keeping
+  the verified ones in the state is future work.
+- **Acknowledged entries:** `monitor/rekor-acknowledged-staging.json`
+  and `-prod.json` (passed with `-rekor-acknowledged <file>`), beside
+  the partial uploads' lists, whose entries name a document and not a
+  Rekor entry, are strict JSON arrays of entries
+
+  ```json
+  {"instance": "staging", "uuid": "<hex>", "log_index": 123,
+   "sha256": "<hex>", "reason": "<why>", "acknowledged_at": "YYYY-MM-DD"}
+  ```
+
+  with no other members. `instance` is `-sigstore`'s, `uuid` the entry's
+  UUID as Rekor gives it (lowercase hex), `log_index` its log index, and
+  `sha256` its digest, 64 lowercase hex digits; none twice. An unknown
+  digest is reported in `acknowledged`, and is not a mismatch, only for
+  the entry all four name. Each run fetches every listed entry by UUID:
+  one that isn't there, whose log index or digest differs, or that isn't
+  signed by an anchor key is a mismatch, so the list stays true. Only
+  unknown digests are acknowledged, never a failed verification or an
+  index gap. As with the other lists, each entry is added by a PR that
+  gives its reason, the owner reviews it (`.github/CODEOWNERS` covers
+  `monitor/`), and both start empty; the report's `unknown` has each
+  entry's fields to copy.
+- **The state:** the monitor kept none before. `-rekor-state <file>` is
+  read at the start and rewritten at the end: JSON `{"tree_size": n,
+  "root_hash": "<hex>", "scanned_to": n, "failures": n}` (`scanned_to`
+  on staging only). Between runs it is the SSM parameter
+  `/vettid/votes/<env>/monitor/rekor-state` (standard, well under its
+  4 KB), which the stack creates empty; the monitor role may only
+  `ssm:GetParameter` and `ssm:PutParameter` it, and never delete it. The
+  workflow assumes the role before the check (it now does so after),
+  reads the parameter into the file, and puts the file back once the
+  check has run. Not GitHub's cache or artifacts: the cache is evicted
+  after 7 days unused and artifacts expire, while the parameter lasts
+  and only this workflow, on `main`, can write it. An empty parameter is
+  the first run, which records the checkpoint it finds; a run without
+  the state (another branch, or the role unset) checks no consistency,
+  counts no failures and says so (`rekor.state` `none`).
+- **Alarms:** each `rekor:` mismatch makes `ok` false (exit 3), so the
+  failed run's alert goes to the topic (**Alerts**). The workflow keeps
+  the report and adds its `rekor.mismatches` to the alert's message, at
+  most 20 with the count of the rest, each naming the instance, the
+  entry's UUID, its log index and its digest. All are public; the report
+  holds nothing secret.
+- **Not guaranteed:** that production's search found every entry (only
+  staging is scanned); that the log shows others the tree it shows this
+  monitor (a split view: v1 has no witnesses, and comparing checkpoints
+  from a second vantage point is future work); and anything about a
+  stolen anchor key used in another log, or not logged at all. Such a
+  bundle fails the site's trusted root, but could pass for someone who
+  trusts another. Rekor v2 holds no `hashedrekord` 0.0.1 and has no
+  search: if v1 freezes or the profile moves to v2, this check is
+  redesigned.
+
 ## Changes
+
+- **0.2.12 (2026-11-04), draft:** `votesctl check -all -rekor` (§7)
+  searches Rekor v1 by each listed anchor key, verifies each entry, and
+  makes an unknown digest a mismatch unless it is acknowledged, by PR,
+  in `monitor/rekor-acknowledged-<env>.json`; on staging it also scans
+  the log and makes an entry the search missed a mismatch (`index gap`);
+  it checks the log's checkpoint for consistency with the one recorded
+  in an SSM parameter, the monitor's first state; a search that fails 3
+  runs in a row, or is gone, is a mismatch; requests are paced and
+  capped; the alert names each Rekor mismatch's entry.
 
 - **0.2.11 (2026-11-04):** `votesctl check` is a monitor (§7): `ok` is
   false for a listing difference or a partial upload past 10 minutes,
