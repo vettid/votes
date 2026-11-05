@@ -288,8 +288,8 @@ reports to AWS (**Alerts**, below).
   unset the run warns and sends nothing. A stack without the two
   contexts has neither the role nor the alarm.
 
-**The Rekor check** (`-rekor`, with `-all`; **draft:** the choices
-marked below await the owner's answer) looks in Rekor for anchors the
+**The Rekor check** (`-rekor`, with `-all`; the choices marked below
+are the owner's (a) of 2026-11-05) looks in Rekor for anchors the
 site doesn't show. The profile's `hashedrekord` 0.0.1 entries (§4) are
 only in Rekor v1: `rekor.sigstore.dev` for production and
 `rekor.sigstage.dev` for staging, as `-sigstore`. The `monitor` workflow
@@ -329,8 +329,8 @@ entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   `/api/v1/log/proof`. A log index is the index within its shard plus
   the sizes of the shards before it (`inactiveShards`; all of them for
   the active shard).
-- **The search** (production's check, **chosen, pending the owner**;
-  the alternatives are a full scan, as staging's, of millions of entries
+- **The search** (production's check, **the owner's choice**, a2 of
+  2026-11-05, its limit stated below; the alternatives are a full scan, as staging's, of millions of entries
   a day, or no check of production, staging's alone): for each anchor
   key, `POST /api/v1/index/retrieve`
   `{"publicKey":{"format":"x509","content":"<base64 PEM>"}}`. Rekor
@@ -374,7 +374,7 @@ entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   certificate carries an anchor key's SPKI (compared as SPKI, never as
   PEM bytes), each verified and compared as above. One the search didn't
   return, though integrated before the search began, is a mismatch,
-  `rekor: index gap` **(chosen, pending the owner: an alarm, not a
+  `rekor: index gap` **(the owner's (a) of 2026-11-05: an alarm, not a
   warning)**: the search is production's only check, so a sign that it
   misses entries has to reach someone, and a warning in the run's log
   reaches no one. Production gains millions of entries a day and is
@@ -385,7 +385,7 @@ entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   a run that completes resets. Below 3 it is neither a failed check nor
   a mismatch: the run exits `0` if the rest held, and puts the
   heartbeat. At 3 consecutive runs it is a mismatch, `rekor: search
-  unavailable` **(chosen, pending the owner: 3, as the heartbeat alarm's
+  unavailable` **(the owner's (a) of 2026-11-05: 3, as the heartbeat alarm's
   3 hours: an outage of an hour or two, within Rekor's 99.5%
   availability objective, passes, and one that lasts is raised as soon
   as a stopped monitor would be)**. A `404` or `410` from the search
@@ -489,7 +489,7 @@ entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 
 - **0.2.12 (2026-11-04), draft:** `votesctl check -all -rekor` (§7)
   searches Rekor v1 by each listed anchor key (production's check,
-  pending the owner), verifies each entry (any other kind or digest
+  the owner's choice a2 of 2026-11-05), verifies each entry (any other kind or digest
   under an anchor key is `unverified`), and makes an unknown digest a
   mismatch unless it is acknowledged, by PR, in
   `monitor/rekor-acknowledged-<env>.json`; a digest anchored again more
