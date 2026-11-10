@@ -851,3 +851,33 @@ func TestBundleRetried(t *testing.T) {
 		t.Fatal("a bundle failing twice passed")
 	}
 }
+
+// A kept entry late for its kept token: Prepare is judged at about when
+// the fresh token will be taken, not at the old token.
+func TestPrepareBeforeLateToken(t *testing.T) {
+	h := newHarness(t)
+	h.a.clock = func() time.Time { return time.Now().Add(-40 * time.Minute) }
+	h.a.entryClock = func() time.Time { return time.Now().Add(-20 * time.Minute) }
+	h.st.answers = []answer{{503, "unavailable", false}}
+	_, _ = h.s.Handle(context.Background(), req) // kept: the token and the late entry
+	h.a.clock = time.Now
+	_, _ = h.s.Handle(context.Background(), req)
+	if time.Until(h.st.opts.At) < 0 {
+		t.Fatalf("judged at %v, the old token's time", h.st.opts.At)
+	}
+}
+
+// A kept token that doesn't parse alarms and is retried, never signed
+// over.
+func TestUnparseableToken(t *testing.T) {
+	h := newHarness(t)
+	h.a.failEnter = 1
+	_, _ = h.s.Handle(context.Background(), req)
+	h.c.mu.Lock()
+	h.c.c[slot].TSAToken = []byte("junk")
+	h.c.mu.Unlock()
+	if _, err := h.s.Handle(context.Background(), req); err == nil {
+		t.Fatal("no error")
+	}
+	h.counts(t, 1, 1, 1, 0)
+}

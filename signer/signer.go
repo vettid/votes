@@ -230,7 +230,12 @@ type Deadlines struct {
 	Margin time.Duration
 }
 
-// Worst is the longest a call can take with every hop at its deadline.
+// Worst is the longest a call can take with every hop at its deadline. A
+// call asks the TSA at most twice: a token it takes itself is never stale
+// or late in the same call (an entry it gets is integrated within the
+// call), so a call makes at most one of the stale and late replacements,
+// each a TSA call, a conditional write and a note, which the counts below
+// cover.
 func (d Deadlines) Worst() time.Duration {
 	return 3*d.Site + // Prepare, the held bundle, the upload
 		17*d.Claims + // the first read, the claim (3), the lease and its reload, the intent, keeping, journaling and marking the sign, the token, its replacement and note, the attempt mark, the entry, two reloads, the completion
@@ -284,6 +289,14 @@ type Signer struct {
 	Now       func() time.Time
 	Log       *slog.Logger
 	Deadlines Deadlines
+}
+
+// stuck alarms claim_stuck for a kept artifact that can't be read, and
+// returns the error to retry: a retry finds the same, until the owner's
+// break-glass release.
+func (s *Signer) stuck(req Request, what string, err error) error {
+	s.log().Error(what, "alarm", CodeClaimStuck, "proposal_id", req.ProposalID, "name", req.Name, "err", err.Error())
+	return fmt.Errorf("signer: %s: %w", what, err)
 }
 
 // Codes the signer answers or alarms with itself.
@@ -343,9 +356,22 @@ func (s *Signer) Handle(ctx context.Context, req Request) (Result, error) {
 	var staleToken []byte
 	if pre != nil && bytes.Equal(pre.Digest, digest[:]) && pre.TSAToken != nil {
 		t, err := s.Anchor.TokenTime(pre.TSAToken)
+		if err != nil {
+			return Result{}, s.stuck(req, "the kept token doesn't parse", err)
+		}
+		late := false
+		if pre.RekorEntry != nil {
+			it, err := s.Anchor.EntryTime(pre.RekorEntry)
+			if err != nil {
+				return Result{}, s.stuck(req, "the kept entry doesn't parse", err)
+			}
+			late = it.Sub(t) > 600*time.Second
+		}
 		switch {
-		case err != nil:
-			return Result{}, fmt.Errorf("signer: the kept token: %w", err)
+		case late:
+			// lateEntry will take a fresh token after the checks: judge by
+			// about when, so a too_late comes before any work.
+			at = s.Now().Add(s.Deadlines.toMark())
 		case pre.EnterAttempted || s.Now().Add(s.Deadlines.toMark()).Sub(t) < s.Deadlines.RetimestampAfter():
 			at = t
 		default:
@@ -549,11 +575,11 @@ func (s *Signer) retimestamp(ctx context.Context, req Request, slot string, c *C
 func (s *Signer) lateEntry(ctx context.Context, req Request, slot string, c *Claim) (*Claim, error) {
 	old, err := s.Anchor.TokenTime(c.TSAToken)
 	if err != nil {
-		return nil, fmt.Errorf("signer: the kept token: %w", err)
+		return nil, s.stuck(req, "the kept token doesn't parse", err)
 	}
 	integrated, err := s.Anchor.EntryTime(c.RekorEntry)
 	if err != nil {
-		return nil, fmt.Errorf("signer: the kept entry: %w", err)
+		return nil, s.stuck(req, "the kept entry doesn't parse", err)
 	}
 	if integrated.Sub(old) <= 600*time.Second || s.Now().Sub(integrated) > lateWindow-s.Deadlines.TSA {
 		return c, nil
@@ -563,7 +589,7 @@ func (s *Signer) lateEntry(ctx context.Context, req Request, slot string, c *Cla
 		return nil, err
 	}
 	newT, err := s.Anchor.TokenTime(tok)
-	if err != nil || newT.Sub(integrated) > lateWindow || integrated.Sub(newT) > 600*time.Second {
+	if err != nil || newT.Sub(integrated) > lateWindow {
 		return c, nil // too late for this one as well: Bundle refuses, and it alarms
 	}
 	err = s.hop(ctx, s.Deadlines.Claims, func(ctx context.Context) error {
