@@ -65,7 +65,9 @@ type Report struct {
 	// Entries are each document's bundle's Rekor entry, by name, when it
 	// has one (AnchorTimes.Entry): for the Rekor check. A document in
 	// Anchored without one is one the Rekor check can't place, and reports
-	// rather than skips (the canary).
+	// ("anchored, no signed entry") rather than skips. A partial upload's
+	// bundle is only dated (TimestampOf) and gives none: the canary doesn't
+	// cover it, and the Rekor check counts its digests as known only.
 	Entries map[string]*RekorEntry
 	// Partial names documents whose signature, bundle or rows are
 	// published without the document: an upload not finished.

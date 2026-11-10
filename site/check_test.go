@@ -62,10 +62,16 @@ func TestCheck(t *testing.T) {
 	if len(rep.Entries) != len(rep.Anchored) {
 		t.Fatalf("%d entries for %d anchored documents", len(rep.Entries), len(rep.Anchored))
 	}
+	leaves := map[string]string{}
 	for name, e := range rep.Entries {
 		if len(e.Leaf) != 32 || e.Checkpoint == "" || e.Integrated.IsZero() {
 			t.Errorf("%s: %+v", name, e)
 		}
+		// Each document's own entry, not one shared.
+		if other, dup := leaves[string(e.Leaf)]; dup {
+			t.Errorf("%s and %s share an entry", name, other)
+		}
+		leaves[string(e.Leaf)] = name
 	}
 	if rep.Title != f.p.Title || rep.Extensions != 1 || rep.ClosesAt != f.e.ClosesAt || rep.Results == nil ||
 		rep.Results.Counts.Eligible != f.p.Eligible || len(rep.Anchored) != 3 || rep.ServiceName != "Test service" {

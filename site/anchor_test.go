@@ -99,6 +99,23 @@ func TestAnchorVector(t *testing.T) {
 	tl := vmat["tlogEntries"].([]any)[0].(map[string]any)
 	delete(tl, "inclusionPromise")
 	noPromise, _ := json.Marshal(bmap)
+	// A proof whose tree size isn't its checkpoint's: the shard index
+	// isn't bound, so no entry (the bundle may still verify: a right-edge
+	// leaf verifies at other index and size pairs).
+	var bmap2 map[string]any
+	_ = json.Unmarshal(v.Bundle, &bmap2)
+	ip2 := bmap2["verificationMaterial"].(map[string]any)["tlogEntries"].([]any)[0].(map[string]any)["inclusionProof"].(map[string]any)
+	// (This vector's leaf is a right edge: index 262143 of 262144 has
+	// the same path.)
+	ip2["logIndex"], ip2["treeSize"] = "262143", "262144"
+	moved, _ := json.Marshal(bmap2)
+	mat, err := a.VerifyTimes(moved, doc, v.AnchorKey)
+	if err != nil {
+		t.Fatalf("the moved proof no longer verifies (%v): this case needs another edit", err)
+	}
+	if mat.Entry != nil {
+		t.Errorf("an entry from a proof at another size: %+v", mat.Entry)
+	}
 	at, err = a.VerifyTimes(noPromise, doc, v.AnchorKey)
 	if err != nil {
 		t.Fatalf("a bundle without its promise no longer verifies (%v): this case needs another bundle", err)
