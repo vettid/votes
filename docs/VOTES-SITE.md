@@ -85,8 +85,9 @@ credential: the service's signature is the authentication.
    instance (staging or production): the ECDSA signature over the
    document under one of the service's listed anchor keys, the Rekor
    entry and its inclusion proof, and one RFC 3161 timestamp, before
-   that key's `retired_at` if it has one (`retired_anchor_key`; §4
-   "Retired anchor keys"). **The
+   that key's `retired_at` if it has one (`retired_anchor_key`), and
+   under such a key within the stockpiling window (§4 "Retired anchor
+   keys"). **The
    trusted root** is fetched through the instance's TUF repository when
    the function starts, and again at most once every 24 hours; a fetch
    that fails, or takes over 5 seconds, keeps the root in use. Both
@@ -189,23 +190,34 @@ the rules; key protection, phase 1, GC #7406 §8):
   included. `votesctl check` reports a bundle at or after its key's
   `retired_at` as a failure of that document (`retired_anchor_key`), not
   as a broken chain, so the run goes on (`site/chain.go`).
-- **The reader's bounds** (BALLOT-PROTOCOL §3.3, the owner's (a) of
-  #7485): `votesctl check` doesn't take a version that newly sets a
-  `retired_at` more than 300 s earlier than when it last took the version
-  before (a mismatch, `retired_backdated`; with no time of its own for
-  that version, as on a first run, it skips this bound), and doesn't
-  take yet one more than 600 s after its clock (a warning, and the run
-  checks against the version before). `publish-services` refuses both.
+- **The reader's bounds** (BALLOT-PROTOCOL §3.3, the owner's a2 of
+  #7504): `votesctl check` takes every version that chains, except one
+  newly setting a `retired_at` more than 600 s after its clock (a
+  warning; the run checks against the version before). Applying a
+  retirement, it fails a document under that key only if its bundle's
+  time is at or after max(`retired_at`, R − 300 s), where R is the time
+  the monitor's last run took the site's current list, kept in the SSM
+  parameter `/vettid/votes/<env>/monitor/list-state` (`{version, hash,
+  taken_at}`, written at the end of each run; with none, as on a first
+  run, R is unset and `retired_at` alone applies). `publish-services`
+  refuses a backdated or a far-future value.
+- **Stockpiling** (BALLOT-PROTOCOL §3.3): a bundle under a key with
+  `retired_at` counts only with −60 s ≤ `t_int` − `t_tsa` ≤ 600 s (Rekor
+  integrated time less RFC 3161 time). The upload function refuses one
+  outside it (`bad_anchor`, check 4), and `votesctl check` fails it.
 - **`votesctl publish-services -retire <key>`** (repeatable) is the only
   way to set one: it sets `retired_at` from its own clock at publish
-  time, in whole seconds, never from the input, and refuses an input list
+  time, in whole seconds, never from the input, after checking its clock
+  against the site's `Date` header (refused if they differ by more than
+  60 s), and refuses an input list
   that adds a `retired_at` itself. It refuses a key already retired, the
   last live anchor key of its service, and a value that fails forward
   only. The replacement key must be listed in an earlier version.
 - **Rollout** (BALLOT-PROTOCOL §3.3): an older reader refuses the
   unknown member, so it can't take such a list and keeps its last one.
   The order: the upload function, `votesctl` and the service's signer;
-  then the vault release that reads `retired_at`; then a list naming the
+  then the vault release that reads `retired_at` and the Android app
+  release that hands it the lists; then a list naming the
   replacement key; and only once the **oldest supported vault release**
   (the oldest that member vaults may still run) reads `retired_at`, a
   list using it.
@@ -690,8 +702,10 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   upload check (`retired_anchor_key`; the function has no chain check),
   `votesctl`'s chain check with the two chain rules, forward only as the
   site's own condition, `publish-services -retire` setting the value from
-  its clock, the reader's bounds (backdated by over 300 s, or over 600 s
-  ahead), the rollout order, and the Rekor check's rule for when it
+  its clock (checked against the site's `Date`), the reader's bounds
+  (every chaining list taken; over 600 s ahead not yet; a retirement
+  cancels only what is at or after max(`retired_at`, R − 300 s), R in
+  the monitor's list state), the stockpiling window, the rollout order, and the Rekor check's rule for when it
   returns. Times are RFC 3161 `genTime` in whole seconds. The status
   line names BALLOT-PROTOCOL 0.14.0. Key protection, phase 1 (GC #7406,
   the owner's (a) of #7385).
