@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/transparency-dev/merkle/rfc6962"
 	"maps"
 	"slices"
 	"strings"
@@ -72,6 +73,27 @@ func TestCheck(t *testing.T) {
 			t.Errorf("%s and %s share an entry", name, other)
 		}
 		leaves[string(e.Leaf)] = name
+		// And its own bundle's.
+		if body := bundleBody(t, objs["v1/p/"+testID+"/"+name+".json.sigstore.json"]); !bytes.Equal(e.Leaf, rfc6962.DefaultHasher.HashLeaf(body)) {
+			t.Errorf("%s: not its own bundle's entry", name)
+		}
+	}
+	// A document anchored without a signed entry (its bundle's promise
+	// stripped) is in Anchored and not in Entries.
+	stripped := maps.Clone(objs)
+	bk := "v1/p/" + testID + "/results.json.sigstore.json"
+	var bm map[string]any
+	if err := json.Unmarshal(stripped[bk], &bm); err != nil {
+		t.Fatal(err)
+	}
+	delete(bm["verificationMaterial"].(map[string]any)["tlogEntries"].([]any)[0].(map[string]any), "inclusionPromise")
+	stripped[bk], _ = json.Marshal(bm)
+	srep, err := check(t, f, stripped, testID)
+	if err != nil {
+		t.Fatalf("stripped results bundle: %v", err)
+	}
+	if _, has := srep.Entries["results"]; has || len(srep.Entries) != len(srep.Anchored)-1 {
+		t.Errorf("stripped: %d entries for %d anchored", len(srep.Entries), len(srep.Anchored))
 	}
 	if rep.Title != f.p.Title || rep.Extensions != 1 || rep.ClosesAt != f.e.ClosesAt || rep.Results == nil ||
 		rep.Results.Counts.Eligible != f.p.Eligible || len(rep.Anchored) != 3 || rep.ServiceName != "Test service" {
@@ -475,4 +497,20 @@ func TestAcknowledged(t *testing.T) {
 	if acks, err := ParseAcknowledged([]byte("[]\n")); err != nil || len(acks) != 0 {
 		t.Fatalf("the empty list: %v", err)
 	}
+}
+
+// bundleBody is a bundle's single tlog entry's canonicalized body.
+func bundleBody(t *testing.T, bundle []byte) []byte {
+	t.Helper()
+	var b struct {
+		VerificationMaterial struct {
+			TlogEntries []struct {
+				CanonicalizedBody []byte `json:"canonicalizedBody"`
+			} `json:"tlogEntries"`
+		} `json:"verificationMaterial"`
+	}
+	if err := json.Unmarshal(bundle, &b); err != nil || len(b.VerificationMaterial.TlogEntries) != 1 {
+		t.Fatal("bundle: no single tlog entry")
+	}
+	return b.VerificationMaterial.TlogEntries[0].CanonicalizedBody
 }

@@ -105,16 +105,19 @@ func TestAnchorVector(t *testing.T) {
 	var bmap2 map[string]any
 	_ = json.Unmarshal(v.Bundle, &bmap2)
 	ip2 := bmap2["verificationMaterial"].(map[string]any)["tlogEntries"].([]any)[0].(map[string]any)["inclusionProof"].(map[string]any)
-	// (This vector's leaf is a right edge: index 262143 of 262144 has
-	// the same path.)
-	ip2["logIndex"], ip2["treeSize"] = "262143", "262144"
-	moved, _ := json.Marshal(bmap2)
-	mat, err := a.VerifyTimes(moved, doc, v.AnchorKey)
-	if err != nil {
-		t.Fatalf("the moved proof no longer verifies (%v): this case needs another edit", err)
-	}
-	if mat.Entry != nil {
-		t.Errorf("an entry from a proof at another size: %+v", mat.Entry)
+	// (This vector's leaf is a right edge: it has the same path at a
+	// smaller size, index 262143 of 262144, and a larger one, 268434432 of
+	// 268434433.)
+	for _, mv := range [][2]string{{"262143", "262144"}, {"268434432", "268434433"}} {
+		ip2["logIndex"], ip2["treeSize"] = mv[0], mv[1]
+		moved, _ := json.Marshal(bmap2)
+		mat, err := a.VerifyTimes(moved, doc, v.AnchorKey)
+		if err != nil {
+			t.Fatalf("the proof moved to %v no longer verifies (%v): this case needs another edit", mv, err)
+		}
+		if mat.Entry != nil {
+			t.Errorf("an entry from a proof moved to %v: %+v", mv, mat.Entry)
+		}
 	}
 	at, err = a.VerifyTimes(noPromise, doc, v.AnchorKey)
 	if err != nil {

@@ -93,7 +93,8 @@ type AnchorTimes struct {
 	// the integrated time) and an inclusion proof whose tree size and root
 	// are its checkpoint's signed ones (Sigstore's verifier compares only
 	// the root, and a right-edge leaf verifies at other index and size
-	// pairs, so the shard index is bound only by that size). §4 doesn't
+	// pairs, smaller or larger, so the shard index is bound only by that
+	// size). §4 doesn't
 	// require the promise: a bundle without one passes the upload, and the
 	// Rekor check reports "anchored, no signed entry" for it. (Bundles of
 	// the profile's v0.3 always carry a proof; the v2 and proof guards
