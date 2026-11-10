@@ -300,11 +300,14 @@ type PinResult struct {
 	// or another error from the request): for "Rekor unavailable". What
 	// it would have proven is unknown; nothing it would have moved moved.
 	Unavailable error
-	// Stopped is the run's context ending during a proof request: the run
-	// is incomplete, neither adding to failures nor resetting them.
+	// Stopped is the run's context ending, or the request cap reached,
+	// during a proof request: the run is incomplete, neither adding to
+	// failures nor resetting them.
 	Stopped error
-
-	contradicted bool // a proof that failed, not a bad answer
+	// Accepted: an owner-accepted shard change was recorded; Next's scan
+	// still names the old tree, whose tail the scan reads before the new
+	// shard from 0.
+	Accepted bool
 }
 
 func (r *PinResult) add(name, format string, a ...any) {
@@ -316,32 +319,38 @@ func (r *PinResult) add(name, format string, a ...any) {
 // that fails or a bad answer: inconsistent; a gone endpoint: search
 // unavailable) or the request that got no answer, and returns false.
 func (r *PinResult) prove(ctx context.Context, p Prover, a, b *Checkpoint, what string) bool {
+	if a.TreeID == b.TreeID && a.Origin != b.Origin {
+		r.add(FindingInconsistent, "%s: origin %q, not %q", what, b.Origin, a.Origin)
+		return false
+	}
 	var hashes []string
 	if a.TreeID == b.TreeID && b.Size > a.Size {
 		var err error
 		hashes, err = p.ConsistencyProof(ctx, int64(a.Size), int64(b.Size), b.TreeID)
 		switch {
+		case err == nil:
+			// A hash that isn't hex fails VerifyConsistency: inconsistent.
 		case errors.Is(err, ErrGone):
 			r.add(FindingUnavailable, "%s: %v", what, err)
 			return false
-		case errors.Is(err, ErrBadAnswer):
-			r.add(FindingInconsistent, "%s: %v", what, err)
+		case errors.Is(err, ErrUnavailable):
+			if r.Unavailable == nil {
+				r.Unavailable = err
+			}
 			return false
-		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		case errors.Is(err, ErrCap) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
 			if r.Stopped == nil {
 				r.Stopped = err
 			}
 			return false
-		case err != nil:
-			if r.Unavailable == nil {
-				r.Unavailable = err
-			}
+		default:
+			// A bad answer, or anything else that came back: a mismatch.
+			r.add(FindingInconsistent, "%s: %v", what, err)
 			return false
 		}
 	}
 	if err := VerifyConsistency(a, b, hashes); err != nil {
 		r.add(FindingInconsistent, "%s: %v", what, err)
-		r.contradicted = true
 		return false
 	}
 	return true
@@ -356,6 +365,9 @@ func (r *PinResult) prove(ctx context.Context, p Prover, a, b *Checkpoint, what 
 func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 	res := &PinResult{}
 	cur, a, ls := in.Current, in.Admin, in.Loaded
+	if cur == nil || in.Prover == nil {
+		return nil, errors.New("rekor: CheckPin needs the run's checkpoint and a prover")
+	}
 	if a.count() > 1 || a.BootstrapReplaces != "" && !a.Bootstrap {
 		return nil, fmt.Errorf("%w: one admin request at a time", ErrAdminRefused)
 	}
@@ -371,6 +383,9 @@ func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 		switch {
 		case target == nil:
 			res.add(FindingInconsistent, "the newest bundle's tree %s is neither the active nor an inactive shard", b.TreeID)
+		case b.TreeID != cur.TreeID && b.Size > target.Size:
+			// A frozen shard holds nothing past its final size.
+			res.add(FindingInconsistent, "the newest bundle's checkpoint is at %d, past inactive tree %s's final %d", b.Size, b.TreeID, target.Size)
 		case b.Size > target.Size:
 			res.prove(ctx, in.Prover, target, b, "the newest bundle's checkpoint, from the log's")
 		default:
@@ -382,6 +397,9 @@ func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 	// too (exit 2), and the owner dispatches it again.
 	if a.count() > 0 && (len(res.Findings) > 0 || res.Unavailable != nil || res.Stopped != nil) {
 		return nil, fmt.Errorf("%w: the newest bundle's checkpoint isn't proven consistent with the log's", ErrAdminRefused)
+	}
+	if a.count() > 0 && cur.Size == 0 {
+		return nil, fmt.Errorf("%w: the active shard is empty; dispatch again once it has entries", ErrAdminRefused)
 	}
 	switch ls.Kind {
 	case StateNone:
@@ -397,7 +415,7 @@ func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 			res.add(FindingNoState, "the state is empty, the sentinel, or doesn't parse (sha256 %s)", ls.SHA256)
 			return res, nil
 		}
-		if ls.Kind == StateUnparsed && a.BootstrapReplaces != ls.SHA256 {
+		if ls.Kind == StateUnparsed && strings.ToLower(a.BootstrapReplaces) != ls.SHA256 {
 			return nil, fmt.Errorf("%w: the state doesn't parse; a bootstrap must name its SHA-256 %s", ErrAdminRefused, ls.SHA256)
 		}
 		if ls.Kind == StateEmpty && a.BootstrapReplaces != "" {
@@ -418,6 +436,9 @@ func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 	rec := st.Checkpoint()
 
 	if cur.TreeID != st.TreeID {
+		if a.ResetPin != "" {
+			return nil, fmt.Errorf("%w: the tree changed; accept the shard, not reset the pin", ErrAdminRefused)
+		}
 		if a.AcceptShard == "" {
 			res.add(FindingShardChanged, "the active tree is %s; the recorded one is %s", cur.TreeID, st.TreeID)
 			res.ShardChanged = true
@@ -437,6 +458,7 @@ func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 		}
 		next.record(cur)
 		next.StaleRuns = 0
+		res.Accepted = true
 		return res, nil
 	}
 	if a.AcceptShard != "" {
@@ -445,16 +467,19 @@ func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 	var pin PinResult
 	ok := pin.prove(ctx, in.Prover, rec, cur, "the log's checkpoint, from the recorded one")
 	if a.ResetPin != "" {
-		// Only a log shown contradicting the pin (a proof that failed, a
-		// shrunk tree, another root), not a malformed answer.
-		if ok || !pin.contradicted {
-			return nil, fmt.Errorf("%w: a reset applies only to a pin the log was shown to contradict", ErrAdminRefused)
+		// A pin the run couldn't prove (inconsistent, or the proof gone or
+		// malformed), not one it couldn't ask about: the owner names it.
+		if ok || pin.Unavailable != nil || pin.Stopped != nil {
+			return nil, fmt.Errorf("%w: a reset applies only to a pin the run failed to prove", ErrAdminRefused)
 		}
-		if a.ResetPin != fmt.Sprintf("%d:%s", st.TreeSize, st.RootHash) {
+		if strings.ToLower(a.ResetPin) != fmt.Sprintf("%d:%s", st.TreeSize, st.RootHash) {
 			return nil, fmt.Errorf("%w: the reset names %q, not the recorded %d:%s", ErrAdminRefused, a.ResetPin, st.TreeSize, st.RootHash)
 		}
 		next.record(cur)
 		next.StaleRuns = 0
+		if next.ScannedTo != nil && next.ScanTreeID == cur.TreeID && *next.ScannedTo > cur.Size {
+			next.ScanAt(cur.TreeID, cur.Size)
+		}
 		return res, nil
 	}
 	res.Findings = append(res.Findings, pin.Findings...)

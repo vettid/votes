@@ -14,14 +14,18 @@ import (
 // fakeProver answers consistency proofs from a table, or with err.
 type fakeProver struct {
 	proofs map[[2]int64][]string
+	tree   string // if set, only proofs of this tree are answered
 	err    error
 	asked  int
 }
 
-func (f *fakeProver) ConsistencyProof(_ context.Context, first, last int64, _ string) ([]string, error) {
+func (f *fakeProver) ConsistencyProof(_ context.Context, first, last int64, treeID string) ([]string, error) {
 	f.asked++
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.tree != "" && treeID != f.tree {
+		return nil, ErrBadAnswer
 	}
 	return f.proofs[[2]int64{first, last}], nil
 }
@@ -297,10 +301,10 @@ func TestCheckPin(t *testing.T) {
 	if _, err := CheckPin(ctx, PinInput{Loaded: empty, Current: b, Bundle: a, Prover: &fakeProver{err: context.Canceled}, Admin: Admin{Bootstrap: true}}); !errors.Is(err, ErrAdminRefused) {
 		t.Errorf("bootstrap after a stopped proof: %v", err)
 	}
-	// A reset needs the log shown contradicting the pin, not a bad answer.
+	// A reset of a pin the run failed to prove, in upper-case hex too.
 	grown := stateAt(a).State
-	if _, err := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{err: ErrBadAnswer}, Admin: Admin{ResetPin: formatPin(grown)}}); !errors.Is(err, ErrAdminRefused) {
-		t.Errorf("reset after a bad answer: %v", err)
+	if r, err := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{err: ErrBadAnswer}, Admin: Admin{ResetPin: formatPin(grown)}}); err != nil || r.Next.TreeSize != b.Size {
+		t.Errorf("reset after a bad answer (unproven, named by the owner): %+v %v", r, err)
 	}
 	if r, err := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{proofs: map[[2]int64][]string{{int64(a.Size), int64(b.Size)}: {hex.EncodeToString(make([]byte, 32))}}}, Admin: Admin{ResetPin: formatPin(grown)}}); err != nil || r.Next.TreeSize != b.Size {
 		t.Errorf("reset after a failed proof: %+v %v", r, err)
@@ -355,5 +359,111 @@ func TestWriteFileAtomic(t *testing.T) {
 	}
 	if err := WriteFileAtomic(filepath.Join(dir, "missing", "x"), nil); err == nil {
 		t.Error("wrote into a missing directory")
+	}
+}
+
+func TestCheckPinRound2(t *testing.T) {
+	ctx := context.Background()
+	a, b, p := fixturePin(t)
+	other := *b
+	other.TreeID, other.Origin = "1234", host+" - 1234"
+
+	// Another origin for the recorded tree, or the bundle's: inconsistent.
+	evil := stateAt(a).State
+	evil.Origin = "evil.example - " + a.TreeID
+	r, _ := CheckPin(ctx, PinInput{Loaded: ParseState(evil.Encode()), Current: b, Prover: p})
+	if !slices.Equal(names(r), []string{FindingInconsistent}) || r.Next.Origin != evil.Origin {
+		t.Errorf("state's origin: %+v", r)
+	}
+	evilB := *a
+	evilB.Origin = "evil.example - " + a.TreeID
+	if r, _ := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Bundle: &evilB, Prover: p}); !slices.Equal(names(r), []string{FindingInconsistent}) {
+		t.Errorf("bundle's origin: %+v", r)
+	}
+	// A bundle in an inactive shard past its final size: inconsistent, no
+	// proof asked; within it, consistent, so a changed shard is the only
+	// finding.
+	np := &fakeProver{err: ErrUnavailable}
+	if r, _ := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: &other, Inactive: map[string]*Checkpoint{a.TreeID: a}, Bundle: b, Prover: np}); !slices.Contains(names(r), FindingInconsistent) || np.asked != 0 {
+		t.Errorf("bundle past a frozen shard's final: %+v, %d asked", r, np.asked)
+	}
+	if r, _ := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: &other, Inactive: map[string]*Checkpoint{a.TreeID: b}, Bundle: a, Prover: p}); !slices.Equal(names(r), []string{FindingShardChanged}) {
+		t.Errorf("bundle in a known inactive shard: %+v", r)
+	}
+	// A forked bundle ahead of the run: the forward proof fails.
+	forkB := *b
+	forkB.Root = append([]byte(nil), b.Root...)
+	forkB.Root[0] ^= 1
+	if r, _ := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: a, Bundle: &forkB, Prover: p}); !slices.Equal(names(r), []string{FindingInconsistent}) {
+		t.Errorf("forked bundle ahead: %+v", r)
+	}
+	// An empty active shard: admin steps refused.
+	emptyCur := &Checkpoint{Origin: other.Origin, TreeID: other.TreeID, Size: 0, Root: make([]byte, 32)}
+	for name, in := range map[string]PinInput{
+		"bootstrap": {Loaded: ParseState([]byte(Sentinel)), Current: emptyCur, Prover: p, Admin: Admin{Bootstrap: true}},
+		"accept":    {Loaded: stateAt(a), Current: emptyCur, Inactive: map[string]*Checkpoint{a.TreeID: b}, Prover: p, Admin: Admin{AcceptShard: other.TreeID}},
+	} {
+		if _, err := CheckPin(ctx, in); !errors.Is(err, ErrAdminRefused) {
+			t.Errorf("%s at size 0: %v", name, err)
+		}
+	}
+	// Error classes: the cap is stopped; anything unclassified a mismatch.
+	if r, _ := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{err: ErrCap}}); !errors.Is(r.Stopped, ErrCap) || r.Unavailable != nil {
+		t.Errorf("cap: %+v", r)
+	}
+	if r, _ := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{err: errors.New("odd")}}); !slices.Equal(names(r), []string{FindingInconsistent}) || r.Unavailable != nil {
+		t.Errorf("unclassified: %+v", r)
+	}
+	// A proof with a non-hex hash: inconsistent (a bad answer).
+	if r, _ := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{proofs: map[[2]int64][]string{{int64(a.Size), int64(b.Size)}: {"zz"}}}}); !slices.Equal(names(r), []string{FindingInconsistent}) {
+		t.Errorf("non-hex proof: %+v", r)
+	}
+	// A reset during a shard change is refused.
+	if _, err := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: &other, Prover: p, Admin: Admin{ResetPin: formatPin(stateAt(a).State)}}); !errors.Is(err, ErrAdminRefused) {
+		t.Errorf("reset during a shard change: %v", err)
+	}
+	// No checkpoint: an error, not a panic.
+	if _, err := CheckPin(ctx, PinInput{Loaded: stateAt(a), Prover: p}); err == nil {
+		t.Error("no checkpoint")
+	}
+	// Acceptance asks the old tree for its proof, and says it accepted.
+	treeP := &fakeProver{proofs: p.proofs, tree: a.TreeID}
+	r, err := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: &other, Inactive: map[string]*Checkpoint{a.TreeID: b}, Prover: treeP, Admin: Admin{AcceptShard: other.TreeID}})
+	if err != nil || !r.Accepted || treeP.asked != 1 {
+		t.Errorf("accept: %+v %v, %d asked", r, err, treeP.asked)
+	}
+	// Counts are unchanged on an inconsistent run.
+	counted := stateAt(b).State
+	counted.Failures = 2
+	counted.ScanAt(b.TreeID, 9)
+	if r, _ := CheckPin(ctx, PinInput{Loaded: ParseState(counted.Encode()), Current: a, Prover: p}); r.Next.Failures != 2 || *r.Next.ScannedTo != 9 {
+		t.Errorf("counts on an inconsistent run: %+v", r.Next)
+	}
+	// A reset to a smaller tree clamps the scan to it.
+	counted.ScanAt(b.TreeID, b.Size)
+	r, err = CheckPin(ctx, PinInput{Loaded: ParseState(counted.Encode()), Current: a, Prover: p, Admin: Admin{ResetPin: strings.ToUpper(formatPin(counted))}})
+	if err != nil || *r.Next.ScannedTo != a.Size || r.Next.TreeSize != a.Size {
+		t.Errorf("reset clamps the scan: %+v %v", r, err)
+	}
+	// Strictness: negative counts, the scan pair half empty.
+	ok := stateAt(a).State
+	for name, raw := range map[string]string{
+		"negative failures": strings.Replace(string(ok.Encode()), `"failures":0`, `"failures":-1`, 1),
+		"negative stale":    strings.Replace(string(ok.Encode()), `"stale_runs":0`, `"stale_runs":-1`, 1),
+		"empty scan tree":   string(ok.Encode())[:len(ok.Encode())-1] + `,"scan_tree_id":"","scanned_to":5}`,
+	} {
+		if ParseState([]byte(raw)).Kind != StateUnparsed {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	// A bootstrap's hash compares in any case.
+	bad := ParseState([]byte("{"))
+	if _, err := CheckPin(ctx, PinInput{Loaded: bad, Current: b, Prover: p, Admin: Admin{Bootstrap: true, BootstrapReplaces: strings.ToUpper(bad.SHA256)}}); err != nil {
+		t.Errorf("upper-case hash: %v", err)
+	}
+	// Failures: a run both unavailable and incomplete adds one (an answer
+	// was missing).
+	if n, _ := Failures(1, true, true); n != 2 {
+		t.Errorf("unavailable and incomplete: %d", n)
 	}
 }
