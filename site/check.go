@@ -62,6 +62,13 @@ type Report struct {
 	// Hashes are each document's SHA-256 by name, and rows', for readers
 	// to compare what they were served.
 	Hashes map[string][]byte
+	// Entries are each document's bundle's Rekor entry, by name, when it
+	// has one (AnchorTimes.Entry): for the Rekor check. A document in
+	// Anchored without one is one the Rekor check can't place, and reports
+	// ("anchored, no signed entry") rather than skips. A partial upload's
+	// bundle is only dated (TimestampOf) and gives none: the canary doesn't
+	// cover it, and the Rekor check counts its digests as known only.
+	Entries map[string]*RekorEntry
 	// Partial names documents whose signature, bundle or rows are
 	// published without the document: an upload not finished.
 	Partial []string
@@ -120,7 +127,7 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 	if err != nil {
 		return nil, err
 	}
-	rep := &Report{ProposalID: id, Anchored: map[string]time.Time{}, Hashes: map[string][]byte{}, Skew: map[string]time.Duration{}}
+	rep := &Report{ProposalID: id, Anchored: map[string]time.Time{}, Hashes: map[string][]byte{}, Entries: map[string]*RekorEntry{}, Skew: map[string]time.Duration{}}
 	partialAt := map[string]time.Time{}    // a partial upload's verified timestamp, when it has one
 	partialMod := map[string]time.Time{}   // or, without a bundle, its signature's Last-Modified
 	partialClose := map[string]time.Time{} // a partial extension's close in force
@@ -212,6 +219,9 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 			rep.Mismatches = append(rep.Mismatches, m)
 		}
 		rep.Hashes[name] = sha(u.Doc)
+		if at.Entry != nil {
+			rep.Entries[name] = at.Entry
+		}
 		if u.Rows != nil {
 			rep.Hashes["rows"] = sha(u.Rows)
 		}

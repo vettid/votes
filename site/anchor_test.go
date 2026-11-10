@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +57,74 @@ func TestAnchorVector(t *testing.T) {
 	ts, err := a.Verify(v.Bundle, doc, v.AnchorKey)
 	if err != nil || ts.Unix() != v.Timestamp {
 		t.Fatalf("verify: %v at %v, want %d", err, ts, v.Timestamp)
+	}
+	// The bundle's own Rekor entry: its leaf hash is its body's (sha256 of
+	// 0x00 and the body), its indexes and checkpoint the proof's.
+	at, err := a.VerifyTimes(v.Bundle, doc, v.AnchorKey)
+	if err != nil || at.Entry == nil {
+		t.Fatalf("entry: %+v %v", at, err)
+	}
+	var bj struct {
+		VerificationMaterial struct {
+			TlogEntries []struct {
+				LogIndex          string `json:"logIndex"`
+				IntegratedTime    string `json:"integratedTime"`
+				CanonicalizedBody []byte `json:"canonicalizedBody"`
+				InclusionProof    struct {
+					LogIndex   string `json:"logIndex"`
+					Checkpoint struct {
+						Envelope string `json:"envelope"`
+					} `json:"checkpoint"`
+				} `json:"inclusionProof"`
+			} `json:"tlogEntries"`
+		} `json:"verificationMaterial"`
+	}
+	if err := json.Unmarshal(v.Bundle, &bj); err != nil || len(bj.VerificationMaterial.TlogEntries) != 1 {
+		t.Fatal("bundle: no single tlog entry")
+	}
+	te := bj.VerificationMaterial.TlogEntries[0]
+	leaf := sha256.Sum256(append([]byte{0}, te.CanonicalizedBody...))
+	e := at.Entry
+	if !bytes.Equal(e.Leaf, leaf[:]) || strconv.FormatInt(e.LogIndex, 10) != te.LogIndex || strconv.FormatInt(e.ShardIndex, 10) != te.InclusionProof.LogIndex ||
+		e.Checkpoint != te.InclusionProof.Checkpoint.Envelope || strconv.FormatInt(e.Integrated.Unix(), 10) != te.IntegratedTime {
+		t.Errorf("entry %+v, bundle %+v", e, te)
+	}
+	// Without the inclusion promise (which signs the global index and the
+	// time), the bundle may still verify, but gives no entry.
+	var bmap map[string]any
+	if err := json.Unmarshal(v.Bundle, &bmap); err != nil {
+		t.Fatal(err)
+	}
+	vmat := bmap["verificationMaterial"].(map[string]any)
+	tl := vmat["tlogEntries"].([]any)[0].(map[string]any)
+	delete(tl, "inclusionPromise")
+	noPromise, _ := json.Marshal(bmap)
+	// A proof whose tree size isn't its checkpoint's: the shard index
+	// isn't bound, so no entry (the bundle may still verify: a right-edge
+	// leaf verifies at other index and size pairs).
+	var bmap2 map[string]any
+	_ = json.Unmarshal(v.Bundle, &bmap2)
+	ip2 := bmap2["verificationMaterial"].(map[string]any)["tlogEntries"].([]any)[0].(map[string]any)["inclusionProof"].(map[string]any)
+	// (This vector's leaf is a right edge: it has the same path at a
+	// smaller size, index 262143 of 262144, and a larger one, 268434432 of
+	// 268434433.)
+	for _, mv := range [][2]string{{"262143", "262144"}, {"268434432", "268434433"}} {
+		ip2["logIndex"], ip2["treeSize"] = mv[0], mv[1]
+		moved, _ := json.Marshal(bmap2)
+		mat, err := a.VerifyTimes(moved, doc, v.AnchorKey)
+		if err != nil {
+			t.Fatalf("the proof moved to %v no longer verifies (%v): this case needs another edit", mv, err)
+		}
+		if mat.Entry != nil {
+			t.Errorf("an entry from a proof moved to %v: %+v", mv, mat.Entry)
+		}
+	}
+	at, err = a.VerifyTimes(noPromise, doc, v.AnchorKey)
+	if err != nil {
+		t.Fatalf("a bundle without its promise no longer verifies (%v): this case needs another bundle", err)
+	}
+	if at.Entry != nil {
+		t.Errorf("an entry without its inclusion promise: %+v", at.Entry)
 	}
 	// Other bytes, another key, and a bundle whose entry is altered.
 	if _, err := a.Verify(v.Bundle, append(doc, ' '), v.AnchorKey); err == nil {

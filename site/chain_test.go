@@ -56,10 +56,19 @@ func chainCheck(objs map[string][]byte) (*ChainReport, error) {
 
 func TestServiceChain(t *testing.T) {
 	f := loadFixture(t)
-	objs, _ := chainSite(t, f)
+	objs, datas := chainSite(t, f)
 	rep, err := chainCheck(objs)
 	if err != nil || rep.Version != 3 || rep.Checked != 3 || len(rep.Mismatches) != 0 {
 		t.Fatalf("the chain: %+v %v", rep, err)
+	}
+	// Each version's digest, once.
+	if len(rep.Digests) != 3 {
+		t.Fatalf("%d digests", len(rep.Digests))
+	}
+	for _, d := range datas {
+		if !slices.ContainsFunc(rep.Digests, func(x []byte) bool { return bytes.Equal(x, sha(d)) }) {
+			t.Error("a version's digest is missing")
+		}
 	}
 
 	// Missing copies are mismatches: the current one's still chains.
@@ -76,6 +85,23 @@ func TestServiceChain(t *testing.T) {
 		rep, err := chainCheck(o)
 		if err != nil || !slices.Contains(rep.Mismatches, c.want) {
 			t.Fatalf("%s: %+v %v", name, rep, err)
+		}
+		// The digests are of the current list and each copy checked: a
+		// missing copy's is absent, unless it is the current list's.
+		want := [][]byte{sha(datas[2])}
+		for v, d := range datas {
+			p := "v1/services/" + string(rune('1'+v)) + ".json"
+			if _, ok := o[p]; ok && v != 2 && c.drop != p+".sig" {
+				want = append(want, sha(d))
+			}
+		}
+		if len(rep.Digests) != len(want) {
+			t.Errorf("%s: %d digests, want %d", name, len(rep.Digests), len(want))
+		}
+		for _, w := range want {
+			if !slices.ContainsFunc(rep.Digests, func(x []byte) bool { return bytes.Equal(x, w) }) {
+				t.Errorf("%s: a digest is missing", name)
+			}
 		}
 	}
 	// The current version's copy may lag services.json by ListingGrace.

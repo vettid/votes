@@ -12,10 +12,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/sigstore/rekor/pkg/util"
 	"github.com/sigstore/sigstore-go/pkg/bundle"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/verify"
 	"github.com/sigstore/sigstore/pkg/signature"
+	"github.com/transparency-dev/merkle/rfc6962"
 )
 
 // Anchors checks documents' Sigstore bundles (BALLOT-PROTOCOL §8.5
@@ -84,6 +86,33 @@ func (a *Anchors) trusted() root.TrustedMaterial {
 type AnchorTimes struct {
 	TSA   time.Time
 	Rekor time.Time
+	// Entry is the bundle's own Rekor v1 entry, as Sigstore's verifier
+	// checked it, for the Rekor check (VOTES-SITE §7), which verifies its
+	// checkpoint itself. It is nil unless the bundle has a single v1 entry
+	// with both an inclusion promise (which signs the global log index and
+	// the integrated time) and an inclusion proof whose tree size and root
+	// are its checkpoint's signed ones (Sigstore's verifier compares only
+	// the root, and a right-edge leaf verifies at other index and size
+	// pairs, smaller or larger, so the shard index is bound only by that
+	// size). §4 doesn't
+	// require the promise: a bundle without one passes the upload, and the
+	// Rekor check reports "anchored, no signed entry" for it. (Bundles of
+	// the profile's v0.3 always carry a proof; the v2 and proof guards
+	// below can't be reached by them, and have no test.)
+	Entry *RekorEntry
+}
+
+// RekorEntry is a bundle's Rekor entry: its leaf hash (the last 64 hex
+// digits of its entry ID), its global log index and integrated time (as
+// the inclusion promise signs them), its shard's index (the proof's), and
+// the proof's checkpoint, a signed note whose own size and root are the
+// ones to use once it is verified.
+type RekorEntry struct {
+	Leaf       []byte
+	LogIndex   int64
+	ShardIndex int64
+	Integrated time.Time
+	Checkpoint string
 }
 
 // Verify checks that bundleJSON anchors exactly doc under the anchor key
@@ -149,6 +178,17 @@ func (a *Anchors) VerifyTimes(bundleJSON, doc, spki []byte) (AnchorTimes, error)
 	// signed by the log.
 	if es, err := b.TlogEntries(); err == nil && len(es) == 1 && es[0].HasInclusionPromise() {
 		t.Rekor = es[0].IntegratedTime()
+		// The global index and the time only as the promise signs them,
+		// with a v1 proof against the canonical body.
+		if tle := es[0].TransparencyLogEntry(); !es[0].IsRekorV2() && tle != nil && tle.GetInclusionProof() != nil && tle.GetInclusionProof().GetCheckpoint() != nil {
+			ip := tle.GetInclusionProof()
+			var sc util.SignedCheckpoint
+			if sc.UnmarshalText([]byte(ip.GetCheckpoint().GetEnvelope())) == nil && ip.GetTreeSize() >= 0 &&
+				sc.Size == uint64(ip.GetTreeSize()) && bytes.Equal(sc.Hash, ip.GetRootHash()) {
+				t.Entry = &RekorEntry{Leaf: rfc6962.DefaultHasher.HashLeaf(tle.GetCanonicalizedBody()), LogIndex: tle.GetLogIndex(),
+					ShardIndex: ip.GetLogIndex(), Integrated: es[0].IntegratedTime(), Checkpoint: ip.GetCheckpoint().GetEnvelope()}
+			}
+		}
 	}
 	return t, nil
 }
