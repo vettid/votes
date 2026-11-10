@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -56,14 +57,21 @@ const (
 type LoadedState struct {
 	Kind  StateKind
 	State State
-	// Raw and SHA256 are the bytes read and their hash (hex), for a run
-	// that writes back a state it didn't change, and for the report.
+	// Raw and SHA256 are the bytes read and their hash (hex): a run that
+	// leaves a state it couldn't parse writes Raw back; the report names
+	// SHA256.
 	Raw    []byte
 	SHA256 string
 }
 
-// ParseState reads a stored state strictly: one JSON object of the
-// members above, v 1, a checkpoint that could have been verified.
+var (
+	stateRequired = []string{"v", "origin", "tree_id", "tree_size", "root_hash", "stale_runs", "failures"}
+	stateScan     = []string{"scan_tree_id", "scanned_to"}
+)
+
+// ParseState reads a stored state strictly: one JSON object with exactly
+// the members of State (the scan's two together or neither), each once,
+// named exactly; v 1; a checkpoint that could have been verified.
 func ParseState(raw []byte) LoadedState {
 	sum := sha256.Sum256(raw)
 	ls := LoadedState{Raw: append([]byte(nil), raw...), SHA256: hex.EncodeToString(sum[:])}
@@ -72,24 +80,64 @@ func ParseState(raw []byte) LoadedState {
 		ls.Kind = StateEmpty
 		return ls
 	}
-	dec := json.NewDecoder(bytes.NewReader(t))
-	dec.DisallowUnknownFields()
-	var s State
-	if dec.Decode(&s) != nil || dec.More() || !s.valid() {
-		ls.Kind = StateUnparsed
+	ls.Kind = StateUnparsed
+	keys, ok := objectKeys(t)
+	if !ok {
 		return ls
 	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		ls.Kind = StateUnparsed
+	want := slices.Clone(stateRequired)
+	if slices.Contains(keys, "scan_tree_id") || slices.Contains(keys, "scanned_to") {
+		want = append(want, stateScan...)
+	}
+	slices.Sort(keys)
+	slices.Sort(want)
+	if !slices.Equal(keys, want) {
+		return ls
+	}
+	var s State
+	if json.Unmarshal(t, &s) != nil || !s.valid() {
 		return ls
 	}
 	ls.Kind, ls.State = StateOK, s
 	return ls
 }
 
+// objectKeys returns the keys of a single JSON object, refusing anything
+// else, a repeated key, or data after it.
+func objectKeys(b []byte) ([]string, bool) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, false
+	}
+	var keys []string
+	for dec.More() {
+		tok, err := dec.Token()
+		k, isKey := tok.(string)
+		if err != nil || !isKey || slices.Contains(keys, k) {
+			return nil, false
+		}
+		keys = append(keys, k)
+		var v json.RawMessage
+		if dec.Decode(&v) != nil {
+			return nil, false
+		}
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return nil, false
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, false
+	}
+	return keys, true
+}
+
 func isSentinel(b []byte) bool {
+	keys, ok := objectKeys(b)
+	if !ok || len(keys) != 2 {
+		return false
+	}
 	var m map[string]any
-	if json.Unmarshal(b, &m) != nil || len(m) != 2 {
+	if json.Unmarshal(b, &m) != nil {
 		return false
 	}
 	return m["v"] == float64(1) && m["bootstrap"] == true
@@ -130,10 +178,14 @@ func (s State) Encode() []byte {
 }
 
 // WriteFileAtomic writes data to path whole: to a temporary file in the
-// same directory, synced, then renamed over it, so a write cut short
-// leaves the old file (VOTES-SITE §7, "Reading and writing back").
+// same directory, synced, renamed over path, and the directory synced,
+// so a write cut short leaves the old file (VOTES-SITE §7, "Reading and
+// writing back"). The file is 0600, as these are the check's own files;
+// a symlink at path is replaced, not followed; a temporary file left by a
+// process killed mid-write is named ".<name>.*" beside it.
 func WriteFileAtomic(path string, data []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
 	if err != nil {
 		return err
 	}
@@ -150,20 +202,32 @@ func WriteFileAtomic(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync() // not supported on every platform; the rename stands
+		d.Close()
+	}
+	return nil
 }
 
-// Findings of the checkpoint pin (VOTES-SITE §7).
+// Findings of the checkpoint pin, by the spec's names (VOTES-SITE §7).
 const (
-	FindingNoState       = "no state"
-	FindingInconsistent  = "inconsistent"
-	FindingShardChanged  = "shard changed"
-	FindingStale         = "stale"
-	FindingBundleInconst = "inconsistent (newest bundle)"
+	FindingNoState      = "no state"
+	FindingInconsistent = "inconsistent"
+	FindingShardChanged = "shard changed"
+	FindingStale        = "stale"
+	FindingUnavailable  = "search unavailable"
 )
 
+// Finding is a mismatch: its name and what was found.
+type Finding struct {
+	Name, Detail string
+}
+
 // Admin is what an owner-run dispatch asks of the pin (VOTES-SITE §7,
-// "Clearing"); the zero value asks nothing.
+// "Clearing"); the zero value asks nothing. At most one is asked.
 type Admin struct {
 	// Bootstrap records the checkpoint found, on an empty or sentinel
 	// state, or an unparseable one whose SHA-256 is BootstrapReplaces.
@@ -176,7 +240,22 @@ type Admin struct {
 	ResetPin string
 }
 
-// ErrAdminRefused is an admin request the state doesn't allow (exit 2).
+func (a Admin) count() int {
+	n := 0
+	if a.Bootstrap {
+		n++
+	}
+	if a.AcceptShard != "" {
+		n++
+	}
+	if a.ResetPin != "" {
+		n++
+	}
+	return n
+}
+
+// ErrAdminRefused is an admin request the state doesn't allow (exit 2):
+// nothing is recorded.
 var ErrAdminRefused = errors.New("rekor: the admin request doesn't apply to this state")
 
 // Prover gets consistency proofs (Client.ConsistencyProof).
@@ -197,157 +276,184 @@ type PinInput struct {
 	Prover   Prover
 }
 
-// PinResult is the pin's outcome: the findings (each a mismatch), the
-// state to write back (nil: write back what was read, unchanged), and
-// whether consistency held from the recorded checkpoint, so that the run
-// may check entries against the current one.
+// PinResult is the pin's outcome.
 type PinResult struct {
-	Findings []string
-	Next     *State
-	// Trusted: the current checkpoint may anchor the run's other checks
-	// (consistent with the state's, or recorded by an admin step).
-	Trusted bool
+	// Findings are mismatches, each proven: kept whatever else fails.
+	Findings []Finding
+	// Next is the state to write back, for a state that parsed (its counts
+	// for the caller to update: Failures, staging's scan) or one an admin
+	// step recorded; nil for no state, an empty or unparseable one (write
+	// back Raw unchanged).
+	Next *State
 	// ShardChanged: a tree ID other than the recorded one, not accepted:
-	// the run withholds the scan.
+	// the run withholds the scan, and still searches and verifies entries.
 	ShardChanged bool
+	// Unavailable is a proof request that got no answer (ErrUnavailable,
+	// or another error from the request): for "Rekor unavailable". What
+	// it would have proven is unknown; nothing it would have moved moved.
+	Unavailable error
+}
+
+func (r *PinResult) add(name, format string, a ...any) {
+	r.Findings = append(r.Findings, Finding{Name: name, Detail: fmt.Sprintf(format, a...)})
+}
+
+// prove checks b's tree extends a's, fetching a proof when b is larger.
+// It returns true if it does; otherwise it records the finding (a proof
+// that fails or a bad answer: inconsistent; a gone endpoint: search
+// unavailable) or the request that got no answer, and returns false.
+func (r *PinResult) prove(ctx context.Context, p Prover, a, b *Checkpoint, what string) bool {
+	var hashes []string
+	if a.TreeID == b.TreeID && b.Size > a.Size {
+		var err error
+		hashes, err = p.ConsistencyProof(ctx, int64(a.Size), int64(b.Size), b.TreeID)
+		switch {
+		case errors.Is(err, ErrGone):
+			r.add(FindingUnavailable, "%s: %v", what, err)
+			return false
+		case errors.Is(err, ErrBadAnswer):
+			r.add(FindingInconsistent, "%s: %v", what, err)
+			return false
+		case err != nil:
+			if r.Unavailable == nil {
+				r.Unavailable = err
+			}
+			return false
+		}
+	}
+	if err := VerifyConsistency(a, b, hashes); err != nil {
+		r.add(FindingInconsistent, "%s: %v", what, err)
+		return false
+	}
+	return true
 }
 
 // CheckPin checks the run's checkpoint against the recorded one and the
 // newest bundle's (VOTES-SITE §7, "The checkpoint", "Freshness",
-// "Shards", "Clearing"). A failed proof request is returned as an error
-// (the caller classifies it: ErrUnavailable counts toward "Rekor
-// unavailable"); a proof that fails is a finding. An admin request that
-// doesn't apply is ErrAdminRefused, with nothing recorded.
+// "Shards", "Clearing"). It never moves the pin to a checkpoint not
+// proven consistent with it, except by an admin step the spec allows. An
+// admin request that doesn't apply is ErrAdminRefused, with nothing
+// recorded.
 func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 	res := &PinResult{}
-	cur := in.Current
+	cur, a, ls := in.Current, in.Admin, in.Loaded
+	if a.count() > 1 || a.BootstrapReplaces != "" && !a.Bootstrap {
+		return nil, fmt.Errorf("%w: one admin request at a time", ErrAdminRefused)
+	}
 	// The newest bundle's checkpoint binds every run, with or without a
-	// state, so a state rolled back or reset can't take the check below it.
+	// state, so a state rolled back or reset can't take the check below
+	// it. A bundle larger than the run's (published during the run, or a
+	// lagging view) is proved from the run's up to it.
 	if b := in.Bundle; b != nil {
 		target := cur
 		if b.TreeID != cur.TreeID {
 			target = in.Inactive[b.TreeID]
 		}
-		if target == nil {
-			res.Findings = append(res.Findings, FindingBundleInconst)
-		} else if err := consistent(ctx, in.Prover, b, target); err != nil {
-			if !errors.Is(err, ErrInconsistent) {
-				return nil, err
-			}
-			res.Findings = append(res.Findings, FindingBundleInconst)
+		switch {
+		case target == nil:
+			res.add(FindingInconsistent, "the newest bundle's tree %s is neither the active nor an inactive shard", b.TreeID)
+		case b.Size > target.Size:
+			res.prove(ctx, in.Prover, target, b, "the newest bundle's checkpoint, from the log's")
+		default:
+			res.prove(ctx, in.Prover, b, target, "the log's checkpoint, from the newest bundle's")
 		}
 	}
-	ls := in.Loaded
-	a := in.Admin
-	// An admin step never records a pin the newest bundle contradicts.
-	if a != (Admin{}) && len(res.Findings) > 0 {
-		return nil, fmt.Errorf("%w: the newest bundle's checkpoint isn't consistent with the log's", ErrAdminRefused)
+	// An admin step never records a pin the newest bundle contradicts, or
+	// that it couldn't be checked against.
+	if a.count() > 0 && (len(res.Findings) > 0 || res.Unavailable != nil) {
+		return nil, fmt.Errorf("%w: the newest bundle's checkpoint isn't proven consistent with the log's", ErrAdminRefused)
 	}
 	switch ls.Kind {
 	case StateNone:
-		if a != (Admin{}) {
+		if a.count() > 0 {
 			return nil, fmt.Errorf("%w: no state given", ErrAdminRefused)
 		}
-		res.Trusted = len(res.Findings) == 0
 		return res, nil
 	case StateEmpty, StateUnparsed:
 		if !a.Bootstrap {
-			if a != (Admin{}) {
+			if a.count() > 0 {
 				return nil, fmt.Errorf("%w: only a bootstrap applies to no state", ErrAdminRefused)
 			}
-			res.Findings = append(res.Findings, FindingNoState)
+			res.add(FindingNoState, "the state is empty, the sentinel, or doesn't parse (sha256 %s)", ls.SHA256)
 			return res, nil
 		}
 		if ls.Kind == StateUnparsed && a.BootstrapReplaces != ls.SHA256 {
 			return nil, fmt.Errorf("%w: the state doesn't parse; a bootstrap must name its SHA-256 %s", ErrAdminRefused, ls.SHA256)
 		}
+		if ls.Kind == StateEmpty && a.BootstrapReplaces != "" {
+			return nil, fmt.Errorf("%w: the state is empty; a bootstrap names no hash", ErrAdminRefused)
+		}
 		next := &State{}
 		next.record(cur)
 		next.ScanTreeID, next.ScannedTo = cur.TreeID, cur.Size
-		res.Next, res.Trusted = next, len(res.Findings) == 0
+		res.Next = next
 		return res, nil
 	}
 	if a.Bootstrap {
 		return nil, fmt.Errorf("%w: a bootstrap applies only to an empty, sentinel or unparseable state", ErrAdminRefused)
 	}
 	st := ls.State
-	rec := st.Checkpoint()
 	next := st
+	res.Next = &next
+	rec := st.Checkpoint()
+
 	if cur.TreeID != st.TreeID {
-		old := in.Inactive[st.TreeID]
-		if a.AcceptShard == "" || a.AcceptShard != cur.TreeID {
-			if a.AcceptShard != "" {
-				return nil, fmt.Errorf("%w: the active tree is %s, not %s", ErrAdminRefused, cur.TreeID, a.AcceptShard)
-			}
-			res.Findings = append(res.Findings, FindingShardChanged)
+		if a.AcceptShard == "" {
+			res.add(FindingShardChanged, "the active tree is %s; the recorded one is %s", cur.TreeID, st.TreeID)
 			res.ShardChanged = true
+			next.StaleRuns = 0
 			return res, nil
 		}
+		if a.AcceptShard != cur.TreeID {
+			return nil, fmt.Errorf("%w: the active tree is %s, not %s", ErrAdminRefused, cur.TreeID, a.AcceptShard)
+		}
+		old := in.Inactive[st.TreeID]
 		if old == nil {
 			return nil, fmt.Errorf("%w: the recorded tree %s isn't among the inactive shards", ErrAdminRefused, st.TreeID)
 		}
-		if err := consistent(ctx, in.Prover, rec, old); err != nil {
-			if !errors.Is(err, ErrInconsistent) {
-				return nil, err
-			}
-			return nil, fmt.Errorf("%w: the recorded checkpoint isn't consistent with tree %s's final one: %v", ErrAdminRefused, st.TreeID, err)
+		var check PinResult
+		if !check.prove(ctx, in.Prover, rec, old, "the recorded checkpoint, to the old shard's final one") {
+			return nil, fmt.Errorf("%w: the recorded checkpoint isn't proven consistent with tree %s's final one (%v %v)", ErrAdminRefused, st.TreeID, check.Findings, check.Unavailable)
 		}
 		next.record(cur)
 		next.StaleRuns = 0
-		res.Next, res.Trusted = &next, len(res.Findings) == 0
 		return res, nil
 	}
 	if a.AcceptShard != "" {
 		return nil, fmt.Errorf("%w: the tree hasn't changed", ErrAdminRefused)
 	}
-	if err := consistent(ctx, in.Prover, rec, cur); err != nil {
-		if !errors.Is(err, ErrInconsistent) {
-			return nil, err
+	var pin PinResult
+	ok := pin.prove(ctx, in.Prover, rec, cur, "the log's checkpoint, from the recorded one")
+	if a.ResetPin != "" {
+		if ok || pin.Unavailable != nil || len(pin.Findings) == 0 || pin.Findings[0].Name != FindingInconsistent {
+			return nil, fmt.Errorf("%w: a reset applies only to an inconsistent pin", ErrAdminRefused)
 		}
-		if a.ResetPin != "" {
-			if a.ResetPin != fmt.Sprintf("%d:%s", st.TreeSize, st.RootHash) {
-				return nil, fmt.Errorf("%w: the reset names %q, not the recorded %d:%s", ErrAdminRefused, a.ResetPin, st.TreeSize, st.RootHash)
-			}
-			next.record(cur)
-			next.StaleRuns = 0
-			res.Next, res.Trusted = &next, len(res.Findings) == 0
-			return res, nil
+		if a.ResetPin != fmt.Sprintf("%d:%s", st.TreeSize, st.RootHash) {
+			return nil, fmt.Errorf("%w: the reset names %q, not the recorded %d:%s", ErrAdminRefused, a.ResetPin, st.TreeSize, st.RootHash)
 		}
-		// The recorded checkpoint is kept, so every later run reports it.
-		res.Findings = append(res.Findings, FindingInconsistent)
+		next.record(cur)
+		next.StaleRuns = 0
 		return res, nil
 	}
-	if a.ResetPin != "" {
-		return nil, fmt.Errorf("%w: the pin is consistent", ErrAdminRefused)
+	res.Findings = append(res.Findings, pin.Findings...)
+	if res.Unavailable == nil {
+		res.Unavailable = pin.Unavailable
+	}
+	if !ok {
+		// The recorded checkpoint is kept, so every later run reports it
+		// (or proves it, once Rekor answers).
+		return res, nil
 	}
 	if cur.Size == st.TreeSize {
 		next.StaleRuns = st.StaleRuns + 1
 		if next.StaleRuns >= 2 {
-			res.Findings = append(res.Findings, FindingStale)
+			res.add(FindingStale, "the tree has stayed at size %d for %d runs", cur.Size, next.StaleRuns)
 		}
 	} else {
 		next.StaleRuns = 0
 	}
 	next.record(cur)
-	res.Next, res.Trusted = &next, len(res.Findings) == 0
 	return res, nil
-}
-
-// consistent checks b's tree extends a's, fetching the proof when b is
-// larger: ErrInconsistent if not, another error if the proof couldn't be
-// had.
-func consistent(ctx context.Context, p Prover, a, b *Checkpoint) error {
-	if a.TreeID != b.TreeID || b.Size <= a.Size {
-		return VerifyConsistency(a, b, nil)
-	}
-	hashes, err := p.ConsistencyProof(ctx, int64(a.Size), int64(b.Size), b.TreeID)
-	if err != nil {
-		if errors.Is(err, ErrBadAnswer) || errors.Is(err, ErrGone) {
-			return fmt.Errorf("%w: %v", ErrInconsistent, err)
-		}
-		return err
-	}
-	return VerifyConsistency(a, b, hashes)
 }
 
 // Failures updates the count of runs whose Rekor requests got no answer
