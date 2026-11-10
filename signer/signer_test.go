@@ -179,6 +179,7 @@ type fakeAnchor struct {
 	clock                 func() time.Time // the TSA's
 	entryClock            func() time.Time // Rekor's, if set
 	failSign              bool
+	mismatch              bool // Sign answers a KeyMismatchError
 	failBundle            int
 	onSign                func() // if set, runs as Sign answers
 }
@@ -190,6 +191,10 @@ func (a *fakeAnchor) Sign(ctx context.Context, doc []byte) ([]byte, []byte, erro
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.signs++
+	if a.mismatch {
+		d := sha256.Sum256(doc)
+		return d[:], nil, &KeyMismatchError{Sig: []byte{0x30, 6, 2, 1, 1, 2, 1, 1}}
+	}
 	if a.failSign {
 		if p := RequestIDSink(ctx); p != nil {
 			*p = "req-lost"
@@ -340,7 +345,8 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	h := &harness{c: &memClaims{}, j: &memJournal{}, a: &fakeAnchor{key: k, clock: time.Now}, st: &fakeSite{}}
-	h.s = &Signer{Claims: h.c, Journal: h.j, Anchor: h.a, Site: h.st, Now: time.Now, Deadlines: DefaultDeadlines}
+	h.s = &Signer{Claims: h.c, Journal: h.j, Anchor: h.a, Site: h.st, Now: time.Now, Deadlines: DefaultDeadlines,
+		ServiceIKs: [][]byte{[]byte("ik")}}
 	return h
 }
 
@@ -884,4 +890,31 @@ func TestUnparseableToken(t *testing.T) {
 		t.Fatal("no error")
 	}
 	h.counts(t, 1, 1, 1, 0)
+}
+
+// A signature under another key: journaled raw, and nothing more is signed.
+func TestKeyMismatch(t *testing.T) {
+	h := newHarness(t)
+	h.a.mismatch = true
+	if _, err := h.s.Handle(context.Background(), req); err == nil {
+		t.Fatal("no error")
+	}
+	k := h.j.kinds()
+	if len(k) != 2 || k[1] != NoteUnkept || h.j.notes[1].Signature == nil {
+		t.Fatalf("notes %+v", h.j.notes)
+	}
+	h.a.mismatch = false
+	if _, err := h.s.Handle(context.Background(), req); err == nil || h.a.signs != 1 {
+		t.Fatalf("signed again after a mismatch: %v, %d signs", err, h.a.signs)
+	}
+}
+
+// With no identity keys compiled in, nothing is signed.
+func TestNoServiceIKs(t *testing.T) {
+	h := newHarness(t)
+	h.s.ServiceIKs = nil
+	if _, err := h.s.Handle(context.Background(), req); err == nil {
+		t.Fatal("no error")
+	}
+	h.counts(t, 0, 0, 0, 0)
 }

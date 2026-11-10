@@ -8,8 +8,9 @@
 //
 // Its configuration is compiled in (config.go, scripts/build-signer.sh),
 // never read from the environment; it refuses to start when a variable
-// that could redirect its clients is set, or when the anchor key isn't
-// listed for the services it anchors for.
+// that could redirect its clients is set. An anchor key not (yet) listed
+// for the services it anchors for makes it not ready (it alarms and signs
+// nothing), never an exit.
 //
 // The event is a signer.Request as JSON; the answer a signer.Result. A
 // function error means not published: the caller retries, and the claim
@@ -93,17 +94,21 @@ func run(ctx context.Context, log *slog.Logger) error {
 	store := awsio.ReadOnly{Storage: &s3store.Store{Bucket: c.bucket,
 		Client: s3.NewFromConfig(ac, func(o *s3.Options) { o.BaseEndpoint = endpoint("s3") })}}
 	st := &site.Site{Store: store, Anchors: anchors, SiteKey: c.siteKey, Now: time.Now, Log: log}
-	// The anchor key must be listed for every service compiled in, or
-	// nothing is signed (each document is checked again in Prepare).
+	// The anchor key should be listed for every service compiled in. Until
+	// it is (the first deploy, a key change, a list edit), the function is
+	// not ready: it alarms and goes on answering, every answer with its
+	// anchor_key so that the service can certify and list it, and signs
+	// nothing (Prepare refuses each document, bad_anchor, before the claim).
 	if err := listedFor(ctx, store, c, anch.PublicKeyDER()); err != nil {
-		return err
+		log.Error("not ready: the anchor key isn't listed for the compiled services", "alarm", "key_not_listed",
+			"err", err.Error())
 	}
 	s := &signer.Signer{
 		Claims: &awsio.Claims{Table: c.table,
 			Client: dynamodb.NewFromConfig(ac, func(o *dynamodb.Options) { o.BaseEndpoint = endpoint("dynamodb") })},
 		Journal: &awsio.Journal{Group: c.group, Stream: c.stream, Now: time.Now,
 			Client: cloudwatchlogs.NewFromConfig(ac, func(o *cloudwatchlogs.Options) { o.BaseEndpoint = endpoint("logs") })},
-		Anchor:     awsio.Anchor{Anchorer: anch},
+		Anchor:     awsio.NewAnchor(anch, key),
 		Site:       &awsio.Site{Site: st, API: c.api, Client: anchor.Client(signer.DefaultDeadlines.Site), Anchors: anchors},
 		Now:        time.Now,
 		Log:        log,
@@ -158,7 +163,11 @@ func handle(ctx context.Context, s *signer.Signer, ev []byte) ([]byte, error) {
 	dec := json.NewDecoder(bytes.NewReader(ev))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil || dec.More() {
-		return json.Marshal(signer.Result{Status: 400, Code: signer.CodeBadRequest})
+		r := signer.Result{Status: 400, Code: signer.CodeBadRequest}
+		if s.Anchor != nil {
+			r.AnchorKey = s.Anchor.PublicKeyDER()
+		}
+		return json.Marshal(r)
 	}
 	res, err := s.Handle(ctx, req)
 	if err != nil {

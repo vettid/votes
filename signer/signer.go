@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/vettid/votes/site"
@@ -82,6 +83,16 @@ var (
 	// lease, another digest or r, or no claim).
 	ErrSet = errors.New("signer: claim condition failed")
 )
+
+// KeyMismatchError is a signature that doesn't verify under the anchor
+// key read at start: the key behind the alias changed. It is journaled
+// (sign_unkept, with the signature), it alarms (key_mismatch), and the
+// process signs nothing more.
+type KeyMismatchError struct{ Sig []byte }
+
+func (e *KeyMismatchError) Error() string {
+	return "signer: the signature doesn't verify under the anchor key read at start"
+}
 
 // Retryable failures, before anything is signed.
 var (
@@ -295,7 +306,10 @@ type Signer struct {
 	Deadlines Deadlines
 	// ServiceIKs are the identity keys this signer anchors for, compiled
 	// into it; a document under any other is refused (unknown_service).
+	// None: nothing is signed.
 	ServiceIKs [][]byte
+
+	halted atomic.Bool // a key mismatch was seen: nothing more is signed
 }
 
 // stuck alarms claim_stuck for a kept artifact that can't be read, and
@@ -319,6 +333,9 @@ const (
 	// CodeJournalFailed: the alarm for a journal write that failed after a
 	// sign.
 	CodeJournalFailed = "journal_failed"
+	// CodeKeyMismatch: the alarm for a signature under another key than
+	// the one read at start.
+	CodeKeyMismatch = "key_mismatch"
 )
 
 // requestIDKey is the context key under which Handle puts a *string for
@@ -349,6 +366,12 @@ func (s *Signer) Handle(ctx context.Context, req Request) (Result, error) {
 }
 
 func (s *Signer) handle(ctx context.Context, req Request) (Result, error) {
+	if s.halted.Load() {
+		return Result{}, errors.New("signer: halted after a key mismatch: nothing more is signed by this process")
+	}
+	if len(s.ServiceIKs) == 0 {
+		return Result{}, errors.New("signer: no service identity keys compiled in: nothing is signed")
+	}
 	if req.ProposalID == "" || req.Name == "" || len(req.Doc) == 0 {
 		return Result{Status: http.StatusBadRequest, Code: CodeBadRequest}, nil
 	}
@@ -744,6 +767,17 @@ func (s *Signer) sign(ctx context.Context, req Request, slot string, c *Claim) (
 	// From here KMS may have signed: what it answered is journaled, and
 	// kept, whatever happens to the call's own context.
 	keepCtx := context.WithoutCancel(ctx)
+	var km *KeyMismatchError
+	if errors.As(err, &km) {
+		s.halted.Store(true)
+		n := base
+		n.Kind, n.KMSRequestID, n.Signature = NoteUnkept, reqID, km.Sig
+		n.R, _ = RFromDER(km.Sig)
+		s.note(keepCtx, n)
+		s.log().Error("a signature under another key", "alarm", CodeKeyMismatch, "proposal_id", req.ProposalID,
+			"name", req.Name, "kms_request_id", reqID)
+		return nil, km
+	}
 	if err != nil {
 		n := base
 		n.Kind, n.KMSRequestID = NoteOutcomeUnknown, reqID

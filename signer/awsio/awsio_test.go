@@ -25,6 +25,7 @@ import (
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
+	"github.com/vettid/service-vault/anchor"
 	"github.com/vettid/votes/signer"
 	"github.com/vettid/votes/site"
 )
@@ -231,3 +232,30 @@ func TestUpload(t *testing.T) {
 }
 
 func must[T any](v T, _ error) T { return v }
+
+// otherSigner names one key and signs with another (an alias repointed).
+type otherSigner struct{ named, signs *ecdsa.PrivateKey }
+
+func (o otherSigner) Public() *ecdsa.PublicKey { return &o.named.PublicKey }
+func (o otherSigner) SignDigest(_ context.Context, d []byte) ([]byte, error) {
+	return ecdsa.SignASN1(rand.Reader, o.signs, d)
+}
+
+// The adapter's Sign: a signature under another key than the one read at
+// start is a KeyMismatchError carrying it; one under that key is returned.
+func TestAnchorSignMismatch(t *testing.T) {
+	named, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	other, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	a, err := anchor.NewWithSigner(anchor.LocalSigner{Key: named}, anchor.Endpoints{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, sig, err := NewAnchor(a, anchor.LocalSigner{Key: named}).Sign(context.Background(), []byte("doc")); err != nil || sig == nil {
+		t.Fatalf("%v", err)
+	}
+	_, _, err = NewAnchor(a, otherSigner{named: named, signs: other}).Sign(context.Background(), []byte("doc"))
+	var km *signer.KeyMismatchError
+	if !errors.As(err, &km) || km.Sig == nil {
+		t.Fatalf("%v", err)
+	}
+}
