@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -113,7 +114,7 @@ func (s *Site) upload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, code)
 		return
 	}
-	created, err := s.put(r.Context(), id, name, &u, false)
+	created, err := s.put(r.Context(), id, name, &u, nil)
 	var rf *refusal
 	var ie *indexError
 	stale := false
@@ -149,7 +150,7 @@ func validSlot(id, name string) bool {
 // put runs an upload's checks and, unless dry, writes it. A dry run
 // (Prepare) takes the time now for the anchor's, which a later anchor
 // can only follow, and stops before the write.
-func (s *Site) put(ctx context.Context, id, name string, u *Upload, dry bool) (bool, error) {
+func (s *Site) put(ctx context.Context, id, name string, u *Upload, dry *dryRun) (bool, error) {
 	switch name {
 	case "proposal":
 		return s.putProposal(ctx, id, u, dry)
@@ -160,6 +161,10 @@ func (s *Site) put(ctx context.Context, id, name string, u *Upload, dry bool) (b
 		return s.putExtension(ctx, id, n, u, dry)
 	}
 }
+
+// placeholderBundle stands in for a bundle of the largest size the site
+// takes, for measuring a request before it has one.
+var placeholderBundle = json.RawMessage(strconv.Quote(strings.Repeat("x", maxBundle-2)))
 
 // Prepared is what Prepare found.
 type Prepared struct {
@@ -180,12 +185,13 @@ func (r *Refusal) Error() string { return "site refuses: " + r.Code }
 // Prepare runs every check an upload of doc, sig and rows to the slot
 // (id, name) would get, except the anchor, and writes nothing: the
 // signer's checks before it signs (key protection, GC #7406 §1). The time
-// now stands in for the anchor's, which can only be later, so a document
-// Prepare accepts may still be refused once anchored (a close that passes
-// in between), never the other way round. A document the site already
+// now plus lead stands in for the anchor's (the signer's lead is the time
+// its steps may take), so a document Prepare accepts is refused once
+// anchored only if the anchor takes longer than lead; and the request is
+// measured with the largest bundle the site takes. A document the site already
 // holds is judged with the bundle it holds. A refusal is a *Refusal; any
 // other error is the store's.
-func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []byte) (Prepared, error) {
+func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []byte, lead time.Duration) (Prepared, error) {
 	if !validSlot(id, name) {
 		return Prepared{}, &Refusal{http.StatusNotFound, "not_found"}
 	}
@@ -200,14 +206,48 @@ func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []by
 	if prev != nil && !bytes.Equal(prev, doc) {
 		return Prepared{}, &Refusal{http.StatusConflict, "differs"}
 	}
-	if prev != nil {
-		// Published: judged by the bundle the site holds, as a re-upload
-		// of it would be.
-		if u.Bundle, err = s.published(ctx, docPath(id, name)+".sigstore.json"); err != nil {
+	// The request it will take, with the largest bundle the site takes:
+	// the API measures the body as sent (as Check does).
+	var body bytes.Buffer
+	enc := json.NewEncoder(&body)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(&Upload{Doc: doc, Sig: sig, Rows: rows, Bundle: placeholderBundle}); err != nil {
+		return Prepared{}, &Refusal{http.StatusBadRequest, "bad_request"}
+	}
+	if body.Len()-1 > MaxUpload {
+		return Prepared{}, &Refusal{http.StatusRequestEntityTooLarge, "too_large"}
+	}
+	// Parts an earlier upload left: the signature and rows must be these
+	// bytes, as write requires.
+	base := "v1/p/" + id + "/" + name
+	left := []struct {
+		path string
+		data []byte
+	}{{base + ".json.sig", sig}}
+	if name == "results" {
+		left = append(left, struct {
+			path string
+			data []byte
+		}{"v1/p/" + id + "/rows.json", rows})
+	}
+	for _, l := range left {
+		b, err := s.published(ctx, l.path)
+		if err != nil {
 			return Prepared{}, err
 		}
+		if b != nil && !bytes.Equal(b, l.data) {
+			return Prepared{}, &Refusal{http.StatusConflict, "differs"}
+		}
 	}
-	if _, err := s.put(ctx, id, name, u, true); err != nil {
+	// A bundle there already (published, or a partial upload's) judges
+	// the document, as a re-upload would be judged: write keeps it, and
+	// refuses one that isn't this document's.
+	held, err := s.published(ctx, base+".json.sigstore.json")
+	if err != nil {
+		return Prepared{}, err
+	}
+	u.Bundle = held
+	if _, err := s.put(ctx, id, name, u, &dryRun{lead: max(lead, 0)}); err != nil {
 		var rf *refusal
 		if errors.As(err, &rf) {
 			return Prepared{}, &Refusal{rf.status, rf.code}
@@ -217,10 +257,15 @@ func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []by
 	return Prepared{Published: prev != nil}, nil
 }
 
-// anchorAt is the anchor's time, or, in a dry run without a bundle, now.
-func (s *Site) anchorAt(dry bool, svc *Service, u *Upload) (time.Time, error) {
-	if dry && len(u.Bundle) == 0 {
-		return s.Now(), nil
+// dryRun is a run of the checks with nothing written (Prepare): lead is
+// how much later than now the anchor is taken to be.
+type dryRun struct{ lead time.Duration }
+
+// anchorAt is the anchor's time, or, in a dry run without a bundle, now
+// plus the run's lead.
+func (s *Site) anchorAt(dry *dryRun, svc *Service, u *Upload) (time.Time, error) {
+	if dry != nil && len(u.Bundle) == 0 {
+		return s.Now().Add(dry.lead), nil
 	}
 	return s.anchor(svc, u)
 }
@@ -335,7 +380,7 @@ func (s *Site) proposalOf(ctx context.Context, id string) ([]byte, *vote.Proposa
 	return doc, p, svc, nil
 }
 
-func (s *Site) putProposal(ctx context.Context, id string, u *Upload, dry bool) (bool, error) {
+func (s *Site) putProposal(ctx context.Context, id string, u *Upload, dry *dryRun) (bool, error) {
 	p, err := vote.ParseProposal(u.Doc)
 	if err != nil {
 		return false, refuse(http.StatusUnprocessableEntity, "bad_document", err.Error())
@@ -367,7 +412,7 @@ func (s *Site) putProposal(ctx context.Context, id string, u *Upload, dry bool) 
 	} else if !bytes.Equal(prev, u.Doc) && (!ts.Before(time.Unix(p.ClosesAt, 0)) || !s.Now().Before(time.Unix(p.ClosesAt, 0))) {
 		return false, refuse(http.StatusUnprocessableEntity, "too_late", "the vote has closed")
 	}
-	if dry {
+	if dry != nil {
 		return false, nil
 	}
 	created, err := s.write(ctx, id, "proposal", u, nil, svc)
@@ -400,7 +445,7 @@ func withEntry(es []IndexEntry, id string, svc *Service, pdoc []byte, p *vote.Pr
 		OpensAt: p.OpensAt, ClosesAt: p.ClosesAt})
 }
 
-func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload, dry bool) (bool, error) {
+func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload, dry *dryRun) (bool, error) {
 	pdoc, p, svc, err := s.proposalOf(ctx, id)
 	if err != nil {
 		return false, err
@@ -449,7 +494,7 @@ func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload, dr
 	case e.ClosesAt-p.ClosesAt > vote.MaxExtension:
 		return false, refuse(http.StatusUnprocessableEntity, "bad_document", "extensions over 24 h")
 	}
-	if dry {
+	if dry != nil {
 		return false, nil
 	}
 	created, err := s.write(ctx, id, "extension-"+strconv.Itoa(n), u, nil, svc)
@@ -504,7 +549,7 @@ func (s *Site) closeInForce(ctx context.Context, id string, p *vote.Proposal, n 
 	return e.ClosesAt, nil
 }
 
-func (s *Site) putResults(ctx context.Context, id string, u *Upload, dry bool) (bool, error) {
+func (s *Site) putResults(ctx context.Context, id string, u *Upload, dry *dryRun) (bool, error) {
 	pdoc, p, svc, err := s.proposalOf(ctx, id)
 	if err != nil {
 		return false, err
@@ -562,7 +607,7 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload, dry bool) (
 		// sooner were counted before it ended.
 		return false, refuse(http.StatusUnprocessableEntity, "bad_anchor", "results anchored before collection ended")
 	}
-	if dry {
+	if dry != nil {
 		return false, nil
 	}
 	created, err := s.write(ctx, id, "results", u, u.Rows, svc)

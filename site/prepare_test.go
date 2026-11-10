@@ -5,13 +5,14 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"time"
 	"testing"
 )
 
 // prepare runs Prepare on an upload's parts, without its bundle.
 func prepare(t *testing.T, s *Site, name string, u *Upload) (Prepared, string) {
 	t.Helper()
-	p, err := s.Prepare(context.Background(), testID, name, u.Doc, u.Sig, u.Rows)
+	p, err := s.Prepare(context.Background(), testID, name, u.Doc, u.Sig, u.Rows, 0)
 	var rf *Refusal
 	switch {
 	case errors.As(err, &rf):
@@ -76,4 +77,49 @@ func TestPrepare(t *testing.T) {
 	st.Objects["v1/p/"+testID+"/results.json"] = []byte("{}")
 	before = maps.Clone(st.Objects)
 	check("other bytes at the slot", "results", &f.Results, "differs", false)
+}
+
+// Prepare refuses what the upload would refuse for its size or for parts
+// an earlier upload left, and judges the anchor lead later than now.
+func TestPrepareRequest(t *testing.T) {
+	f := loadFixture(t)
+	s, st := newSite(t, f, f.during())
+	// Rows are bounded only by the request: so big a request, with the
+	// largest bundle, is over it.
+	_, code := prepare(t, s, "results", mut(f.Results, func(u *Upload) { u.Rows = bytes.Repeat([]byte("r"), MaxUpload*3/4) }))
+	if code != "too_large" {
+		t.Fatalf("large rows: %q", code)
+	}
+
+	// A signature an earlier upload left for another document.
+	st.Objects["v1/p/"+testID+"/proposal.json.sig"] = bytes.Repeat([]byte{1}, 64)
+	if _, code := prepare(t, s, "proposal", &f.Proposal); code != "differs" {
+		t.Fatalf("a leftover signature: %q", code)
+	}
+	delete(st.Objects, "v1/p/"+testID+"/proposal.json.sig")
+	// A bundle an earlier upload left that isn't this document's.
+	st.Objects["v1/p/"+testID+"/proposal.json.sigstore.json"] = f.Extension.Bundle
+	if _, code := prepare(t, s, "proposal", &f.Proposal); code != "bad_anchor" {
+		t.Fatalf("a leftover bundle: %q", code)
+	}
+	delete(st.Objects, "v1/p/"+testID+"/proposal.json.sigstore.json")
+
+	// The lead: an extension a little before its close passes with none,
+	// and is too late with a lead that reaches the close.
+	st201, why := post(t, s, "proposal", &f.Proposal)
+	want(t, "proposal", st201, why, 201, "")
+	at(s, time.Unix(f.p.ClosesAt-30, 0))
+	for lead, wantCode := range map[time.Duration]string{0: "", 10 * time.Second: "", 30 * time.Second: "too_late", time.Minute: "too_late"} {
+		_, err := s.Prepare(context.Background(), testID, "extension-1", f.Extension.Doc, f.Extension.Sig, nil, lead)
+		var rf *Refusal
+		got := ""
+		if errors.As(err, &rf) {
+			got = rf.Code
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if got != wantCode {
+			t.Fatalf("lead %v: %q, want %q", lead, got, wantCode)
+		}
+	}
 }

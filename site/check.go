@@ -227,7 +227,7 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		}
 		return true, nil
 	}
-	found, err := put("proposal", false, func(u *Upload) (bool, error) { return s.putProposal(ctx, id, u, false) })
+	found, err := put("proposal", false, func(u *Upload) (bool, error) { return s.putProposal(ctx, id, u, nil) })
 	if err != nil {
 		return nil, err
 	}
@@ -255,7 +255,7 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 			}
 			continue
 		}
-		found, err := put(name, false, func(u *Upload) (bool, error) { return s.putExtension(ctx, id, n, u, false) })
+		found, err := put(name, false, func(u *Upload) (bool, error) { return s.putExtension(ctx, id, n, u, nil) })
 		if err != nil {
 			return nil, err
 		}
@@ -269,7 +269,7 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		e, _ := vote.ParseExtension(mem.Objects[docPath(id, name)])
 		rep.Extensions, rep.ClosesAt = n, e.ClosesAt
 	}
-	found, err = put("results", true, func(u *Upload) (bool, error) { return s.putResults(ctx, id, u, false) })
+	found, err = put("results", true, func(u *Upload) (bool, error) { return s.putResults(ctx, id, u, nil) })
 	if err != nil {
 		return nil, err
 	}
