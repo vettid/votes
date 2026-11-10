@@ -339,6 +339,12 @@ func checkBody(body []byte) (digest, spki []byte, err error) {
 // naming no anchor key is ErrNotAnchor; one naming one that fails
 // anything else is ErrUnverified. Whether the proof's checkpoint is the
 // run's or consistent with it is the caller's to check (Verified.Proof).
+//
+// With ErrWrongKind the Verified is returned too, without a Digest: the
+// log's part held, but whether its proof's checkpoint is the run's or
+// consistent with it is still the caller's to check, as for any entry.
+// One that isn't is inconsistent, not wrong kind: only then is the
+// finding acknowledgeable.
 func VerifyEntry(ctx context.Context, id string, e *Entry, host string, logs Logs, anchors [][]byte, verifiedAt time.Time) (*Verified, error) {
 	id = strings.ToLower(id)
 	body, err := base64.StdEncoding.DecodeString(e.Body)
@@ -398,13 +404,15 @@ func VerifyEntry(ctx context.Context, id string, e *Entry, host string, logs Log
 		return fail("the proof's root or size isn't its checkpoint's")
 	}
 	// The log's checks hold: the body is what the log holds under this ID.
+	out := &Verified{ID: id, Leaf: leaf, LogIndex: e.LogIndex, ShardIndex: ip.LogIndex, SPKI: spki,
+		Integrated: integrated.UTC(), Proof: cp}
 	digest, keySPKI, err := checkBody(body)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrWrongKind, err)
+		return out, fmt.Errorf("%w: %v", ErrWrongKind, err)
 	}
 	if !bytes.Equal(keySPKI, spki) {
-		return nil, fmt.Errorf("%w: the anchor key isn't the entry's signing key", ErrWrongKind)
+		return out, fmt.Errorf("%w: the anchor key isn't the entry's signing key", ErrWrongKind)
 	}
-	return &Verified{ID: id, Leaf: leaf, LogIndex: e.LogIndex, ShardIndex: ip.LogIndex, Digest: digest, SPKI: spki,
-		Integrated: integrated.UTC(), Proof: cp}, nil
+	out.Digest = digest
+	return out, nil
 }

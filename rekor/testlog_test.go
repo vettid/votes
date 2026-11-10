@@ -112,8 +112,13 @@ func TestWrongKind(t *testing.T) {
 		"other key": append([]byte(`{"x":`+string(mustJSON(t, string(keyPEM)))+`,"y":`), append(body(t, "hashedrekord", "0.0.1", "sha256", dh, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: mustSPKI(t, "another")}), sig), '}')...),
 	} {
 		id, e := l.log(t, b, when)
-		if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, at); !errors.Is(err, ErrWrongKind) || errors.Is(err, ErrUnverified) {
+		v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, at)
+		if !errors.Is(err, ErrWrongKind) || errors.Is(err, ErrUnverified) {
 			t.Errorf("%s: %v", name, err)
+		}
+		// The log's part is returned, for the caller's consistency check.
+		if v == nil || v.Proof == nil || v.Proof.TreeID != "42" || v.Digest != nil || v.Leaf != id[16:] {
+			t.Errorf("%s: %+v", name, v)
 		}
 	}
 	// The same good entry with its signed entry timestamp broken: the
