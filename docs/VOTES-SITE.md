@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.12 (2026-11-10), draft. The protocol this site serves is
+**Status:** 0.2.14 (2026-11-10), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -26,7 +26,7 @@ one: the service's signature and the Rekor anchor catch that.
 | Bucket | Private S3 bucket, versioned, blocking public access. Read only through CloudFront (origin access control). Written only by the upload function, which cannot delete. |
 | CloudFront | `votes.vettid.org`. Serves `/v1/*` from the bucket and `/api/*` from the API. Security headers as vettid.org's sites. No access logs. Behind an AWS WAF web ACL with one rate rule (§4, "Limits"). |
 | Upload API | API Gateway HTTP API → Lambda `votes-api` (Go, arm64). |
-| Service list | `services.json`, kept by VettID's operator (a service is added by the owner, BALLOT-PROTOCOL §3.3), not in this repository. The operator's `votesctl publish-services` signs it with the site's Ed25519 key and writes it to the bucket as `v1/services.json` and `.sig`, refusing a list that doesn't extend the published one, and keeps each version as `v1/services/<version>.json` (§3): the bucket's copies are the record of every list. The function reads it on every upload and checks it under the site's public key whenever its bytes or its signature's differ from the pair it checked last. |
+| Service list | `services.json`, kept by VettID's operator (a service is added by the owner, BALLOT-PROTOCOL §3.3), not in this repository. The operator's `votesctl publish-services` signs it with the site's Ed25519 key and writes it to the bucket as `v1/services.json` and `.sig`, refusing a list that doesn't extend the published one (BALLOT-PROTOCOL §3.3, retired keys included: §4 "Retired anchor keys"), and keeps each version as `v1/services/<version>.json` (§3): the bucket's copies are the record of every list. The function reads it on every upload and checks it under the site's public key whenever its bytes or its signature's differ from the pair it checked last. |
 | Stack | CDK (TypeScript), `VotesSite-staging` and `VotesSite-prod`, as member-service. |
 
 **(chosen; not in the spec:** Lambda rather than an ECS service, because
@@ -84,7 +84,9 @@ credential: the service's signature is the authentication.
    (`sigstore-go`) against the trusted root of the stack's Sigstore
    instance (staging or production): the ECDSA signature over the
    document under one of the service's listed anchor keys, the Rekor
-   entry and its inclusion proof, and one RFC 3161 timestamp. **The
+   entry and its inclusion proof, and one RFC 3161 timestamp, before
+   that key's `retired_at` if it has one (`retired_anchor_key`; §4
+   "Retired anchor keys"). **The
    trusted root** is fetched through the instance's TUF repository when
    the function starts, and again at most once every 24 hours; a fetch
    that fails, or takes over 5 seconds, keeps the root in use. Both
@@ -161,6 +163,29 @@ retries a `429` and takes a `403` as final) until its rate falls below
 the limit. Everything else is allowed. The
 ACL keeps CloudWatch metrics only: request sampling is off, so it keeps
 no source addresses (§5).
+
+**Retired anchor keys** (0.2.14; BALLOT-PROTOCOL 0.14.0 §3.3; key
+protection, phase 1, GC #7406 §8):
+- **The member:** an `anchor_keys[]` entry may carry `retired_at` (Unix
+  seconds). The site's service-list parser and `votesctl` take it; one
+  without it is as before.
+- **Upload check:** a document whose bundle's RFC 3161 time is at or
+  after its anchor key's `retired_at` is refused, `422
+  retired_anchor_key`.
+- **The chain check** (the function's, `votesctl publish-services`' and
+  `votesctl check`'s): a new version chains only if, besides the existing
+  rules, every `retired_at` of the version before is kept with the same
+  value, none is added to an entry that had one, a key is retired only
+  while the same service lists another anchor key without one, and no
+  `retired_at` is earlier than the RFC 3161 time of a bundle the site
+  holds under that key (forward only: retiring cancels nothing already
+  published).
+- **`votesctl publish-services`** sets or adds a `retired_at` only with
+  `-retire <key>` naming each key it retires, and refuses a list that
+  retires a key without it.
+- **When:** the operator publishes a list with `retired_at` only once the
+  oldest vault release the site's members run reads it: an older vault
+  can't take such a list and keeps its last one.
 
 ## 5. What the site keeps about readers
 
@@ -634,6 +659,12 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 
 ## Changes
 
+- **0.2.14 (2026-11-10), draft:** §4: retired anchor keys
+  (`retired_at` on an `anchor_keys[]` entry): an upload anchored at or
+  after it is refused (`retired_anchor_key`); the chain check keeps it set
+  once, only while another anchor key of the service is live, and never
+  earlier than a bundle the site holds; `publish-services -retire`. Key
+  protection, phase 1 (GC #7406, the owner's (a) of #7385).
 - **0.2.12 (2026-11-10):** `votesctl check -all -rekor` (§7)
   reads Rekor v1 through an allowlist of four endpoints (never one that
   adds to the log), and the site by `GET` and `HEAD` only. It searches
