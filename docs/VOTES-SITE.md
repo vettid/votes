@@ -189,6 +189,13 @@ the rules; key protection, phase 1, GC #7406 §8):
   included. `votesctl check` reports a bundle at or after its key's
   `retired_at` as a failure of that document (`retired_anchor_key`), not
   as a broken chain, so the run goes on (`site/chain.go`).
+- **The reader's bounds** (BALLOT-PROTOCOL §3.3, the owner's (a) of
+  #7485): `votesctl check` doesn't take a version that newly sets a
+  `retired_at` more than 300 s earlier than when it last took the version
+  before (a mismatch, `retired_backdated`; with no time of its own for
+  that version, as on a first run, it skips this bound), and doesn't
+  take yet one more than 600 s after its clock (a warning, and the run
+  checks against the version before). `publish-services` refuses both.
 - **`votesctl publish-services -retire <key>`** (repeatable) is the only
   way to set one: it sets `retired_at` from its own clock at publish
   time, in whole seconds, never from the input, and refuses an input list
@@ -683,7 +690,8 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   upload check (`retired_anchor_key`; the function has no chain check),
   `votesctl`'s chain check with the two chain rules, forward only as the
   site's own condition, `publish-services -retire` setting the value from
-  its clock, the rollout order, and the Rekor check's rule for when it
+  its clock, the reader's bounds (backdated by over 300 s, or over 600 s
+  ahead), the rollout order, and the Rekor check's rule for when it
   returns. Times are RFC 3161 `genTime` in whole seconds. The status
   line names BALLOT-PROTOCOL 0.14.0. Key protection, phase 1 (GC #7406,
   the owner's (a) of #7385).
