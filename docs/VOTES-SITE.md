@@ -418,45 +418,102 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   signed entry timestamp, inclusion proof and index mapping) but is
   anything else (another kind or version, a `sha384` or `sha512`
   digest, a signature that doesn't verify) is told by whether the
-  anchor key **signed** something in it (0.2.13, the owner's (a) of
-  2026-11-10, #7136, and (a) of #7216): only the private key can make a
-  signature that verifies, so nothing else can raise a standing alarm.
-  The check verifies, with maintained libraries, every signature it can
-  read from the entry alone, under each anchor key (ECDSA P-256):
-  - a `hashedrekord` 0.0.1's signature over its digest (whatever the
-    algorithm: a `sha384` or `sha512` digest, or a `sha256` one with
-    another key named);
-  - a `tuf` 0.0.1's signatures, of the root and of the metadata, each
-    over the canonical JSON (`cjson`, go-securesystemslib) of its signed
-    part, whatever key ID it names;
-  - every X.509 certificate in the entry (a PEM `CERTIFICATE` anywhere
-    in it, also inside base64), its signature over its to-be-signed part
-    (`crypto/x509`): a certificate the anchor key issued.
+  anchor key **signed** something in it, and whether that signature is
+  new (0.2.13, the owner's (a) of #7136, of #7216 and of #7256).
 
-  Then:
-  - **signed:** one of them verifies under an anchor key: a mismatch,
-    `rekor: wrong kind`, whatever its digest, stored with its entry and
-    repeated every run until acknowledged.
-  - **mentions:** none verifies, and the entry is a `hashedrekord` 0.0.1
-    or a `tuf` 0.0.1 the check reads whole: the anchor key is only written
-    in it (anyone may write a public key into an entry of their own): a
-    warning, `rekor: mentions an anchor key`, with the entry's ID, log
-    index and kind, counted in the report (`rekor.mentions`) and named in
-    the alert whenever one goes out, at most 20 with the count of the
-    rest. It is never stored and never an `index gap`.
-  - **can't verify:** any other kind or version, or a body that doesn't
-    read as its kind: whether the anchor key signed it can't be told from
-    the entry (its signature is over data the log doesn't hold: a
-    `rekord`'s artifact, a `dsse` or `intoto` payload, a package), so it
-    is a mismatch, `rekor: unverifiable`, in the run that finds it, and
-    not again: its entry ID is added to the verified store's `alerted`
-    list (IDs only, no entry), and an entry on that list is skipped. It
-    can't be acknowledged; the alert is the record.
+  **Signatures read.** The check verifies, with maintained libraries,
+  each signature it can read from the entry alone, under each anchor key
+  (ECDSA P-256, over SHA-256 only):
+  - a `hashedrekord` 0.0.1's, and a `rekord` 0.0.1's with an `x509` key,
+    over its `sha256` data hash (Rekor's x509 verifier checks the
+    signature over the SHA-256 of the data, which is that hash). Its key
+    is read as Rekor reads it: a bare `PUBLIC KEY`, one `CERTIFICATE`, or
+    a chain of up to 10; the signature is verified under the anchor key
+    whatever key the entry names, so a `hashedrekord` whose anchor key
+    sits inside a certificate takes the same path as a bare one (and is
+    never an `index gap`). Rekor's algorithm registry refuses P-256 with
+    `sha384` or `sha512`, so a longer digest whose first 32 bytes are a
+    signed one can't be logged under it; the check relies on that
+    registry, and an anchor-key entry of another algorithm is
+    `unverifiable`.
+  - a `tuf` 0.0.1's signatures, of the root and of the metadata, as
+    go-tuf v0.7.0's `EcdsaVerifier` checks them: ECDSA over the SHA-256
+    of the canonical JSON (`cjson`, go-securesystemslib) of the signed
+    part, the signature hex-decoded, whatever key ID it names.
+  - every X.509 certificate in the entry, its signature over its
+    to-be-signed part (`crypto/x509`, `ECDSAWithSHA256` only; another
+    algorithm doesn't verify): a PEM `CERTIFICATE`, or a
+    certificate of a PKCS #7 `SignedData` in DER (a `jar`'s signature, an
+    `rfc3161` token; `github.com/digitorus/pkcs7`). One that verifies is
+    a certificate the anchor key issued.
 
-  A mention, or an unverifiable entry, can come only from staging's scan
-  or from a search by a key a kind indexes (`rekord`, `alpine`, `cose`).
-  One that fails any of the log's checks is `rekor: unverified`: the
-  answer can't be trusted to be the log's.
+  The scan walks every JSON string, as PEM and as base64, and base64 of
+  JSON in turn (a `tuf` root's keys are PEM inside JSON inside base64),
+  at most 3 deep. A signature is decoded as ASN.1 DER (`encoding/asn1`),
+  as Rekor stores it, or as IEEE P1363 (64 bytes), which sigstore's
+  verifier also accepts; any other encoding doesn't verify.
+
+  **Replays.** Every anchor signature is public (each `.sigstore.json`
+  bundle holds one), and a copy of it verifies too: re-encoded as (`r`,
+  N−`s`) (Go has no low-S rule) or as P1363, under a certificate wrapping
+  the anchor key, or under a key recovered from it with the anchor key
+  an unused certificate beside it. Every copy keeps its `r`. So a
+  signature is identified by its anchor key, the digest it signs and its
+  `r`. Of the signatures the check holds with one identity (every
+  published bundle's `messageSignature`, at its entry's global log
+  index, or before every entry if it has none; every stored entry's;
+  every one the run finds), the one at the lowest log index is the use,
+  and each other is a **replay**: the warning `rekor: replayed
+  signature`, with the entry's ID, log index and kind, counted
+  (`rekor.replays`) and named in the alert, at most 20 with the count of
+  the rest; never stored, never an `index gap`. (Low-S normalisation
+  alone wouldn't do: the recovered key's chain keeps only `r`.)
+
+  **Then,** an entry naming an anchor key is:
+  - **an anchor entry:** a `hashedrekord` whose signature over its
+    `sha256` digest is a use: told by its digest (**Digests**, below).
+  - **wrong kind:** one with another use (a `rekord`'s, a `tuf`
+    signature, a certificate's): a mismatch, `rekor: wrong kind`,
+    whatever its digest, stored with its entry and repeated every run
+    until acknowledged.
+  - **a mention:** a `hashedrekord`, a `rekord` with an `x509` key or a
+    `tuf` 0.0.1, read whole, with no use and no replay: the anchor key is
+    only written in it (anyone may write a public key into an entry of
+    their own): the warning `rekor: mentions an anchor key`, with the
+    entry's ID, log index and kind, counted (`rekor.mentions`) and named
+    in the alert, at most 20 with the count of the rest; never stored,
+    never an `index gap`.
+  - **unverifiable:** readable JSON with a `kind` and `apiVersion`,
+    naming an anchor key, that the check can't read as one of those
+    (another kind or version, a `rekord` with another key format,
+    another digest algorithm, a body that doesn't read as its kind):
+    whether the anchor key signed it is not verified by this check (the
+    signature is over data the log doesn't hold, such as a `dsse` or
+    `intoto` payload or a package, or, for `rfc3161`, over data the log
+    holds that this check doesn't verify). It is a mismatch, `rekor:
+    unverifiable`, in the run that finds it, and not again: its entry ID
+    is added to the verified store's `alerted` list (IDs only), and an
+    entry on that list is skipped. Above 20 in a run, the alarm names 20
+    and counts the rest, all added to `alerted`. It can't be
+    acknowledged; the alert is the record.
+  - **not the check's:** a body that isn't JSON, or has no `kind` and
+    `apiVersion`, is counted in `rekor.unparsed` (a warning); JSON
+    naming no anchor key (as PEM or DER anywhere) is skipped.
+
+  **What the anchor keys sign:** in service-vault, only through
+  `anchor.Anchorer.Anchor`, which `publish` calls for each document it
+  publishes (`internal/publish/publish.go`): ECDSA (ASN.1) over the
+  SHA-256 of the document, logged as a `hashedrekord` 0.0.1. Nothing else
+  public: a signature over anything else is an `unknown digest`, stored,
+  as it should be; one from a publish that didn't finish is a partial
+  upload (above).
+
+  A mention, a replay or an unverifiable entry comes from staging's scan,
+  or from a search by a key a kind indexes (a replay re-encoded in a
+  `hashedrekord` under the bare key is found by production's search,
+  and is a warning there each run). One that fails any of the log's
+  checks is `rekor: unverified`: the answer can't be trusted to be the
+  log's.
 - **Digests:** a verified entry's digest is the `sha256` of a document's
   bytes, never of its `.sig`. Those known are the run's: each proposal's,
   extension's and results' `hashes`, the documents a partial upload's
@@ -493,17 +550,18 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   (`rekor.unparsed`), and the alert names the count whenever the run
   alerts. An anchor
   key's entry the search didn't return, though integrated more than
-  `ListingGrace` before the search began, is a mismatch, `rekor: index
-  gap` **(the owner's (a) of 2026-11-05: an alarm, not a warning)**: the
+  `ListingGrace` before the search began, if a search by its key can
+  return it (**Index gap, beyond the canary**, 0.2.13), is a mismatch,
+  `rekor: index gap` **(the owner's (a) of 2026-11-05: an alarm, not a warning)**: the
   search is production's only check, so a sign that it misses entries
   has to reach someone. Production gains millions of entries a day and
   is never scanned.
-- **Rekor unavailable:** a run in which a request gets no answer (**Two
-  kinds of failure**) has `rekor.error` and adds one to `failures` in the
-  state (one for the run, however many requests), which a run that gets
-  every answer it asked for resets, whether or not those answers verify
-  (one that doesn't is its own mismatch); a run cut short by the cap or
-  the time limit (`incomplete`) neither adds nor resets. Below 3 it is neither a failed
+- **Rekor unavailable:** `failures` in the state follows one rule
+  (0.2.13): one more after a run in which a request got no answer
+  (**Two kinds of failure**; `rekor.error`), however many; reset to 0
+  after a run in which every request got its answer, whether or not the
+  answers verified (one that didn't is its own mismatch); unchanged after
+  a run cut short by the cap or the time limit (`incomplete`). Below 3 it is neither a failed
   check nor a mismatch: the run exits `0` if the rest held, and puts the
   heartbeat. At 3 consecutive runs it is a mismatch, `rekor: search
   unavailable` **(the owner's (a) of 2026-11-05: 3, as the heartbeat
@@ -530,17 +588,19 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   SHA-256 of the key's canonical PEM (`hashedrekord`, `rekord`, `alpine`
   and `cose` in rekor v1.5.3: `pkg/api/index.go`'s lookup by key, and
   each kind's `IndexKeys`), with that key the anchor key alone, as a PEM
-  `PUBLIC KEY`. Of the entries stored (an anchor entry, a `wrong kind`)
-  that is a `hashedrekord` signed by the anchor key named bare. Such an
+  `PUBLIC KEY`. Of the entries stored (an anchor entry, a `wrong kind`),
+  that is a `hashedrekord`, or a `rekord`, signed by the anchor key named
+  bare; of the four kinds other than `hashedrekord`, only a `rekord` can
+  be stored. Such an
   entry, stored or scanned, that its key's search didn't return,
   integrated more than `ListingGrace` before the search began, is
   `rekor: index gap`. Other kinds (`dsse` and `intoto` index the key as
   `"sha256:"` and its hash; `tuf`, `jar`, `helm`, `rpm` and `rfc3161` not
-  under a bare PEM key), a key inside a certificate, a mention and an
-  unverifiable entry never give one. A key whose search got no answer gives no
-  index gap that run, for the canary or anything else (`failures` counts
-  the run), and neither does one cut short by the cap or the time limit
-  (`incomplete`).
+  under a bare PEM key), a key inside a certificate, a mention, a replay
+  and an unverifiable entry never give one. A key whose search got no
+  answer gives no index gap that run, for the canary or anything else
+  (the run's `failures` rule applies), and neither does one cut short by
+  the cap or the time limit (`incomplete`).
 - **The verified store:** each verified entry is kept by its 80-hex
   entry ID (matched on the last 64) with its whole answer (body,
   integrated time, log ID, log indexes, signed entry timestamp and
@@ -561,8 +621,11 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   proved again, and so is every stored entry after a run that bootstraps
   or resets the pin, which move the pin without a proof: that run sets
   the store's `reprove`, and only a run that proves every stored entry
-  clears it, so a run cut short leaves it set. The store is `{"v": 1,
-  "entries": {...}, "reprove": bool, "alerted": [IDs]}`. It is `-rekor-verified <file>`, between
+  clears it, so a run cut short leaves it set. The store is `{"v": 2,
+  "entries": {...}, "reprove": bool, "alerted": [IDs]}`. **Migration:** a
+  store of 0.2.12's shape (`"v": 1`) doesn't parse, so the first 0.2.13
+  run on staging needs `rekor_reset_store`; a reset also drops `alerted`,
+  so each unverifiable entry alerts once more. It is `-rekor-verified <file>`, between
   runs the S3 object `rekor-verified.json` in the monitor's bucket,
   `vettid-votes-<env>-monitor`, which the stack adds (private,
   versioned, its noncurrent versions kept 90 days, blocking public
@@ -615,10 +678,11 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   so a store reset after an acceptance rewinds within the new shard, and
   the old shard's entries only the scan found (one the search can't
   return) aren't found again. When the log can't be read or verified at
-  all, a recorded state is written back with only `failures` changed
-  (one more for the run, however many requests got no answer); an empty,
-  sentinel or unparseable state is written back byte for byte, and is
-  `rekor: no state` whether or not the log answers. Between runs it is the SSM parameter
+  all, a recorded state is written back with only `failures` changed, by
+  the one rule (**Rekor unavailable**): one more if a request got no
+  answer, reset if every answer arrived; an empty, sentinel or
+  unparseable state is written back byte for byte, and is `rekor: no
+  state` whether or not the log answers. Between runs it is the SSM parameter
   `/vettid/votes/<env>/monitor/rekor-state` (standard, well under its
   4 KB). SSM holds no empty value, so the stack creates it holding the
   sentinel `{"v":1,"bootstrap":true}`, and only if it is absent: a
@@ -707,11 +771,18 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
     in an entry in another encoding (OpenPGP, SSH, JWK) isn't recognised
     at all (0.2.13).
   - that a real anchor-key signature in a kind the check can't verify
-    from the entry alone (a `rekord`, `dsse`, `intoto`, `cose`, `jar`,
-    `helm`, `rpm`, `alpine` or `rfc3161` entry) raises more than one
-    alarm: `rekor: unverifiable` comes once, in the run that finds it
-    (0.2.13, the owner's (a) of #7216). An SSH certificate's CA key
-    isn't verified either.
+    from the entry alone (a `dsse`, `intoto`, `cose`, `jar`, `helm`,
+    `rpm`, `alpine` or `rfc3161` entry, or a `rekord` with another key
+    format) raises more than one alarm: `rekor: unverifiable` comes once,
+    in the run that finds it (0.2.13, the owner's (a) of #7216). An SSH
+    certificate's CA key isn't verified, nor an `rfc3161` token's own
+    signature.
+  - that a replay is use: a copy of a published anchor signature is the
+    warning `replayed signature`, not an alarm (0.2.13).
+  - that `unverifiable` stays quiet while someone keeps logging entries
+    that name an anchor key (an unused certificate in a chain, say): each
+    alerts once, so on staging such a stream gives one alarm a run, with
+    at most 20 named and the rest counted.
   - that the log shows others the tree it shows this monitor (a split
     view: v1 has no witnesses, and comparing checkpoints from a second
     vantage point is future work);
@@ -725,21 +796,22 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 ## Changes
 
 - **0.2.13 (2026-11-10), draft:** the Rekor check (§7): an anchor key's
-  entry of another kind is `wrong kind` only when a signature in it
-  verifies under the anchor key (a `hashedrekord`'s, a `tuf` root's or
-  metadata's, any certificate's), stored and repeated; one where none
-  does, of a kind read whole (`hashedrekord`, `tuf`), only mentions the
-  key: a warning, counted and named (at most 20) in the alert; any other
-  is `unverifiable`, an alarm once, its ID kept so it isn't raised again
-  (the owner's (a) of #7136 and of #7216). Every stored entry is verified
-  and reported on every run; a stored or scanned entry a search by its
-  key can return and didn't is `index gap`, and a key whose search got
-  no answer, or was cut short, gives none. A stored entry is re-proved
-  off the state's chain, and after a bootstrap or a pin reset until a
-  run proves them all (the store's `reprove`). The state gains
-  `scan_from`, which `rekor_reset_store` rewinds the scan to; a staging
-  state without the scan members doesn't parse; a run that can't read
-  the log changes only `failures`, counted per run.
+  entry is told by whether a signature in it verifies under the anchor
+  key (P-256, SHA-256: a `hashedrekord`'s or an x509 `rekord`'s over its
+  hash, a `tuf` root's or metadata's, any certificate's, PEM or PKCS #7)
+  and whether that signature is new: a copy (the same key, digest and
+  `r` as one already held at a lower log index) is the warning `replayed
+  signature`; a `hashedrekord` use is told by its digest; another use is
+  `wrong kind`, stored and repeated; a kind read whole with none only
+  mentions the key, a warning; any other is `unverifiable`, an alarm once
+  (its ID kept), at most 20 named a run (the owner's (a) of #7136, #7216
+  and #7256). Every stored entry is verified and reported on every run;
+  a stored or scanned entry a search by its key can return and didn't is
+  `index gap`. A stored entry is re-proved off the state's chain, and
+  after a bootstrap or a pin reset until a run proves them all
+  (`reprove`). The store is `v` 2 (a reset to migrate); the state gains
+  `scan_from`; a staging state without the scan members doesn't parse;
+  `failures` has one rule, per run.
 - **0.2.12 (2026-11-10):** `votesctl check -all -rekor` (§7)
   reads Rekor v1 through an allowlist of four endpoints (never one that
   adds to the log), and the site by `GET` and `HEAD` only. It searches
