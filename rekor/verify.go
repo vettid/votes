@@ -222,11 +222,12 @@ func keyOf(pemBytes []byte) ([]byte, crypto.PublicKey, error) {
 
 // AnchorOf returns which anchor key (an SPKI in anchors) an entry's body
 // names anywhere, of any kind (a hashedrekord's key, a DSSE or in-toto
-// envelope's verifiers), as a PEM public key or certificate, raw or in
-// base64, compared by SPKI whatever its PEM form; or nil. It is the
-// scan's filter, before the entry is verified: an entry it finds is then
-// verified, and fails as ErrUnverified unless it is a hashedrekord 0.0.1
-// signed by that key.
+// envelope's verifiers): as a PEM public key or certificate, raw or in
+// base64, compared by SPKI whatever its PEM form, or as the SPKI's DER
+// bytes in base64; or nil. VerifyEntry uses it after the log's checks, so
+// that an anchor key's entry of another kind is ErrWrongKind. Other
+// encodings of a key (SSH, OpenPGP, JWK) aren't recognised (VOTES-SITE
+// §7, "Not guaranteed").
 func AnchorOf(e *Entry, anchors [][]byte) []byte {
 	body, err := base64.StdEncoding.DecodeString(e.Body)
 	if err != nil {
@@ -256,6 +257,11 @@ func AnchorOf(e *Entry, anchors [][]byte) []byte {
 			if found == nil {
 				if d, err := base64.StdEncoding.DecodeString(x); err == nil {
 					found = anchorIn(d, anchors)
+					for _, a := range anchors {
+						if found == nil && bytes.Equal(d, a) {
+							found = a
+						}
+					}
 				}
 			}
 		}
@@ -335,15 +341,22 @@ func checkBody(body []byte) (digest, spki []byte, err error) {
 // key's.
 var ErrUnparsed = errors.New("rekor: the entry's body doesn't parse")
 
-// Place says where an entry is checked: Offset, the sizes of the shards
-// before the proof's (LogInfo.InactiveShards), so that the global log
-// index is the shard's plus Offset; and CheckpointAt, the time the proof's
-// checkpoint key must be valid at: the run's for the active shard, or
-// zero for an inactive shard's, whose key is checked at the entry's
-// integrated time.
+// Place says where an entry is checked:
+//   - TreeID, the shard its proof's checkpoint must be of;
+//   - Offset, the sizes of the shards before it, from their verified
+//     final checkpoints (never the unsigned sizes in LogInfo), so that the
+//     global log index is the shard's plus Offset;
+//   - for the active shard, CheckpointAt, the run's time, which the
+//     checkpoint's key must be valid at; for an inactive shard, Inactive,
+//     and the key is checked at the entry's integrated time.
+//
+// A Place without a TreeID, or for the active shard without a
+// CheckpointAt, verifies nothing.
 type Place struct {
+	TreeID       string
 	Offset       int64
 	CheckpointAt time.Time
+	Inactive     bool
 }
 
 // VerifyEntry verifies an entry Rekor returned under id (VOTES-SITE §7,
@@ -361,7 +374,10 @@ type Place struct {
 // Then the body: one that doesn't parse is ErrUnparsed; one naming no
 // anchor key ErrNotAnchor; one naming one that isn't a hashedrekord 0.0.1
 // over a sha256 digest signed by that key ErrWrongKind. With each of these
-// the Verified is returned too, without a Digest.
+// the Verified is returned too, without a Digest. ErrUnparsed and
+// ErrNotAnchor let the scan skip an entry that isn't ours; for an entry
+// the check asked for by ID (the search's, an acknowledged one), they are
+// a mismatch, never a skip.
 //
 // Whether the proof's checkpoint is the run's or consistent with it is
 // the caller's to check (Verified.Proof), for every entry: one that isn't
@@ -415,12 +431,20 @@ func VerifyEntry(ctx context.Context, id string, e *Entry, host string, logs Log
 		return fail("%v", err)
 	}
 	cpAt := pl.CheckpointAt
-	if cpAt.IsZero() {
+	switch {
+	case pl.TreeID == "":
+		return fail("no tree ID to check the entry's checkpoint against")
+	case pl.Inactive:
 		cpAt = integrated
+	case cpAt.IsZero():
+		return fail("no time to check the active shard's checkpoint key at")
 	}
 	cp, err := VerifyCheckpoint(ip.Checkpoint, host, logs, cpAt)
 	if err != nil {
 		return fail("%v", err)
+	}
+	if cp.TreeID != pl.TreeID {
+		return fail("the entry's checkpoint is of tree %s, not %s", cp.TreeID, pl.TreeID)
 	}
 	if root, err := hex.DecodeString(ip.RootHash); err != nil || !bytes.Equal(root, cp.Root) || int64(cp.Size) != ip.TreeSize {
 		return fail("the proof's root or size isn't its checkpoint's")

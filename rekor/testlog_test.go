@@ -112,7 +112,7 @@ func TestWrongKind(t *testing.T) {
 	when := at.Add(-time.Hour)
 
 	id, e := l.log(t, body(t, "hashedrekord", "0.0.1", "sha256", dh, keyPEM, sig), when)
-	v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{CheckpointAt: at}, at)
+	v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{TreeID: "42", CheckpointAt: at}, at)
 	if err != nil || hex.EncodeToString(v.Digest) != dh || v.Proof.TreeID != "42" {
 		t.Fatalf("a good entry: %+v %v", v, err)
 	}
@@ -127,7 +127,7 @@ func TestWrongKind(t *testing.T) {
 		"other key": append([]byte(`{"x":`+string(mustJSON(t, string(keyPEM)))+`,"y":`), append(body(t, "hashedrekord", "0.0.1", "sha256", dh, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: mustSPKI(t, "another")}), sig), '}')...),
 	} {
 		id, e := l.log(t, b, when)
-		v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{CheckpointAt: at}, at)
+		v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{TreeID: "42", CheckpointAt: at}, at)
 		if !errors.Is(err, ErrWrongKind) || errors.Is(err, ErrUnverified) {
 			t.Errorf("%s: %v", name, err)
 		}
@@ -140,7 +140,7 @@ func TestWrongKind(t *testing.T) {
 	// log's checks fail, so unverified, whatever its body.
 	id, e = l.log(t, dsse, when)
 	e.Verification.SignedEntryTimestamp[10] ^= 1
-	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{CheckpointAt: at}, at); !errors.Is(err, ErrUnverified) {
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{TreeID: "42", CheckpointAt: at}, at); !errors.Is(err, ErrUnverified) {
 		t.Errorf("broken SET: %v", err)
 	}
 }
@@ -171,7 +171,7 @@ func TestLogChecksFirst(t *testing.T) {
 	l := newTestLog(t)
 	anchor := mustSPKI(t, "votes anchor key")
 	when := at.Add(-time.Hour)
-	pl := Place{CheckpointAt: at}
+	pl := Place{TreeID: "42", CheckpointAt: at}
 	id, e := l.log(t, []byte("not json"), when)
 	if v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{anchor}, pl, at); !errors.Is(err, ErrUnparsed) || v == nil {
 		t.Errorf("unparsed: %v", err)
@@ -181,16 +181,16 @@ func TestLogChecksFirst(t *testing.T) {
 	if v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{anchor}, pl, at); !errors.Is(err, ErrNotAnchor) || v == nil {
 		t.Errorf("not an anchor's: %v", err)
 	}
-	// A body substituted under an ID: unverified, not "not ours".
-	e.Body = base64.StdEncoding.EncodeToString([]byte(`{"kind":"x"}`))
-	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{anchor}, pl, at); !errors.Is(err, ErrUnverified) || errors.Is(err, ErrNotAnchor) {
-		t.Errorf("substituted body: %v", err)
-	}
-	// IDs: only 80 hex digits.
+	// IDs: only 80 hex digits, on an entry that is otherwise good.
 	for _, bad := range []string{id[16:], "00000000" + id[16:], id + "00"} {
 		if _, err := VerifyEntry(ctx, bad, e, host, l.logs, [][]byte{anchor}, pl, at); !errors.Is(err, ErrUnverified) {
 			t.Errorf("id of %d: %v", len(bad), err)
 		}
+	}
+	// A body substituted under an ID: unverified, not "not ours".
+	e.Body = base64.StdEncoding.EncodeToString([]byte(`{"kind":"x"}`))
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{anchor}, pl, at); !errors.Is(err, ErrUnverified) || errors.Is(err, ErrNotAnchor) {
+		t.Errorf("substituted body: %v", err)
 	}
 }
 
@@ -205,7 +205,7 @@ func TestProofSize(t *testing.T) {
 	digest := sha256.Sum256([]byte("a proposal"))
 	sig, _ := ecdsa.SignASN1(rand.Reader, anchor, digest[:])
 	b := body(t, "hashedrekord", "0.0.1", "sha256", hex.EncodeToString(digest[:]), pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: aspki}), sig)
-	pl := Place{CheckpointAt: at}
+	pl := Place{TreeID: "42", CheckpointAt: at}
 	id, e := l.logIn(t, b, at.Add(-time.Hour), 4, 4)
 	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, pl, at); err != nil {
 		t.Fatalf("size 4: %v", err)
@@ -216,7 +216,7 @@ func TestProofSize(t *testing.T) {
 	}
 	// The index mapping: the global index is the shard's plus the offset.
 	id, e = l.log(t, b, at.Add(-time.Hour))
-	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{Offset: 1, CheckpointAt: at}, at); !errors.Is(err, ErrUnverified) {
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{TreeID: "42", Offset: 1, CheckpointAt: at}, at); !errors.Is(err, ErrUnverified) {
 		t.Errorf("another offset: %v", err)
 	}
 }
@@ -236,11 +236,22 @@ func TestCheckpointKeyTime(t *testing.T) {
 	digest := sha256.Sum256([]byte("a proposal"))
 	sig, _ := ecdsa.SignASN1(rand.Reader, anchor, digest[:])
 	id, e := l.log(t, body(t, "hashedrekord", "0.0.1", "sha256", hex.EncodeToString(digest[:]), pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: aspki}), sig), when)
-	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{CheckpointAt: at}, at); !errors.Is(err, ErrUnverified) {
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{TreeID: "42", CheckpointAt: at}, at); !errors.Is(err, ErrUnverified) {
 		t.Errorf("active shard, key ended before the run: %v", err)
 	}
-	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{}, at); err != nil {
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{TreeID: "42", Inactive: true}, at); err != nil {
 		t.Errorf("inactive shard, key valid at the entry: %v", err)
+	}
+	// A Place that says too little verifies nothing; another tree is refused.
+	for name, pl := range map[string]Place{
+		"zero":            {},
+		"no tree ID":      {CheckpointAt: at},
+		"active, no time": {TreeID: "42"},
+		"another tree":    {TreeID: "43", Inactive: true},
+	} {
+		if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, pl, at); !errors.Is(err, ErrUnverified) {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }
 
@@ -256,7 +267,7 @@ func TestSigningKeyIsAnchor(t *testing.T) {
 	sig, _ := ecdsa.SignASN1(rand.Reader, other, digest[:])
 	two := append(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: ospki}), pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: aspki})...)
 	id, e := l.log(t, body(t, "hashedrekord", "0.0.1", "sha256", hex.EncodeToString(digest[:]), two, sig), at.Add(-time.Hour))
-	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{CheckpointAt: at}, at); !errors.Is(err, ErrWrongKind) {
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{TreeID: "42", CheckpointAt: at}, at); !errors.Is(err, ErrWrongKind) {
 		t.Errorf("signed by another key: %v", err)
 	}
 }
