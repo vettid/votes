@@ -428,15 +428,21 @@ func TestCheckPinRound2(t *testing.T) {
 	}
 	// Acceptance asks the old tree for its proof, and says it accepted.
 	treeP := &fakeProver{proofs: p.proofs, tree: a.TreeID}
-	r, err := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: &other, Inactive: map[string]*Checkpoint{a.TreeID: b}, Prover: treeP, Admin: Admin{AcceptShard: other.TreeID}})
+	scanned := stateAt(a).State
+	scanned.ScanAt(a.TreeID, 7)
+	r, err := CheckPin(ctx, PinInput{Loaded: ParseState(scanned.Encode()), Current: &other, Inactive: map[string]*Checkpoint{a.TreeID: b}, Prover: treeP, Admin: Admin{AcceptShard: other.TreeID}})
 	if err != nil || !r.Accepted || treeP.asked != 1 {
 		t.Errorf("accept: %+v %v, %d asked", r, err, treeP.asked)
 	}
+	// The scan still names the old tree (its tail is read first).
+	if r != nil && (r.Next.ScanTreeID != a.TreeID || *r.Next.ScannedTo != 7 || r.Next.TreeID != other.TreeID) {
+		t.Errorf("after acceptance, the scan: %+v", r.Next)
+	}
 	// Counts are unchanged on an inconsistent run.
 	counted := stateAt(b).State
-	counted.Failures = 2
+	counted.Failures, counted.StaleRuns = 2, 1
 	counted.ScanAt(b.TreeID, 9)
-	if r, _ := CheckPin(ctx, PinInput{Loaded: ParseState(counted.Encode()), Current: a, Prover: p}); r.Next.Failures != 2 || *r.Next.ScannedTo != 9 {
+	if r, _ := CheckPin(ctx, PinInput{Loaded: ParseState(counted.Encode()), Current: a, Prover: p}); r.Next.Failures != 2 || *r.Next.ScannedTo != 9 || r.Next.StaleRuns != 1 {
 		t.Errorf("counts on an inconsistent run: %+v", r.Next)
 	}
 	// A reset to a smaller tree clamps the scan to it.
@@ -448,9 +454,10 @@ func TestCheckPinRound2(t *testing.T) {
 	// Strictness: negative counts, the scan pair half empty.
 	ok := stateAt(a).State
 	for name, raw := range map[string]string{
-		"negative failures": strings.Replace(string(ok.Encode()), `"failures":0`, `"failures":-1`, 1),
-		"negative stale":    strings.Replace(string(ok.Encode()), `"stale_runs":0`, `"stale_runs":-1`, 1),
-		"empty scan tree":   string(ok.Encode())[:len(ok.Encode())-1] + `,"scan_tree_id":"","scanned_to":5}`,
+		"negative failures":      strings.Replace(string(ok.Encode()), `"failures":0`, `"failures":-1`, 1),
+		"negative stale":         strings.Replace(string(ok.Encode()), `"stale_runs":0`, `"stale_runs":-1`, 1),
+		"empty scan tree":        string(ok.Encode())[:len(ok.Encode())-1] + `,"scan_tree_id":"","scanned_to":5}`,
+		"scan tree not a number": string(ok.Encode())[:len(ok.Encode())-1] + `,"scan_tree_id":"abc","scanned_to":5}`,
 	} {
 		if ParseState([]byte(raw)).Kind != StateUnparsed {
 			t.Errorf("%s accepted", name)
@@ -460,6 +467,13 @@ func TestCheckPinRound2(t *testing.T) {
 	bad := ParseState([]byte("{"))
 	if _, err := CheckPin(ctx, PinInput{Loaded: bad, Current: b, Prover: p, Admin: Admin{Bootstrap: true, BootstrapReplaces: strings.ToUpper(bad.SHA256)}}); err != nil {
 		t.Errorf("upper-case hash: %v", err)
+	}
+	// A reset after a proof that was stopped (the run's end, the cap) is
+	// refused: the pin wasn't failed, only not asked.
+	for _, stop := range []error{context.Canceled, ErrCap} {
+		if _, err := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{err: stop}, Admin: Admin{ResetPin: formatPin(stateAt(a).State)}}); !errors.Is(err, ErrAdminRefused) {
+			t.Errorf("reset after %v: %v", stop, err)
+		}
 	}
 	// Failures: a run both unavailable and incomplete adds one (an answer
 	// was missing).

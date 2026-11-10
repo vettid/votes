@@ -296,9 +296,9 @@ type PinResult struct {
 	// ShardChanged: a tree ID other than the recorded one, not accepted:
 	// the run withholds the scan, and still searches and verifies entries.
 	ShardChanged bool
-	// Unavailable is a proof request that got no answer (ErrUnavailable,
-	// or another error from the request): for "Rekor unavailable". What
-	// it would have proven is unknown; nothing it would have moved moved.
+	// Unavailable is a proof request that got no answer (ErrUnavailable
+	// alone): for "Rekor unavailable". What it would have proven is
+	// unknown; nothing it would have moved moved.
 	Unavailable error
 	// Stopped is the run's context ending, or the request cap reached,
 	// during a proof request: the run is incomplete, neither adding to
