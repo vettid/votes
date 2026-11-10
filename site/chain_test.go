@@ -86,10 +86,22 @@ func TestServiceChain(t *testing.T) {
 		if err != nil || !slices.Contains(rep.Mismatches, c.want) {
 			t.Fatalf("%s: %+v %v", name, rep, err)
 		}
-		// The digests are of the copies checked and the current list: a
-		// missing copy's is absent (unless it is the current list's).
-		if len(rep.Digests) != rep.Checked && len(rep.Digests) != rep.Checked+1 {
-			t.Errorf("%s: %d digests for %d checked", name, len(rep.Digests), rep.Checked)
+		// The digests are of the current list and each copy checked: a
+		// missing copy's is absent, unless it is the current list's.
+		want := [][]byte{sha(datas[2])}
+		for v, d := range datas {
+			p := "v1/services/" + string(rune('1'+v)) + ".json"
+			if _, ok := o[p]; ok && v != 2 && c.drop != p+".sig" {
+				want = append(want, sha(d))
+			}
+		}
+		if len(rep.Digests) != len(want) {
+			t.Errorf("%s: %d digests, want %d", name, len(rep.Digests), len(want))
+		}
+		for _, w := range want {
+			if !slices.ContainsFunc(rep.Digests, func(x []byte) bool { return bytes.Equal(x, w) }) {
+				t.Errorf("%s: a digest is missing", name)
+			}
 		}
 	}
 	// The current version's copy may lag services.json by ListingGrace.

@@ -99,7 +99,11 @@ func TestAnchorVector(t *testing.T) {
 	tl := vmat["tlogEntries"].([]any)[0].(map[string]any)
 	delete(tl, "inclusionPromise")
 	noPromise, _ := json.Marshal(bmap)
-	if at, err := a.VerifyTimes(noPromise, doc, v.AnchorKey); err == nil && at.Entry != nil {
+	at, err = a.VerifyTimes(noPromise, doc, v.AnchorKey)
+	if err != nil {
+		t.Fatalf("a bundle without its promise no longer verifies (%v): this case needs another bundle", err)
+	}
+	if at.Entry != nil {
 		t.Errorf("an entry without its inclusion promise: %+v", at.Entry)
 	}
 	// Other bytes, another key, and a bundle whose entry is altered.
