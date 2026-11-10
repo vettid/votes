@@ -634,7 +634,7 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 
 ## Changes
 
-- **0.2.12 (2026-11-10), draft:** `votesctl check -all -rekor` (§7)
+- **0.2.12 (2026-11-10):** `votesctl check -all -rekor` (§7)
   reads Rekor v1 through an allowlist of four endpoints (never one that
   adds to the log), and the site by `GET` and `HEAD` only. It searches
   by each listed anchor key (production's check, the owner's choice a2
