@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +57,37 @@ func TestAnchorVector(t *testing.T) {
 	ts, err := a.Verify(v.Bundle, doc, v.AnchorKey)
 	if err != nil || ts.Unix() != v.Timestamp {
 		t.Fatalf("verify: %v at %v, want %d", err, ts, v.Timestamp)
+	}
+	// The bundle's own Rekor entry: its leaf hash is its body's (sha256 of
+	// 0x00 and the body), its indexes and checkpoint the proof's.
+	at, err := a.VerifyTimes(v.Bundle, doc, v.AnchorKey)
+	if err != nil || at.Entry == nil {
+		t.Fatalf("entry: %+v %v", at, err)
+	}
+	var bj struct {
+		VerificationMaterial struct {
+			TlogEntries []struct {
+				LogIndex          string `json:"logIndex"`
+				CanonicalizedBody []byte `json:"canonicalizedBody"`
+				InclusionProof    struct {
+					LogIndex   string `json:"logIndex"`
+					TreeSize   string `json:"treeSize"`
+					Checkpoint struct {
+						Envelope string `json:"envelope"`
+					} `json:"checkpoint"`
+				} `json:"inclusionProof"`
+			} `json:"tlogEntries"`
+		} `json:"verificationMaterial"`
+	}
+	if err := json.Unmarshal(v.Bundle, &bj); err != nil || len(bj.VerificationMaterial.TlogEntries) != 1 {
+		t.Fatal("bundle: no single tlog entry")
+	}
+	te := bj.VerificationMaterial.TlogEntries[0]
+	leaf := sha256.Sum256(append([]byte{0}, te.CanonicalizedBody...))
+	e := at.Entry
+	if !bytes.Equal(e.Leaf, leaf[:]) || strconv.FormatInt(e.LogIndex, 10) != te.LogIndex || strconv.FormatInt(e.ShardIndex, 10) != te.InclusionProof.LogIndex ||
+		strconv.FormatInt(e.TreeSize, 10) != te.InclusionProof.TreeSize || e.Checkpoint != te.InclusionProof.Checkpoint.Envelope || e.Integrated.IsZero() {
+		t.Errorf("entry %+v, bundle %+v", e, te)
 	}
 	// Other bytes, another key, and a bundle whose entry is altered.
 	if _, err := a.Verify(v.Bundle, append(doc, ' '), v.AnchorKey); err == nil {

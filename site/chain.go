@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"fmt"
 	"strconv"
 	"time"
@@ -22,6 +23,10 @@ type ChainReport struct {
 	// published, or a copy past the current version (a stray, which
 	// publish-services would refuse every later list for).
 	Mismatches []string
+	// Digests are the SHA-256 of each version checked and of the current
+	// list: never expected under an anchor key (the Rekor check's
+	// "unexpected digest").
+	Digests [][]byte
 }
 
 // CheckServiceChain walks the kept versions of the service list,
@@ -48,6 +53,8 @@ func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.Publi
 		return nil, fmt.Errorf("site: services.json: %w", err)
 	}
 	rep := &ChainReport{Version: current.Version}
+	curSum := sha256.Sum256(cur)
+	rep.Digests = append(rep.Digests, curSum[:])
 	var prev *ServiceList
 	var prevData []byte
 	link := func(name string, l *ServiceList, data []byte) error {
@@ -98,6 +105,9 @@ func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.Publi
 			return nil, err
 		}
 		rep.Checked++
+		if d := sha256.Sum256(data); !bytes.Equal(d[:], curSum[:]) {
+			rep.Digests = append(rep.Digests, d[:])
+		}
 		if v == current.Version && (!bytes.Equal(data, cur) || !bytes.Equal(sig, curSig)) {
 			return nil, fmt.Errorf("site: %s isn't the current services.json", path)
 		}

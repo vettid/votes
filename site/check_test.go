@@ -58,6 +58,15 @@ func TestCheck(t *testing.T) {
 	if len(rep.Hashes) != 4 || rep.Partial != nil {
 		t.Fatalf("hashes %v, partial %v", rep.Hashes, rep.Partial)
 	}
+	// Each anchored document's bundle gives its Rekor entry.
+	if len(rep.Entries) != len(rep.Anchored) {
+		t.Fatalf("%d entries for %d anchored documents", len(rep.Entries), len(rep.Anchored))
+	}
+	for name, e := range rep.Entries {
+		if len(e.Leaf) != 32 || e.Checkpoint == "" || e.Integrated.IsZero() {
+			t.Errorf("%s: %+v", name, e)
+		}
+	}
 	if rep.Title != f.p.Title || rep.Extensions != 1 || rep.ClosesAt != f.e.ClosesAt || rep.Results == nil ||
 		rep.Results.Counts.Eligible != f.p.Eligible || len(rep.Anchored) != 3 || rep.ServiceName != "Test service" {
 		t.Fatalf("report %+v", rep)

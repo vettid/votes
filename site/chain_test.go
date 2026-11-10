@@ -56,10 +56,19 @@ func chainCheck(objs map[string][]byte) (*ChainReport, error) {
 
 func TestServiceChain(t *testing.T) {
 	f := loadFixture(t)
-	objs, _ := chainSite(t, f)
+	objs, datas := chainSite(t, f)
 	rep, err := chainCheck(objs)
 	if err != nil || rep.Version != 3 || rep.Checked != 3 || len(rep.Mismatches) != 0 {
 		t.Fatalf("the chain: %+v %v", rep, err)
+	}
+	// Each version's digest, once.
+	if len(rep.Digests) != 3 {
+		t.Fatalf("%d digests", len(rep.Digests))
+	}
+	for _, d := range datas {
+		if !slices.ContainsFunc(rep.Digests, func(x []byte) bool { return bytes.Equal(x, sha(d)) }) {
+			t.Error("a version's digest is missing")
+		}
 	}
 
 	// Missing copies are mismatches: the current one's still chains.
