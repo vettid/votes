@@ -9,8 +9,10 @@
 // (the signature, then the RFC 3161 token, then the Rekor entry), so a
 // retry resumes and never signs again. A short lease in the claim keeps
 // two calls for one slot from both signing. A kept token too old to pair
-// with an entry is replaced by a fresh one for the same signature, once,
-// before the entry is asked for: a timestamp, never a second sign.
+// with an entry is replaced by a fresh one for the same signature (at most
+// once in a call) before the entry is asked for, and a token an entry was
+// integrated too late for is replaced right after it: a timestamp, never a
+// second sign.
 package signer
 
 import (
@@ -97,8 +99,9 @@ type Claims interface {
 	// names digest, has no signature, and has no lease live at now.
 	Lease(ctx context.Context, slot string, digest []byte, owner string, until, now time.Time) error
 	// SetSig sets the signature, its r and KMS's request id, only if the
-	// claim names digest and has no signature.
-	SetSig(ctx context.Context, slot string, digest, sig, r []byte, requestID string) error
+	// claim names digest, has no signature, and its lease is owner's: the
+	// kept signature is always the lease holder's.
+	SetSig(ctx context.Context, slot string, digest, sig, r []byte, requestID, owner string) error
 	// SetJournaled, SetToken, SetEnterAttempted and SetEntry set one
 	// artifact each, only if it is unset and the claim names digest and r:
 	// never on another attempt's signature.
@@ -110,6 +113,10 @@ type Claims interface {
 	// digest and r, holds old, and has neither an entry nor an attempt at
 	// one.
 	ReplaceToken(ctx context.Context, slot string, digest, r, old, token []byte) error
+	// ReplaceLateToken puts token in place of old, only if the claim names
+	// digest and r, holds old, and holds exactly entry: an entry that was
+	// integrated too late for old.
+	ReplaceLateToken(ctx context.Context, slot string, digest, r, old []byte, entry json.RawMessage, token []byte) error
 }
 
 // SignEntry is the journal's record of a sign (GC #7406 §3): ids, hashes
@@ -172,6 +179,7 @@ type NoteEntry struct {
 	KMSRequestID string    `json:"kms_request_id,omitempty"`
 	Signature    []byte    `json:"signature,omitempty"`
 	R            []byte    `json:"r,omitempty"`
+	Reason       string    `json:"reason,omitempty"`
 	OldTSATime   time.Time `json:"old_tsa_time,omitzero"`
 	NewTSATime   time.Time `json:"new_tsa_time,omitzero"`
 }
@@ -194,6 +202,8 @@ type Anchor interface {
 	Sign(ctx context.Context, doc []byte) (digest, sig []byte, err error)
 	Timestamp(ctx context.Context, sig []byte) ([]byte, error)
 	TokenTime(token []byte) (time.Time, error)
+	// EntryTime reads an entry's Rekor integrated time, unverified.
+	EntryTime(entry json.RawMessage) (time.Time, error)
 	Enter(ctx context.Context, digest, sig []byte) (json.RawMessage, error)
 	Bundle(digest, sig, ts []byte, entry json.RawMessage) (json.RawMessage, error)
 	PublicKeyDER() []byte
@@ -227,12 +237,25 @@ func (d Deadlines) Worst() time.Duration {
 		d.Key + 2*d.TSA + d.Rekor + d.Margin
 }
 
-// Lead is how much later than its checks a document is taken to be
-// anchored when nothing is kept yet: the claim, the lease, the intent, the
-// sign and its keeping, and the TSA, at their deadlines, with the margin.
+// Lead is how much later than the time it reads a document is taken to
+// be anchored when nothing is kept yet: Prepare itself, the claim, the
+// lease, the intent, the sign and its keeping, and the TSA, at their
+// deadlines, with the margin.
 func (d Deadlines) Lead() time.Duration {
-	return 9*d.Claims + d.Key + d.TSA + d.Margin
+	return d.Site + 9*d.Claims + d.Key + d.TSA + d.Margin
 }
+
+// toMark is the longest from the first read to the entry attempt mark
+// when a token is kept: Prepare, the claim, journaling a kept signature,
+// and replacing the token.
+func (d Deadlines) toMark() time.Duration {
+	return d.Site + 6*d.Claims + d.TSA + d.Margin
+}
+
+// lateWindow is how soon after an entry's integration a fresh token must
+// be for the pair to make a bundle (service-vault anchor: the entry at
+// most 60 s before the token).
+const lateWindow = 60 * time.Second
 
 // RetimestampAfter is the age past which a kept token is replaced before
 // the entry is asked for: an entry integrated more than 600 s after the
@@ -314,10 +337,19 @@ func (s *Signer) Handle(ctx context.Context, req Request) (Result, error) {
 	}); err != nil {
 		return Result{}, fmt.Errorf("signer: claim: %w", err)
 	}
+	// Staleness is decided here, once, for the time of the attempt mark,
+	// so that Prepare and the bundle judge by the same token.
 	at := s.Now().Add(s.Deadlines.Lead())
+	var staleToken []byte
 	if pre != nil && bytes.Equal(pre.Digest, digest[:]) && pre.TSAToken != nil {
-		if t, err := s.Anchor.TokenTime(pre.TSAToken); err == nil && (pre.EnterAttempted || !s.stale(t)) {
+		t, err := s.Anchor.TokenTime(pre.TSAToken)
+		switch {
+		case err != nil:
+			return Result{}, fmt.Errorf("signer: the kept token: %w", err)
+		case pre.EnterAttempted || s.Now().Add(s.Deadlines.toMark()).Sub(t) < s.Deadlines.RetimestampAfter():
 			at = t
+		default:
+			staleToken = pre.TSAToken
 		}
 	}
 
@@ -403,8 +435,10 @@ func (s *Signer) Handle(ctx context.Context, req Request) (Result, error) {
 	}
 	if c.RekorEntry == nil {
 		if !c.EnterAttempted {
-			if c, err = s.retimestamp(ctx, req, slot, c); err != nil {
-				return Result{}, err
+			if bytes.Equal(c.TSAToken, staleToken) {
+				if c, err = s.retimestamp(ctx, req, slot, c); err != nil {
+					return Result{}, err
+				}
 			}
 			// From here an entry may exist for the token: it is never
 			// replaced again.
@@ -432,6 +466,9 @@ func (s *Signer) Handle(ctx context.Context, req Request) (Result, error) {
 			c.RekorEntry = entry
 		}
 	}
+	if c, err = s.lateEntry(ctx, req, slot, c); err != nil {
+		return Result{}, err
+	}
 	bundle, err := s.Anchor.Bundle(c.Digest, c.Sig, c.TSAToken, c.RekorEntry)
 	if err != nil {
 		// Once more from the claim as kept (another call may have kept
@@ -451,12 +488,6 @@ func (s *Signer) Handle(ctx context.Context, req Request) (Result, error) {
 
 	// 6. The upload.
 	return s.upload(ctx, req, c, bundle, resumed, false)
-}
-
-// stale is whether a token from t is too old to pair with an entry asked
-// for now.
-func (s *Signer) stale(t time.Time) bool {
-	return s.Now().Sub(t) >= s.Deadlines.RetimestampAfter()
 }
 
 // timestamp asks the TSA for a token for sig.
@@ -479,9 +510,6 @@ func (s *Signer) retimestamp(ctx context.Context, req Request, slot string, c *C
 	old, err := s.Anchor.TokenTime(c.TSAToken)
 	if err != nil {
 		return nil, fmt.Errorf("signer: the kept token: %w", err)
-	}
-	if !s.stale(old) {
-		return c, nil
 	}
 	tok, err := s.timestamp(ctx, c.Sig)
 	if err != nil {
@@ -506,8 +534,53 @@ func (s *Signer) retimestamp(ctx context.Context, req Request, slot string, c *C
 	if err != nil {
 		return nil, fmt.Errorf("signer: replace the token: %w", err)
 	}
-	s.note(ctx, NoteEntry{Kind: NoteRetimestamp, ProposalID: req.ProposalID, Name: req.Name, Digest: c.Digest, R: c.R,
-		OldTSATime: old.UTC(), NewTSATime: newT.UTC()})
+	s.note(context.WithoutCancel(ctx), NoteEntry{Kind: NoteRetimestamp, Reason: "stale_token", ProposalID: req.ProposalID,
+		Name: req.Name, Digest: c.Digest, R: c.R, OldTSATime: old.UTC(), NewTSATime: newT.UTC()})
+	c2 := *c
+	c2.TSAToken = tok
+	return &c2, nil
+}
+
+// lateEntry replaces the kept token when the kept entry was integrated
+// more than 600 s after it (Rekor slow, or down for a while): a fresh token
+// for the same signature, taken now, pairs with the entry if it is within
+// 60 s of the integration, and is kept only on the claim that holds that
+// entry. Otherwise the claim is left as it is (and Bundle says so).
+func (s *Signer) lateEntry(ctx context.Context, req Request, slot string, c *Claim) (*Claim, error) {
+	old, err := s.Anchor.TokenTime(c.TSAToken)
+	if err != nil {
+		return nil, fmt.Errorf("signer: the kept token: %w", err)
+	}
+	integrated, err := s.Anchor.EntryTime(c.RekorEntry)
+	if err != nil {
+		return nil, fmt.Errorf("signer: the kept entry: %w", err)
+	}
+	if integrated.Sub(old) <= 600*time.Second || s.Now().Sub(integrated) > lateWindow-s.Deadlines.TSA {
+		return c, nil
+	}
+	tok, err := s.timestamp(ctx, c.Sig)
+	if err != nil {
+		return nil, err
+	}
+	newT, err := s.Anchor.TokenTime(tok)
+	if err != nil || newT.Sub(integrated) > lateWindow || integrated.Sub(newT) > 600*time.Second {
+		return c, nil // too late for this one as well: Bundle refuses, and it alarms
+	}
+	err = s.hop(ctx, s.Deadlines.Claims, func(ctx context.Context) error {
+		return s.Claims.ReplaceLateToken(ctx, slot, c.Digest, c.R, c.TSAToken, c.RekorEntry, tok)
+	})
+	if errors.Is(err, ErrSet) {
+		k, rerr := s.reload(ctx, slot)
+		if rerr != nil {
+			return nil, rerr
+		}
+		return k, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("signer: replace the late token: %w", err)
+	}
+	s.note(context.WithoutCancel(ctx), NoteEntry{Kind: NoteRetimestamp, Reason: "late_entry", ProposalID: req.ProposalID,
+		Name: req.Name, Digest: c.Digest, R: c.R, OldTSATime: old.UTC(), NewTSATime: newT.UTC()})
 	c2 := *c
 	c2.TSAToken = tok
 	return &c2, nil
@@ -647,7 +720,7 @@ func (s *Signer) sign(ctx context.Context, req Request, slot string, c *Claim) (
 		return nil, errors.New("signer: sign: the digest isn't the claim's")
 	}
 	if err := s.hop(keepCtx, s.Deadlines.Claims, func(ctx context.Context) error {
-		return s.Claims.SetSig(ctx, slot, c.Digest, sig, r, reqID)
+		return s.Claims.SetSig(ctx, slot, c.Digest, sig, r, reqID, attempt)
 	}); err != nil {
 		// Signed but not kept: the journal still counts the sign (without
 		// marking a claim that lacks it), then the call fails; a retry

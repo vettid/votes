@@ -120,11 +120,12 @@ func TestClaimsUnit(t *testing.T) {
 	if err := c.Create(ctx, "s", make([]byte, 32), time.Unix(5, 0)); err != nil || *f.put.ConditionExpression != "attribute_not_exists(slot)" {
 		t.Fatalf("%v %+v", err, f.put)
 	}
-	if err := c.SetSig(ctx, "s", make([]byte, 32), []byte("sig"), []byte{1}, "req"); err != nil {
+	if err := c.SetSig(ctx, "s", make([]byte, 32), []byte("sig"), []byte{1}, "req", "a1"); err != nil {
 		t.Fatal(err)
 	}
-	if *f.update.ConditionExpression != "attribute_exists(#s) AND #d = :d AND attribute_not_exists(#f)" || f.update.ExpressionAttributeNames["#r"] != "" ||
-		f.update.ExpressionAttributeNames["#f"] != "sig" || len(f.update.ExpressionAttributeValues) != 4 {
+	if *f.update.ConditionExpression != "attribute_exists(#s) AND #d = :d AND attribute_not_exists(#f) AND #o = :o" ||
+		f.update.ExpressionAttributeNames["#o"] != "lease_owner" ||
+		f.update.ExpressionAttributeNames["#f"] != "sig" || len(f.update.ExpressionAttributeValues) != 5 {
 		t.Fatalf("%+v", f.update)
 	}
 	if err := c.SetEntry(ctx, "s", make([]byte, 32), []byte{1}, []byte("{}")); err != nil ||

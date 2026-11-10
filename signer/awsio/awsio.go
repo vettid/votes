@@ -225,7 +225,7 @@ func (c *Claims) set(ctx context.Context, slot string, digest, r []byte, fields 
 }
 
 // SetSig implements signer.Claims.
-func (c *Claims) SetSig(ctx context.Context, slot string, digest, sig, r []byte, requestID string) error {
+func (c *Claims) SetSig(ctx context.Context, slot string, digest, sig, r []byte, requestID, owner string) error {
 	f := map[string]ddbtypes.AttributeValue{
 		"sig": &ddbtypes.AttributeValueMemberB{Value: sig},
 		"r":   &ddbtypes.AttributeValueMemberB{Value: r},
@@ -233,7 +233,37 @@ func (c *Claims) SetSig(ctx context.Context, slot string, digest, sig, r []byte,
 	if requestID != "" {
 		f["request_id"] = &ddbtypes.AttributeValueMemberS{Value: requestID}
 	}
-	return c.set(ctx, slot, digest, nil, f, "sig")
+	return c.setOwned(ctx, slot, digest, owner, f, "sig")
+}
+
+// setOwned is set for the signature: only on the claim whose lease is
+// owner's.
+func (c *Claims) setOwned(ctx context.Context, slot string, digest []byte, owner string, fields map[string]ddbtypes.AttributeValue, first string) error {
+	names := map[string]string{"#s": "slot", "#d": "digest", "#f": first, "#o": "lease_owner"}
+	values := map[string]ddbtypes.AttributeValue{":d": &ddbtypes.AttributeValueMemberB{Value: digest},
+		":o": &ddbtypes.AttributeValueMemberS{Value: owner}}
+	expr, i := "SET ", 0
+	for name, v := range fields {
+		n, p := "#n"+strconv.Itoa(i), ":v"+strconv.Itoa(i)
+		names[n], values[p] = name, v
+		if i > 0 {
+			expr += ", "
+		}
+		expr += n + " = " + p
+		i++
+	}
+	_, err := c.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(c.Table),
+		Key:                       map[string]ddbtypes.AttributeValue{"slot": &ddbtypes.AttributeValueMemberS{Value: slot}},
+		UpdateExpression:          aws.String(expr),
+		ConditionExpression:       aws.String("attribute_exists(#s) AND #d = :d AND attribute_not_exists(#f) AND #o = :o"),
+		ExpressionAttributeNames:  names,
+		ExpressionAttributeValues: values,
+	})
+	var ccf *ddbtypes.ConditionalCheckFailedException
+	if errors.As(err, &ccf) {
+		return signer.ErrSet
+	}
+	return err
 }
 
 // Lease implements signer.Claims: lease_until (Unix milliseconds) is set
@@ -287,6 +317,28 @@ func (c *Claims) ReplaceToken(ctx context.Context, slot string, digest, r, old, 
 		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
 			":d": &ddbtypes.AttributeValueMemberB{Value: digest}, ":r": &ddbtypes.AttributeValueMemberB{Value: r},
 			":old": &ddbtypes.AttributeValueMemberB{Value: old}, ":new": &ddbtypes.AttributeValueMemberB{Value: token},
+		},
+	})
+	var ccf *ddbtypes.ConditionalCheckFailedException
+	if errors.As(err, &ccf) {
+		return signer.ErrSet
+	}
+	return err
+}
+
+// ReplaceLateToken implements signer.Claims: only over the exact old
+// token, on the claim that holds exactly entry.
+func (c *Claims) ReplaceLateToken(ctx context.Context, slot string, digest, r, old []byte, entry json.RawMessage, token []byte) error {
+	_, err := c.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(c.Table),
+		Key:                 map[string]ddbtypes.AttributeValue{"slot": &ddbtypes.AttributeValueMemberS{Value: slot}},
+		UpdateExpression:    aws.String("SET #t = :new"),
+		ConditionExpression: aws.String("attribute_exists(#s) AND #d = :d AND #r = :r AND #t = :old AND #e = :e"),
+		ExpressionAttributeNames: map[string]string{"#s": "slot", "#d": "digest", "#r": "r", "#t": "tsa_token",
+			"#e": "rekor_entry"},
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":d": &ddbtypes.AttributeValueMemberB{Value: digest}, ":r": &ddbtypes.AttributeValueMemberB{Value: r},
+			":old": &ddbtypes.AttributeValueMemberB{Value: old}, ":e": &ddbtypes.AttributeValueMemberB{Value: entry},
+			":new": &ddbtypes.AttributeValueMemberB{Value: token},
 		},
 	})
 	var ccf *ddbtypes.ConditionalCheckFailedException

@@ -78,10 +78,10 @@ func TestClaims(t *testing.T) {
 	if wins != 1 {
 		t.Fatalf("%d creates won", wins)
 	}
-	if err := cl.SetSig(ctx, slot, other[:], []byte("sig"), []byte{1}, "req"); !errors.Is(err, signer.ErrSet) {
+	if err := cl.SetSig(ctx, slot, other[:], []byte("sig"), []byte{1}, "req", "a1"); !errors.Is(err, signer.ErrSet) {
 		t.Fatalf("a set on another digest's claim: %v", err)
 	}
-	if err := cl.SetSig(ctx, "nobody/proposal", d[:], []byte("sig"), []byte{1}, "req"); !errors.Is(err, signer.ErrSet) {
+	if err := cl.SetSig(ctx, "nobody/proposal", d[:], []byte("sig"), []byte{1}, "req", "a1"); !errors.Is(err, signer.ErrSet) {
 		t.Fatalf("a set on no claim: %v", err)
 	}
 	// The lease: refused while live, taken again once it has passed, and
@@ -99,8 +99,11 @@ func TestClaims(t *testing.T) {
 	if err := cl.SetToken(ctx, slot, d[:], []byte{1}, []byte("early")); !errors.Is(err, signer.ErrSet) {
 		t.Fatalf("a token before the signature: %v", err)
 	}
+	if err := cl.SetSig(ctx, slot, d[:], []byte("sig"), []byte{1}, "req-1", "another"); !errors.Is(err, signer.ErrSet) {
+		t.Fatalf("a signature from another lease holder: %v", err)
+	}
 	steps := []func() error{
-		func() error { return cl.SetSig(ctx, slot, d[:], []byte("sig"), []byte{1}, "req-1") },
+		func() error { return cl.SetSig(ctx, slot, d[:], []byte("sig"), []byte{1}, "req-1", "a1") },
 		func() error { return cl.SetJournaled(ctx, slot, d[:], []byte{1}) },
 		func() error { return cl.SetToken(ctx, slot, d[:], []byte{1}, []byte("token")) },
 		func() error { return cl.ReplaceToken(ctx, slot, d[:], []byte{1}, []byte("token"), []byte("token2")) },
@@ -118,15 +121,25 @@ func TestClaims(t *testing.T) {
 	if err := cl.Lease(ctx, slot, d[:], "a1", now.Add(time.Hour), now.Add(time.Hour)); !errors.Is(err, signer.ErrSet) {
 		t.Fatalf("a lease after the signature: %v", err)
 	}
+	// A late entry's token: only on the claim holding exactly that entry.
+	if err := cl.ReplaceLateToken(ctx, slot, d[:], []byte{1}, []byte("token2"), []byte(`{"other":1}`), []byte("token3")); !errors.Is(err, signer.ErrSet) {
+		t.Fatalf("a late token on another entry: %v", err)
+	}
+	if err := cl.ReplaceLateToken(ctx, slot, d[:], []byte{1}, []byte("token2"), []byte(`{"logIndex":"7"}`), []byte("token3")); err != nil {
+		t.Fatalf("a late token: %v", err)
+	}
+	if err := cl.ReplaceLateToken(ctx, slot, d[:], []byte{1}, []byte("token2"), []byte(`{"logIndex":"7"}`), []byte("token4")); !errors.Is(err, signer.ErrSet) {
+		t.Fatalf("a late token twice: %v", err)
+	}
 	// The token is never replaced once an entry is attempted.
-	if err := cl.ReplaceToken(ctx, slot, d[:], []byte{1}, []byte("token2"), []byte("token3")); !errors.Is(err, signer.ErrSet) {
+	if err := cl.ReplaceToken(ctx, slot, d[:], []byte{1}, []byte("token3"), []byte("token5")); !errors.Is(err, signer.ErrSet) {
 		t.Fatalf("a token replaced after the attempt: %v", err)
 	}
 	if err := cl.SetEntry(ctx, "x", d[:], []byte{2}, []byte("{}")); !errors.Is(err, signer.ErrSet) {
 		t.Fatalf("no claim: %v", err)
 	}
 	got, err := cl.Get(ctx, slot)
-	if err != nil || string(got.Sig) != "sig" || got.RequestID != "req-1" || !got.Journaled || string(got.TSAToken) != "token2" || !got.EnterAttempted || got.LeaseOwner != "a1" ||
+	if err != nil || string(got.Sig) != "sig" || got.RequestID != "req-1" || !got.Journaled || string(got.TSAToken) != "token3" || !got.EnterAttempted || got.LeaseOwner != "a1" ||
 		string(got.RekorEntry) != `{"logIndex":"7"}` || got.Created.Unix() != 100 || string(got.Digest) != string(d[:]) {
 		t.Fatalf("%+v %v", got, err)
 	}

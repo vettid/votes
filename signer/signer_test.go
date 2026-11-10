@@ -85,17 +85,23 @@ func (m *memClaims) SetEnterAttempted(_ context.Context, slot string, digest, r 
 		func(c *Claim) { c.EnterAttempted = true })
 }
 
+func (m *memClaims) ReplaceLateToken(_ context.Context, slot string, digest, r, old []byte, entry json.RawMessage, tok []byte) error {
+	return m.set(slot, digest, "late", func(c *Claim) bool {
+		return bytes.Equal(c.R, r) && bytes.Equal(c.TSAToken, old) && bytes.Equal(c.RekorEntry, entry)
+	}, func(c *Claim) { c.TSAToken = tok })
+}
+
 func (m *memClaims) ReplaceToken(_ context.Context, slot string, digest, r, old, tok []byte) error {
 	return m.set(slot, digest, "replace", func(c *Claim) bool {
 		return bytes.Equal(c.R, r) && bytes.Equal(c.TSAToken, old) && c.RekorEntry == nil && !c.EnterAttempted
 	}, func(c *Claim) { c.TSAToken = tok })
 }
 
-func (m *memClaims) SetSig(ctx context.Context, slot string, digest, sig, r []byte, id string) error {
+func (m *memClaims) SetSig(ctx context.Context, slot string, digest, sig, r []byte, id, owner string) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	return m.set(slot, digest, "sig", func(c *Claim) bool { return c.Sig == nil },
+	return m.set(slot, digest, "sig", func(c *Claim) bool { return c.Sig == nil && c.LeaseOwner == owner },
 		func(c *Claim) { c.Sig, c.R, c.RequestID = sig, r, id })
 }
 
@@ -169,8 +175,9 @@ type fakeAnchor struct {
 	failStamp, failEnter  int
 	blockStamp            bool
 	wrongDigest           bool
-	signGate              chan struct{} // if set, Sign waits on it
-	clock                 func() time.Time
+	signGate              chan struct{}    // if set, Sign waits on it
+	clock                 func() time.Time // the TSA's
+	entryClock            func() time.Time // Rekor's, if set
 	failSign              bool
 	failBundle            int
 	onSign                func() // if set, runs as Sign answers
@@ -237,7 +244,22 @@ func (a *fakeAnchor) Enter(_ context.Context, digest, sig []byte) (json.RawMessa
 		a.failEnter--
 		return nil, errors.New("Rekor down")
 	}
-	return json.RawMessage(`{"logIndex":"7"}`), nil
+	at := time.Now()
+	if a.entryClock != nil {
+		at = a.entryClock()
+	}
+	return json.RawMessage(`{"logIndex":"7","integratedTime":"` + strconv.FormatInt(at.Unix(), 10) + `"}`), nil
+}
+
+func (a *fakeAnchor) EntryTime(e json.RawMessage) (time.Time, error) {
+	var v struct {
+		IntegratedTime string `json:"integratedTime"`
+	}
+	if err := json.Unmarshal(e, &v); err != nil {
+		return time.Time{}, err
+	}
+	n, err := strconv.ParseInt(v.IntegratedTime, 10, 64)
+	return time.Unix(n, 0), err
 }
 
 func (a *fakeAnchor) Bundle(digest, sig, ts []byte, entry json.RawMessage) (json.RawMessage, error) {
@@ -586,11 +608,11 @@ func TestDeadlinesFit(t *testing.T) {
 	// The lead covers everything from the checks to the token.
 	// The claim (3), the lease, the intent, the sign, keeping, journaling
 	// and marking it, then the TSA.
-	if d.Lead() < 8*d.Claims+d.Key+d.TSA {
+	if d.Lead() < d.Site+8*d.Claims+d.Key+d.TSA {
 		t.Fatal("the lead is shorter than the steps before the TSA")
 	}
 	// A re-timestamped token still pairs with an entry asked for at once.
-	if after := d.RetimestampAfter(); after < 7*time.Minute || after+d.Rekor+3*d.Claims+d.Margin >= 600*time.Second {
+	if after := d.RetimestampAfter(); after-d.toMark() < 7*time.Minute || after+d.Rekor+3*d.Claims+d.Margin >= 600*time.Second {
 		t.Fatalf("re-timestamp after %v", after)
 	}
 }
@@ -686,36 +708,41 @@ func TestRFromDER(t *testing.T) {
 	}
 }
 
-// A token too old to pair with an entry is replaced by a fresh one for the
-// same signature, before the entry; never a second sign.
-func TestRetimestamp(t *testing.T) {
-	h := newHarness(t)
-	h.a.failEnter = 1
-	n := 0
-	h.a.clock = func() time.Time { // the first token is old, as after a long wait
-		n++
-		if n == 1 {
-			return time.Now().Add(-20 * time.Minute)
+// reasons are the retimestamp notes' reasons.
+func (j *memJournal) reasons() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var r []string
+	for _, n := range j.notes {
+		if n.Kind == NoteRetimestamp {
+			r = append(r, n.Reason)
 		}
-		return time.Now()
 	}
+	return r
+}
+
+// A kept token too old to pair with an entry is replaced by a fresh one for
+// the same signature, before the entry; never a second sign.
+func TestRetimestampStale(t *testing.T) {
+	h := newHarness(t)
+	h.c.failOn = "attempt" // the first call stops before the attempt mark
+	h.a.clock = func() time.Time { return time.Now().Add(-20 * time.Minute) }
 	if _, err := h.s.Handle(context.Background(), req); err == nil {
-		t.Fatal("Rekor down, and no error")
+		t.Fatal("no error")
 	}
-	if c, _ := h.c.Get(context.Background(), slot); !c.EnterAttempted {
-		t.Fatal("no attempt mark before Rekor")
-	}
+	h.a.clock = time.Now
 	r, err := h.s.Handle(context.Background(), req)
 	if err != nil || r.Status != 201 {
 		t.Fatalf("%+v %v", r, err)
 	}
-	h.counts(t, 1, 2, 2, 1)
-	found := false
-	for _, k := range h.j.kinds() {
-		found = found || k == NoteRetimestamp
+	h.counts(t, 1, 2, 1, 1)
+	if got := h.j.reasons(); len(got) != 1 || got[0] != "stale_token" {
+		t.Fatalf("retimestamps %v", got)
 	}
-	if !found {
-		t.Fatalf("no retimestamp note: %v", h.j.kinds())
+	// Prepare judged the second call at now plus the lead, as the bundle
+	// carries a fresh token.
+	if time.Until(h.st.opts.At) < DefaultDeadlines.Lead()-time.Second {
+		t.Fatalf("judged at %v", h.st.opts.At)
 	}
 	var b map[string][]byte
 	_ = json.Unmarshal(h.st.uploads[0].Bundle, &b)
@@ -724,20 +751,40 @@ func TestRetimestamp(t *testing.T) {
 	}
 }
 
-// Once an entry may exist, the kept token is never replaced, however old.
-func TestNoRetimestampAfterAttempt(t *testing.T) {
+// Once an entry may exist, a stale token is never replaced before the
+// entry; an entry integrated too late for the kept token gets a fresh
+// token right after it, on that entry's claim only.
+func TestRetimestampLateEntry(t *testing.T) {
 	h := newHarness(t)
 	h.a.failEnter = 1
+	h.a.clock = func() time.Time { return time.Now().Add(-20 * time.Minute) }
 	_, _ = h.s.Handle(context.Background(), req)
-	h.c.mu.Lock()
-	h.c.c[slot].TSAToken = []byte("token:1:" + strconv.FormatInt(time.Now().Add(-20*time.Minute).Unix(), 10))
-	h.c.mu.Unlock()
-	_, _ = h.s.Handle(context.Background(), req)
-	h.counts(t, 1, 1, 2, 1)
-	for _, k := range h.j.kinds() {
-		if k == NoteRetimestamp {
-			t.Fatal("a token replaced after an entry attempt")
-		}
+	if c, _ := h.c.Get(context.Background(), slot); !c.EnterAttempted {
+		t.Fatal("no attempt mark before Rekor")
+	}
+	h.a.clock = time.Now
+	r, err := h.s.Handle(context.Background(), req)
+	if err != nil || r.Status != 201 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	h.counts(t, 1, 2, 2, 1)
+	if got := h.j.reasons(); len(got) != 1 || got[0] != "late_entry" {
+		t.Fatalf("retimestamps %v", got)
+	}
+}
+
+// An entry integrated long ago, too late for its token, can't be helped
+// by a fresh token: the claim is left, and it alarms.
+func TestLateEntryTooLate(t *testing.T) {
+	h := newHarness(t)
+	h.a.clock = func() time.Time { return time.Now().Add(-40 * time.Minute) }
+	h.a.entryClock = func() time.Time { return time.Now().Add(-20 * time.Minute) }
+	h.a.failBundle = 2
+	if _, err := h.s.Handle(context.Background(), req); err == nil {
+		t.Fatal("no error")
+	}
+	if got := h.j.reasons(); len(got) != 0 {
+		t.Fatalf("retimestamps %v", got)
 	}
 }
 
