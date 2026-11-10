@@ -5,8 +5,8 @@ import (
 	"context"
 	"errors"
 	"maps"
-	"time"
 	"testing"
+	"time"
 )
 
 // prepare runs Prepare on an upload's parts, without its bundle.
