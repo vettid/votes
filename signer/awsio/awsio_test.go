@@ -30,11 +30,12 @@ import (
 )
 
 type fakeKMS struct {
-	spec  kmstypes.KeySpec
-	usage kmstypes.KeyUsageType
-	key   *ecdsa.PrivateKey
-	in    *kms.SignInput
-	fail  bool
+	spec     kmstypes.KeySpec
+	usage    kmstypes.KeyUsageType
+	key      *ecdsa.PrivateKey
+	in       *kms.SignInput
+	fail     bool
+	attempts int
 }
 
 func (f *fakeKMS) GetPublicKey(context.Context, *kms.GetPublicKeyInput, ...func(*kms.Options)) (*kms.GetPublicKeyOutput, error) {
@@ -42,8 +43,13 @@ func (f *fakeKMS) GetPublicKey(context.Context, *kms.GetPublicKeyInput, ...func(
 	return &kms.GetPublicKeyOutput{KeySpec: f.spec, KeyUsage: f.usage, PublicKey: der}, nil
 }
 
-func (f *fakeKMS) Sign(_ context.Context, in *kms.SignInput, _ ...func(*kms.Options)) (*kms.SignOutput, error) {
+func (f *fakeKMS) Sign(_ context.Context, in *kms.SignInput, opts ...func(*kms.Options)) (*kms.SignOutput, error) {
 	f.in = in
+	o := kms.Options{RetryMaxAttempts: 3}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	f.attempts = o.RetryMaxAttempts
 	if f.fail {
 		return nil, &awshttp.ResponseError{RequestID: "req-failed",
 			ResponseError: &smithyhttp.ResponseError{Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 400}}, Err: errors.New("denied")}}
@@ -65,6 +71,9 @@ func TestKeyUnit(t *testing.T) {
 	d := make([]byte, 32)
 	if _, err := key.SignDigest(signer.WithRequestIDSink(context.Background(), &id), d); err != nil || id != "req-ok" {
 		t.Fatalf("%v %q", err, id)
+	}
+	if f.attempts != 1 {
+		t.Fatalf("Sign may be tried %d times", f.attempts)
 	}
 	if f.in.MessageType != kmstypes.MessageTypeDigest || f.in.SigningAlgorithm != kmstypes.SigningAlgorithmSpecEcdsaSha256 || *f.in.KeyId != "key-1" {
 		t.Fatalf("%+v", f.in)
@@ -169,9 +178,25 @@ func TestUpload(t *testing.T) {
 	var body []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path, body = r.URL.Path, must(io.ReadAll(r.Body))
-		if strings.HasSuffix(path, "/results") {
+		switch {
+		case strings.HasSuffix(path, "/results"):
 			w.WriteHeader(422)
 			_, _ = io.WriteString(w, `{"error":"too_early"}`)
+			return
+		case strings.HasSuffix(path, "/extension-1"):
+			http.Redirect(w, r, "https://elsewhere.example/", http.StatusFound)
+			return
+		case strings.HasSuffix(path, "/extension-2"):
+			w.WriteHeader(403)
+			_, _ = io.WriteString(w, "<html>Forbidden</html>")
+			return
+		case strings.HasSuffix(path, "/extension-3"):
+			w.WriteHeader(201)
+			_, _ = io.WriteString(w, `{"published":"proposal","index_updated":true}`)
+			return
+		case strings.HasSuffix(path, "/extension-4"):
+			w.WriteHeader(422)
+			_, _ = io.WriteString(w, `{"error":"something_new"}`)
 			return
 		}
 		w.WriteHeader(201)
@@ -189,6 +214,14 @@ func TestUpload(t *testing.T) {
 	}
 	if st, code, _, _ := s.Upload(context.Background(), "id", "results", &site.Upload{}); st != 422 || code != "too_early" {
 		t.Fatalf("%d %q", st, code)
+	}
+	cl := srv.Client()
+	cl.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	s.Client = cl
+	for _, name := range []string{"extension-1", "extension-2", "extension-3", "extension-4"} {
+		if st, code, _, err := s.Upload(context.Background(), "id", name, &site.Upload{}); err == nil {
+			t.Fatalf("%s: taken as the site's answer: %d %q", name, st, code)
+		}
 	}
 	if (ReadOnly{}).PutOnce(context.Background(), "x", nil, "") == nil || (ReadOnly{}).PutIf(context.Background(), "x", nil, "", "") == nil {
 		t.Fatal("the read-only store wrote")

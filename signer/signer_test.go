@@ -78,7 +78,10 @@ func (m *memClaims) Lease(_ context.Context, slot string, digest []byte, until, 
 		func(c *Claim) { c.LeaseUntil = until })
 }
 
-func (m *memClaims) SetSig(_ context.Context, slot string, digest, sig, r []byte, id string) error {
+func (m *memClaims) SetSig(ctx context.Context, slot string, digest, sig, r []byte, id string) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	return m.set(slot, digest, "sig", func(c *Claim) bool { return c.Sig == nil },
 		func(c *Claim) { c.Sig, c.R, c.RequestID = sig, r, id })
 }
@@ -105,7 +108,10 @@ type memJournal struct {
 	failSign int // fail this many Sign writes
 }
 
-func (j *memJournal) Sign(_ context.Context, e SignEntry) error {
+func (j *memJournal) Sign(ctx context.Context, e SignEntry) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.failSign > 0 {
@@ -133,6 +139,7 @@ type fakeAnchor struct {
 	blockStamp            bool
 	wrongDigest           bool
 	signGate              chan struct{} // if set, Sign waits on it
+	onSign                func()        // if set, runs as Sign answers
 }
 
 func (a *fakeAnchor) Sign(ctx context.Context, doc []byte) ([]byte, []byte, error) {
@@ -149,6 +156,9 @@ func (a *fakeAnchor) Sign(ctx context.Context, doc []byte) ([]byte, []byte, erro
 	sig, err := ecdsa.SignASN1(rand.Reader, a.key, d[:])
 	if p := RequestIDSink(ctx); p != nil {
 		*p = "req-" + strconv.Itoa(a.signs)
+	}
+	if a.onSign != nil {
+		a.onSign()
 	}
 	return d[:], sig, err
 }
@@ -197,6 +207,7 @@ type fakeSite struct {
 	refuse    *site.Refusal
 	published bool
 	held      []byte
+	heldOnly  bool     // Prepare reports a held bundle, not a published document
 	answers   []answer // answers to uploads, in turn; then 201, indexed
 	uploads   []site.Upload
 	lead      time.Duration
@@ -215,7 +226,7 @@ func (f *fakeSite) Prepare(_ context.Context, _, _ string, _, _, _ []byte, lead 
 	if f.refuse != nil {
 		return site.Prepared{}, f.refuse
 	}
-	return site.Prepared{Published: f.published}, nil
+	return site.Prepared{Published: f.published, Held: f.heldOnly}, nil
 }
 
 func (f *fakeSite) Bundle(context.Context, string, string) ([]byte, error) {
@@ -372,6 +383,51 @@ func TestNoSign(t *testing.T) {
 	if r, err := h.s.Handle(context.Background(), Request{Name: "proposal"}); err != nil || r.Code != CodeBadRequest {
 		t.Fatalf("%+v %v", r, err)
 	}
+}
+
+// A bundle a partial upload left for these bytes is uploaded, not signed
+// again.
+func TestHeldBundle(t *testing.T) {
+	h := newHarness(t)
+	h.st.heldOnly, h.st.held = true, []byte(`{"partial":1}`)
+	if r, err := h.s.Handle(context.Background(), req); err != nil || r.Status != 201 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	h.counts(t, 0, 0, 0, 1)
+	if string(h.st.uploads[0].Bundle) != `{"partial":1}` {
+		t.Fatalf("uploaded %s", h.st.uploads[0].Bundle)
+	}
+}
+
+// The call's context ending as KMS answers: the signature is still kept
+// and journaled.
+func TestSignKeptPastTheContext(t *testing.T) {
+	h := newHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	h.a.onSign = cancel
+	_, _ = h.s.Handle(ctx, req)
+	c, _ := h.c.Get(context.Background(), slot)
+	if c.Sig == nil || !c.Journaled || len(h.j.signs) != 1 {
+		t.Fatalf("claim %+v, journal %d", c, len(h.j.signs))
+	}
+}
+
+// A mark another call made first is fine.
+func TestJournaledByAnother(t *testing.T) {
+	h := newHarness(t)
+	h.c.before = func(which string) {
+		if which != "journaled" {
+			return
+		}
+		h.c.before = nil
+		h.c.mu.Lock()
+		h.c.c[slot].Journaled = true
+		h.c.mu.Unlock()
+	}
+	if _, err := h.s.Handle(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	h.counts(t, 1, 1, 1, 1)
 }
 
 // A signer that answers for another digest stops the call before the

@@ -171,6 +171,11 @@ type Prepared struct {
 	// Published is whether the site already holds these exact bytes
 	// at the slot.
 	Published bool
+	// Held is whether the site holds a bundle for these bytes at the slot
+	// (published, or an earlier partial upload's) that the checks took:
+	// an upload keeps that bundle, so the signer uploads it and signs
+	// nothing.
+	Held bool
 }
 
 // Refusal is an upload's refusal: the HTTP status and the error code the
@@ -254,7 +259,7 @@ func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []by
 		}
 		return Prepared{}, err
 	}
-	return Prepared{Published: prev != nil}, nil
+	return Prepared{Published: prev != nil, Held: held != nil}, nil
 }
 
 // dryRun is a run of the checks with nothing written (Prepare): lead is

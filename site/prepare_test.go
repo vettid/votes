@@ -3,6 +3,7 @@ package site
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
 	"testing"
@@ -86,9 +87,16 @@ func TestPrepareRequest(t *testing.T) {
 	s, st := newSite(t, f, f.during())
 	// Rows are bounded only by the request: so big a request, with the
 	// largest bundle, is over it.
-	_, code := prepare(t, s, "results", mut(f.Results, func(u *Upload) { u.Rows = bytes.Repeat([]byte("r"), MaxUpload*3/4) }))
+	// Rows that fit with no bundle, and not with the largest one.
+	n := (MaxUpload - maxBundle/2) * 3 / 4
+	_, code := prepare(t, s, "results", mut(f.Results, func(u *Upload) { u.Rows = bytes.Repeat([]byte("r"), n) }))
 	if code != "too_large" {
-		t.Fatalf("large rows: %q", code)
+		t.Fatalf("rows that don't leave room for a bundle: %q", code)
+	}
+	var body bytes.Buffer
+	_ = json.NewEncoder(&body).Encode(mut(f.Results, func(u *Upload) { u.Rows = bytes.Repeat([]byte("r"), n); u.Bundle = nil }))
+	if body.Len() > MaxUpload {
+		t.Fatalf("the test's rows are over the limit even without a bundle (%d)", body.Len())
 	}
 
 	// A signature an earlier upload left for another document.

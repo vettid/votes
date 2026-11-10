@@ -176,9 +176,10 @@ type Deadlines struct {
 // Worst is the longest a call can take with every hop at its deadline.
 func (d Deadlines) Worst() time.Duration {
 	// Prepare and the held-bundle read, the claim (read, create, read),
-	// the lease, the sign, its keeping, journal and mark, the TSA and its
-	// keeping, Rekor and its keeping, the upload, the completion.
-	return 2*d.Site + 3*d.Claims + d.Claims + d.Key + 3*d.Claims + d.TSA + d.Claims + d.Rekor + d.Claims + d.Site + d.Claims
+	// the lease and its reload, the sign, its keeping, journal and mark,
+	// the TSA, its keeping and a reload, Rekor, its keeping and a reload,
+	// the upload, the completion, and the margin.
+	return 2*d.Site + 3*d.Claims + 2*d.Claims + d.Key + 3*d.Claims + d.TSA + 2*d.Claims + d.Rekor + 2*d.Claims + d.Site + d.Claims + d.Margin
 }
 
 // signWindow is how much of the call's time a sign needs: the KMS call and
@@ -272,10 +273,11 @@ func (s *Signer) Handle(ctx context.Context, req Request) (Result, error) {
 		return Result{Status: http.StatusConflict, Code: CodeClaimConflict}, nil
 	}
 
-	// 3. Already published: the same upload again with the bundle the site
-	// holds, never a new sign, so that an index a failure left undone is
-	// finished, and the answer is the site's.
-	if prep.Published {
+	// 3. Already published, or a bundle the site holds for these bytes
+	// (an earlier partial upload's, which the upload would keep): the same
+	// upload again with that bundle, never a new sign, so that an index a
+	// failure left undone is finished, and the answer is the site's.
+	if prep.Published || prep.Held {
 		var b []byte
 		err := s.hop(ctx, s.Deadlines.Site, func(ctx context.Context) error {
 			var err error
@@ -288,8 +290,8 @@ func (s *Signer) Handle(ctx context.Context, req Request) (Result, error) {
 		if b != nil {
 			return s.upload(ctx, req, c, b, false, true)
 		}
-		// Held without a bundle can't be: the site writes the document
-		// last. Go on, and the upload of the same bytes fills it in.
+		// A published document without a bundle can't be: the site writes
+		// the document last. Go on, and the upload fills it in.
 	}
 	resumed := c.Sig != nil
 
@@ -436,7 +438,10 @@ func (s *Signer) sign(ctx context.Context, req Request, slot string, c *Claim) (
 	if errors.Is(err, ErrSet) {
 		// Another call is signing, or has signed since we read.
 		k, rerr := s.reload(ctx, slot)
-		if rerr == nil && k.Sig != nil && bytes.Equal(k.Digest, c.Digest) {
+		switch {
+		case rerr != nil:
+			return nil, fmt.Errorf("signer: lease: %w", rerr)
+		case k.Sig != nil && bytes.Equal(k.Digest, c.Digest):
 			return k, nil
 		}
 		return nil, ErrBusy
@@ -536,7 +541,17 @@ func (s *Signer) complete(ctx context.Context, req Request, c *Claim, bundle []b
 	} else {
 		s.log().Warn("bundle times", "proposal_id", req.ProposalID, "name", req.Name, "err", err.Error())
 	}
-	if err := s.hop(context.WithoutCancel(ctx), s.Deadlines.Claims, func(ctx context.Context) error {
+	// Within the call's own time, less a margin, so that the call still
+	// answers before Lambda's deadline.
+	d := s.Deadlines.Claims
+	if dl, ok := ctx.Deadline(); ok {
+		d = min(d, time.Until(dl)-time.Second)
+	}
+	if d <= 0 {
+		s.log().Error("journal completion: no time left", "proposal_id", req.ProposalID, "name", req.Name)
+		return
+	}
+	if err := s.hop(context.WithoutCancel(ctx), d, func(ctx context.Context) error {
 		return s.Journal.Complete(ctx, e)
 	}); err != nil {
 		s.log().Error("journal completion", "proposal_id", req.ProposalID, "name", req.Name, "err", err.Error())

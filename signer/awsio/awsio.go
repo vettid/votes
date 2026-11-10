@@ -74,8 +74,12 @@ func (k *Key) Public() *ecdsa.PublicKey { return k.pub }
 // SignDigest implements anchor.DigestSigner. The anchor package checks the
 // signature against Public before it is used.
 func (k *Key) SignDigest(ctx context.Context, digest []byte) ([]byte, error) {
+	// One attempt only: an SDK retry after a Sign whose answer was lost
+	// would be a second sign the journal never sees. A retry of the whole
+	// call goes through the claim and its lease.
 	out, err := k.Client.Sign(ctx, &kms.SignInput{KeyId: aws.String(k.KeyID), Message: digest,
-		MessageType: kmstypes.MessageTypeDigest, SigningAlgorithm: kmstypes.SigningAlgorithmSpecEcdsaSha256})
+		MessageType: kmstypes.MessageTypeDigest, SigningAlgorithm: kmstypes.SigningAlgorithmSpecEcdsaSha256},
+		NoRetry)
 	if sink := signer.RequestIDSink(ctx); sink != nil {
 		switch {
 		case out != nil:
@@ -92,6 +96,9 @@ func (k *Key) SignDigest(ctx context.Context, digest []byte) ([]byte, error) {
 	}
 	return out.Signature, nil
 }
+
+// NoRetry makes a KMS call a single attempt.
+func NoRetry(o *kms.Options) { o.RetryMaxAttempts = 1 }
 
 // DynamoAPI is the part of the DynamoDB client the claims use.
 type DynamoAPI interface {
@@ -342,7 +349,18 @@ func (s *Site) Bundle(ctx context.Context, id, name string) ([]byte, error) {
 	return b, err
 }
 
-// Upload implements signer.Site.
+// siteCodes are the error codes the site's upload answers with
+// (VOTES-SITE §4): a 4xx carrying one is the site's answer on the
+// document; anything else is not.
+var siteCodes = map[string]bool{"not_found": true, "bad_request": true, "too_large": true, "bad_document": true,
+	"bad_signature": true, "bad_anchor": true, "unknown_service": true, "unknown_proposal": true, "too_late": true,
+	"too_early": true, "out_of_order": true, "differs": true, "sig_mismatch": true, "extension_pending": true}
+
+// Upload implements signer.Site. Only the site's own answers count: a
+// 200 or 201 naming the document published, or a 4xx with one of the
+// site's codes. Anything else (a redirect, a CDN's or a firewall's
+// refusal, an answer without a body) is an error, to retry: the signer
+// never takes a guess for "published" or for a refusal.
 func (s *Site) Upload(ctx context.Context, id, name string, u *site.Upload) (int, string, bool, error) {
 	body, err := json.Marshal(u)
 	if err != nil {
@@ -363,11 +381,18 @@ func (s *Site) Upload(ctx context.Context, id, name string, u *site.Upload) (int
 		return 0, "", false, err
 	}
 	var ans struct {
+		Published    string `json:"published"`
 		Error        string `json:"error"`
 		IndexUpdated bool   `json:"index_updated"`
 	}
-	_ = json.Unmarshal(raw, &ans)
-	return resp.StatusCode, ans.Error, ans.IndexUpdated, nil
+	jerr := json.Unmarshal(raw, &ans)
+	switch st := resp.StatusCode; {
+	case (st == http.StatusOK || st == http.StatusCreated) && jerr == nil && ans.Published == name:
+		return st, "", ans.IndexUpdated, nil
+	case st >= 400 && st < 500 && st != http.StatusTooManyRequests && jerr == nil && siteCodes[ans.Error]:
+		return st, ans.Error, false, nil
+	}
+	return 0, "", false, fmt.Errorf("awsio: upload: an answer that isn't the site's (%d)", resp.StatusCode)
 }
 
 // Times implements signer.Site.
