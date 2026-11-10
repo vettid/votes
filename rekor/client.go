@@ -2,7 +2,8 @@
 // for votesctl check -rekor (docs/VOTES-SITE.md §7, "The Rekor check"):
 // the log's signed checkpoint, consistency proofs, the deprecated search
 // by public key, and entries by entry ID or log index, each verified
-// before it is used. It only reads: no request it makes adds to the log.
+// before it is used. It only reads: an allowlist of four endpoints, none
+// of which adds to the log.
 package rekor
 
 import (
@@ -13,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,25 +29,46 @@ const (
 	MaxRequests = 1000
 	// MaxBatch is the most entries one entries/retrieve request names.
 	MaxBatch = 10
+	// MaxRetryAfter bounds a Retry-After pause (chosen; not in the spec).
+	MaxRetryAfter = 60 * time.Second
 	// maxBody bounds an answer read.
 	maxBody = 16 << 20
 )
 
-// retries are the pauses before each retry of a request that failed with
-// a network error, a 429 or a 5xx.
+// retries are the pauses before each retry of a request that got no
+// answer: a network error, a 429 or a 5xx.
 var retries = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
 
-// Errors a request can end with.
+// allowed is every request the client may send: method and path. Nothing
+// else is sent; in particular not POST /api/v1/log/entries, which adds an
+// entry to the log.
+var allowed = map[string]string{
+	"/api/v1/log":                  http.MethodGet,
+	"/api/v1/log/proof":            http.MethodGet,
+	"/api/v1/index/retrieve":       http.MethodPost,
+	"/api/v1/log/entries/retrieve": http.MethodPost,
+}
+
+// The kinds of failure (VOTES-SITE §7, "Two kinds of failure").
 var (
-	// ErrCap is a request past MaxRequests: the run stops there.
-	ErrCap = errors.New("rekor: the run's request cap is reached")
-	// ErrGone is a 404 or 410 from an endpoint the check needs (the
-	// search, in Rekor v2): it is not retried.
+	// ErrUnavailable: no answer, after the retries (a network error, a 429
+	// or a 5xx). Only this counts toward "Rekor unavailable".
+	ErrUnavailable = errors.New("rekor: no answer")
+	// ErrBadAnswer: an answer that arrived but is malformed, or another
+	// 4xx: a mismatch at once.
+	ErrBadAnswer = errors.New("rekor: a bad answer")
+	// ErrGone: a 404, 410 or 501 from an endpoint the check needs (the
+	// search, in Rekor v2): a mismatch at once, not retried.
 	ErrGone = errors.New("rekor: the endpoint is gone")
+	// ErrCap: a request past MaxRequests; the run stops there.
+	ErrCap = errors.New("rekor: the run's request cap is reached")
+	// ErrNotAllowed: a request outside the allowlist; never sent.
+	ErrNotAllowed = errors.New("rekor: a request the check never makes")
 )
 
-// StatusError is an answer other than 200 that is not retried or still
-// failed after the retries.
+// StatusError is an HTTP answer the client didn't take: errors.Is it
+// with ErrUnavailable (429, 5xx), ErrGone (404, 410, 501) or ErrBadAnswer
+// (another status).
 type StatusError struct {
 	Path   string
 	Status int
@@ -53,8 +76,20 @@ type StatusError struct {
 
 func (e *StatusError) Error() string { return fmt.Sprintf("rekor: %s answered %d", e.Path, e.Status) }
 
+// Unwrap gives the kind of failure.
+func (e *StatusError) Unwrap() error {
+	switch {
+	case e.Status == http.StatusTooManyRequests || e.Status >= 500 && e.Status != http.StatusNotImplemented:
+		return ErrUnavailable
+	case e.Status == http.StatusNotFound || e.Status == http.StatusGone || e.Status == http.StatusNotImplemented:
+		return ErrGone
+	}
+	return ErrBadAnswer
+}
+
 // Client reads one Rekor v1 instance, one request at a time, paced and
-// capped.
+// capped. It is safe for concurrent use; requests are still sent one at
+// a time.
 type Client struct {
 	// Base is the instance's URL, e.g. https://rekor.sigstage.dev.
 	Base string
@@ -66,6 +101,7 @@ type Client struct {
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error
 
+	// mu is held for a whole request, retries included: one at a time.
 	mu   sync.Mutex
 	last time.Time
 	n    int
@@ -87,7 +123,7 @@ func (c *Client) now() time.Time {
 
 func (c *Client) sleep(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
-		return nil
+		return ctx.Err()
 	}
 	if c.Sleep != nil {
 		return c.Sleep(ctx, d)
@@ -102,38 +138,37 @@ func (c *Client) sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// slot waits for the pacing gap and takes one request of the cap.
+// slot waits for the pacing gap and takes one request of the cap (c.mu
+// held).
 func (c *Client) slot(ctx context.Context) error {
-	gap, max := c.Gap, c.Max
+	gap, limit := c.Gap, c.Max
 	if gap == 0 {
 		gap = Gap
 	}
-	if max == 0 {
-		max = MaxRequests
+	if limit == 0 {
+		limit = MaxRequests
 	}
-	c.mu.Lock()
-	if c.n >= max {
-		c.mu.Unlock()
+	if c.n >= limit {
 		return ErrCap
 	}
-	wait := gap - c.now().Sub(c.last)
-	if c.last.IsZero() {
-		wait = 0
-	}
-	c.n++
-	c.mu.Unlock()
-	if err := c.sleep(ctx, wait); err != nil {
+	if !c.last.IsZero() {
+		if err := c.sleep(ctx, gap-c.now().Sub(c.last)); err != nil {
+			return err
+		}
+	} else if err := ctx.Err(); err != nil {
 		return err
 	}
-	c.mu.Lock()
+	c.n++
 	c.last = c.now()
-	c.mu.Unlock()
 	return nil
 }
 
-// do sends one request (body JSON if non-nil) and decodes a 200's JSON
-// into out, retrying a network error, a 429 or a 5xx.
-func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+// do sends one request (body as JSON if non-nil) and decodes a 200's JSON
+// into out, retrying an attempt that got no answer.
+func (c *Client) do(ctx context.Context, method, path string, query url.Values, body, out any) error {
+	if allowed[path] != method {
+		return fmt.Errorf("%w: %s %s", ErrNotAllowed, method, path)
+	}
 	var payload []byte
 	if body != nil {
 		var err error
@@ -145,12 +180,18 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	if hc == nil {
 		hc = http.DefaultClient
 	}
+	target := strings.TrimSuffix(c.Base, "/") + path
+	if len(query) > 0 {
+		target += "?" + query.Encode()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var lastErr error
 	for attempt := 0; ; attempt++ {
 		if err := c.slot(ctx); err != nil {
 			return err
 		}
-		req, err := http.NewRequestWithContext(ctx, method, strings.TrimSuffix(c.Base, "/")+path, bytes.NewReader(payload))
+		req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(payload))
 		if err != nil {
 			return err
 		}
@@ -159,44 +200,44 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 			req.Header.Set("Content-Type", "application/json")
 		}
 		resp, err := hc.Do(req)
-		retryAfter := time.Duration(0)
-		switch {
-		case err != nil:
+		pause := time.Duration(0)
+		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			lastErr = fmt.Errorf("rekor: %s: %w", path, err)
-		default:
+			lastErr = fmt.Errorf("%w: %s: %v", ErrUnavailable, path, err)
+		} else {
 			data, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 			resp.Body.Close()
-			switch {
-			case resp.StatusCode == http.StatusOK:
-				if rerr != nil {
-					lastErr = fmt.Errorf("rekor: %s: %w", path, rerr)
-					break
+			if resp.StatusCode == http.StatusOK {
+				switch {
+				case rerr != nil:
+					lastErr = fmt.Errorf("%w: %s: %v", ErrUnavailable, path, rerr)
+				case len(data) > maxBody:
+					return fmt.Errorf("%w: %s: answer over %d bytes", ErrBadAnswer, path, maxBody)
+				default:
+					if err := json.Unmarshal(data, out); err != nil {
+						return fmt.Errorf("%w: %s: %v", ErrBadAnswer, path, err)
+					}
+					return nil
 				}
-				if len(data) > maxBody {
-					return fmt.Errorf("rekor: %s: answer over %d bytes", path, maxBody)
+			} else {
+				se := &StatusError{Path: path, Status: resp.StatusCode}
+				if !errors.Is(se, ErrUnavailable) {
+					return se
 				}
-				if err := json.Unmarshal(data, out); err != nil {
-					return fmt.Errorf("rekor: %s: %w", path, err)
-				}
-				return nil
-			case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
-				return fmt.Errorf("%w: %s answered %d", ErrGone, path, resp.StatusCode)
-			case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
-				lastErr = &StatusError{Path: path, Status: resp.StatusCode}
+				lastErr = se
+				// Retry-After in seconds is taken, up to MaxRetryAfter; an
+				// HTTP date is ignored (the fixed pauses apply).
 				if s, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && s > 0 {
-					retryAfter = time.Duration(s) * time.Second
+					pause = min(time.Duration(s)*time.Second, MaxRetryAfter)
 				}
-			default:
-				return &StatusError{Path: path, Status: resp.StatusCode}
 			}
 		}
 		if attempt >= len(retries) {
 			return lastErr
 		}
-		if err := c.sleep(ctx, max(retries[attempt], retryAfter)); err != nil {
+		if err := c.sleep(ctx, max(retries[attempt], pause)); err != nil {
 			return err
 		}
 	}
@@ -221,7 +262,7 @@ type LogInfo struct {
 // LogInfo returns the log's state.
 func (c *Client) LogInfo(ctx context.Context) (*LogInfo, error) {
 	var li LogInfo
-	if err := c.do(ctx, http.MethodGet, "/api/v1/log", nil, &li); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/api/v1/log", nil, nil, &li); err != nil {
 		return nil, err
 	}
 	return &li, nil
@@ -231,30 +272,32 @@ func (c *Client) LogInfo(ctx context.Context) (*LogInfo, error) {
 // consistent with the one of size last, in the shard treeID (the active
 // shard if empty).
 func (c *Client) ConsistencyProof(ctx context.Context, first, last int64, treeID string) ([]string, error) {
-	q := "/api/v1/log/proof?firstSize=" + strconv.FormatInt(first, 10) + "&lastSize=" + strconv.FormatInt(last, 10)
+	q := url.Values{"firstSize": {strconv.FormatInt(first, 10)}, "lastSize": {strconv.FormatInt(last, 10)}}
 	if treeID != "" {
-		q += "&treeID=" + treeID
+		if _, err := strconv.ParseUint(treeID, 10, 64); err != nil {
+			return nil, fmt.Errorf("rekor: tree ID %q isn't a number", treeID)
+		}
+		q.Set("treeID", treeID)
 	}
 	var p struct {
-		Hashes   []string `json:"hashes"`
-		RootHash string   `json:"rootHash"`
+		Hashes []string `json:"hashes"`
 	}
-	if err := c.do(ctx, http.MethodGet, q, nil, &p); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/api/v1/log/proof", q, nil, &p); err != nil {
 		return nil, err
 	}
 	return p.Hashes, nil
 }
 
 // SearchKey returns the entry IDs Rekor's index holds for a public key
-// (POST /api/v1/index/retrieve). The index is deprecated and best-effort,
-// and holds a key as it was submitted (VOTES-SITE §7, "Not guaranteed").
+// (POST /api/v1/index/retrieve). The index is deprecated, best-effort and
+// unsigned (VOTES-SITE §7, "Not guaranteed").
 func (c *Client) SearchKey(ctx context.Context, pem []byte) ([]string, error) {
 	type key struct {
 		Format  string `json:"format"`
 		Content []byte `json:"content"`
 	}
 	var ids []string
-	if err := c.do(ctx, http.MethodPost, "/api/v1/index/retrieve", map[string]key{"publicKey": {Format: "x509", Content: pem}}, &ids); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/api/v1/index/retrieve", nil, map[string]key{"publicKey": {Format: "x509", Content: pem}}, &ids); err != nil {
 		return nil, err
 	}
 	return ids, nil
@@ -279,7 +322,10 @@ type Entry struct {
 }
 
 // Entries returns the entries with these IDs (at most MaxBatch), by the
-// IDs Rekor returns them under; one it doesn't hold is absent.
+// lower-case IDs Rekor returns them under. Rekor's answer is not trusted
+// to hold only what was asked: callers match each entry by its verified
+// leaf hash (Verified.Leaf) or log index, which the signed entry
+// timestamp binds.
 func (c *Client) Entries(ctx context.Context, ids []string) (map[string]*Entry, error) {
 	if len(ids) == 0 || len(ids) > MaxBatch {
 		return nil, fmt.Errorf("rekor: %d entry IDs in one request", len(ids))
@@ -287,7 +333,8 @@ func (c *Client) Entries(ctx context.Context, ids []string) (map[string]*Entry, 
 	return c.entries(ctx, map[string]any{"entryUUIDs": ids})
 }
 
-// EntriesAt returns the entries at these log indexes (at most MaxBatch).
+// EntriesAt returns the entries at these log indexes (at most MaxBatch),
+// as Entries.
 func (c *Client) EntriesAt(ctx context.Context, indexes []int64) (map[string]*Entry, error) {
 	if len(indexes) == 0 || len(indexes) > MaxBatch {
 		return nil, fmt.Errorf("rekor: %d log indexes in one request", len(indexes))
@@ -297,14 +344,14 @@ func (c *Client) EntriesAt(ctx context.Context, indexes []int64) (map[string]*En
 
 func (c *Client) entries(ctx context.Context, body map[string]any) (map[string]*Entry, error) {
 	var answer []map[string]*Entry
-	if err := c.do(ctx, http.MethodPost, "/api/v1/log/entries/retrieve", body, &answer); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/api/v1/log/entries/retrieve", nil, body, &answer); err != nil {
 		return nil, err
 	}
 	out := map[string]*Entry{}
 	for _, m := range answer {
 		for id, e := range m {
 			if e == nil {
-				return nil, fmt.Errorf("rekor: entry %s without content", id)
+				return nil, fmt.Errorf("%w: entry %s without content", ErrBadAnswer, id)
 			}
 			out[strings.ToLower(id)] = e
 		}

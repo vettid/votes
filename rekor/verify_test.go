@@ -1,6 +1,7 @@
 package rekor
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -92,7 +93,7 @@ func TestVerifyRecordedEntries(t *testing.T) {
 	var li LogInfo
 	fixture(t, "log-before.json", &li)
 	for id, e := range entries(t) {
-		v, err := VerifyEntry(ctx, id, e, host, logs, anchors(t))
+		v, err := VerifyEntry(ctx, id, e, host, logs, anchors(t), at)
 		if err != nil {
 			t.Fatalf("%s: %v", id, err)
 		}
@@ -160,24 +161,24 @@ func TestVerifyEntryRefuses(t *testing.T) {
 	}
 	for name, change := range cases {
 		gotID, e := change(clone())
-		if _, err := VerifyEntry(ctx, gotID, e, host, logs, anchors(t)); !errors.Is(err, ErrUnverified) {
+		if _, err := VerifyEntry(ctx, gotID, e, host, logs, anchors(t), at); !errors.Is(err, ErrUnverified) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	if _, err := VerifyEntry(ctx, id, clone(), host, logs, nil); !errors.Is(err, ErrNotAnchor) {
+	if _, err := VerifyEntry(ctx, id, clone(), host, logs, nil, at); !errors.Is(err, ErrNotAnchor) {
 		t.Errorf("no anchor key: %v", err)
 	}
-	if _, err := VerifyEntry(ctx, id, clone(), "rekor.sigstore.dev", logs, anchors(t)); !errors.Is(err, ErrUnverified) {
+	if _, err := VerifyEntry(ctx, id, clone(), "rekor.sigstore.dev", logs, anchors(t), at); !errors.Is(err, ErrUnverified) {
 		t.Errorf("another host: %v", err)
 	}
-	if _, err := VerifyEntry(ctx, id, clone(), host, Logs{}, anchors(t)); !errors.Is(err, ErrUnverified) {
+	if _, err := VerifyEntry(ctx, id, clone(), host, Logs{}, anchors(t), at); !errors.Is(err, ErrUnverified) {
 		t.Errorf("no trusted log: %v", err)
 	}
-	if _, err := VerifyEntry(ctx, strings.ToUpper(id), clone(), host, logs, anchors(t)); err != nil {
+	if _, err := VerifyEntry(ctx, strings.ToUpper(id), clone(), host, logs, anchors(t), at); err != nil {
 		t.Errorf("upper-case id: %v", err)
 	}
 	// Named by its leaf hash, whatever tree ID prefix Rekor gives it.
-	if v, err := VerifyEntry(ctx, flip(id), clone(), host, logs, anchors(t)); err != nil || v.Leaf != id[16:] {
+	if v, err := VerifyEntry(ctx, flip(id), clone(), host, logs, anchors(t), at); err != nil || v.Leaf != id[16:] {
 		t.Errorf("another tree prefix: %v", err)
 	}
 }
@@ -231,7 +232,7 @@ func TestCheckBody(t *testing.T) {
 		"certificate": certPEM,
 	} {
 		b := body(t, "hashedrekord", "0.0.1", "sha256", dh, kp, sig)
-		if got, err := checkBody(b); err != nil || hex.EncodeToString(got) != dh {
+		if got, key, err := checkBody(b); err != nil || hex.EncodeToString(got) != dh || !bytes.Equal(key, spki) {
 			t.Errorf("%s: %v", name, err)
 		}
 		e := &Entry{Body: base64.StdEncoding.EncodeToString(b)}
@@ -250,7 +251,7 @@ func TestCheckBody(t *testing.T) {
 		"not json":  []byte("{"),
 	}
 	for name, b := range bad {
-		if _, err := checkBody(b); err == nil {
+		if _, _, err := checkBody(b); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
@@ -324,5 +325,90 @@ func TestCheckpointsAndConsistency(t *testing.T) {
 	}
 	if _, err := VerifyCheckpoint(before.SignedTreeHead, host, logs, time.Unix(0, 0)); err == nil {
 		t.Error("verified before the log key's validity")
+	}
+}
+
+// An anchor key is found anywhere in a body, of any kind (a DSSE
+// envelope's verifier, in base64; an in-toto one's), so the scan keeps
+// it; it then fails as unverified, not being a hashedrekord.
+func TestAnchorOfAnyKind(t *testing.T) {
+	ctx := context.Background()
+	b, _ := base64.StdEncoding.DecodeString(stagingSPKI)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: b})
+	bodies := map[string]any{
+		"dsse": map[string]any{"kind": "dsse", "apiVersion": "0.0.1", "spec": map[string]any{
+			"signatures": []any{map[string]any{"signature": "c2ln", "verifier": base64.StdEncoding.EncodeToString(keyPEM)}}}},
+		"intoto": map[string]any{"kind": "intoto", "apiVersion": "0.0.2", "spec": map[string]any{"content": map[string]any{
+			"envelope": map[string]any{"signatures": []any{map[string]any{"publicKey": base64.StdEncoding.EncodeToString(keyPEM)}}}}}},
+		"raw pem, after another block": map[string]any{"kind": "x", "spec": map[string]any{"key": "-----BEGIN JUNK-----\nAA==\n-----END JUNK-----\n" + string(keyPEM)}},
+	}
+	for name, v := range bodies {
+		body, _ := json.Marshal(v)
+		e := &Entry{Body: base64.StdEncoding.EncodeToString(body)}
+		if AnchorOf(e, anchors(t)) == nil {
+			t.Errorf("%s: anchor key not found", name)
+			continue
+		}
+		id := hex.EncodeToString(make([]byte, 8)) + hex.EncodeToString(leafHash(body))
+		if _, err := VerifyEntry(ctx, id, e, host, stagingLogs(t), anchors(t), at); !errors.Is(err, ErrUnverified) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	none, _ := json.Marshal(map[string]any{"kind": "dsse", "spec": map[string]any{"x": base64.StdEncoding.EncodeToString([]byte("not a key"))}})
+	if AnchorOf(&Entry{Body: base64.StdEncoding.EncodeToString(none)}, anchors(t)) != nil {
+		t.Error("found an anchor key in a body without one")
+	}
+}
+
+func leafHash(b []byte) []byte {
+	h := sha256.Sum256(append([]byte{0}, b...))
+	return h[:]
+}
+
+// The entry's time against the time it is verified: within Skew it is
+// accepted, later it is unverified. The log's key: only the instance's
+// (by base URL), only within its validity, never one without a start.
+func TestVerifyEntryTimeAndKeys(t *testing.T) {
+	ctx := context.Background()
+	logs := stagingLogs(t)
+	var id string
+	var e *Entry
+	for k, v := range entries(t) {
+		id, e = k, v
+		break
+	}
+	integrated := time.Unix(e.IntegratedTime, 0)
+	if _, err := VerifyEntry(ctx, id, e, host, logs, anchors(t), integrated.Add(-Skew+time.Second)); err != nil {
+		t.Errorf("within the skew: %v", err)
+	}
+	if _, err := VerifyEntry(ctx, id, e, host, logs, anchors(t), integrated.Add(-Skew-time.Second)); !errors.Is(err, ErrUnverified) {
+		t.Errorf("after it was verified: %v", err)
+	}
+	if _, err := VerifyEntry(ctx, "zz"+id[2:], e, host, logs, anchors(t), at); !errors.Is(err, ErrUnverified) {
+		t.Errorf("an id not hex: %v", err)
+	}
+	change := func(f func(tl *root.TransparencyLog)) Logs {
+		out := Logs{}
+		for k, v := range logs {
+			c := *v
+			f(&c)
+			out[k] = &c
+		}
+		return out
+	}
+	for name, l := range map[string]Logs{
+		"another host's logs": change(func(tl *root.TransparencyLog) { tl.BaseURL = "https://rekor.example" }),
+		"key ended before":    change(func(tl *root.TransparencyLog) { tl.ValidityPeriodEnd = integrated.Add(-time.Hour) }),
+		"key without a start": change(func(tl *root.TransparencyLog) { tl.ValidityPeriodStart = time.Time{} }),
+		"key started after":   change(func(tl *root.TransparencyLog) { tl.ValidityPeriodStart = integrated.Add(time.Hour) }),
+	} {
+		if _, err := VerifyEntry(ctx, id, e, host, l, anchors(t), at); !errors.Is(err, ErrUnverified) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	var li LogInfo
+	fixture(t, "log-before.json", &li)
+	if _, err := VerifyCheckpoint(li.SignedTreeHead, host, change(func(tl *root.TransparencyLog) { tl.BaseURL = "https://rekor.example" }), at); !errors.Is(err, ErrUnverified) {
+		t.Errorf("a checkpoint under another host's key: %v", err)
 	}
 }
