@@ -31,6 +31,9 @@ const (
 	MaxBatch = 10
 	// MaxRetryAfter bounds a Retry-After pause (chosen; not in the spec).
 	MaxRetryAfter = 60 * time.Second
+	// AttemptTimeout bounds one attempt (chosen; not in the spec): one
+	// that takes longer got no answer, and is retried.
+	AttemptTimeout = 30 * time.Second
 	// maxBody bounds an answer read.
 	maxBody = 16 << 20
 )
@@ -94,9 +97,11 @@ type Client struct {
 	// Base is the instance's URL, e.g. https://rekor.sigstage.dev.
 	Base string
 	HTTP *http.Client
-	// Gap and Max override the pacing (tests); zero takes the defaults.
-	Gap time.Duration
-	Max int
+	// Gap, Max and Attempt override the pacing and the attempt timeout
+	// (tests); zero takes the defaults.
+	Gap     time.Duration
+	Max     int
+	Attempt time.Duration
 	// Now and Sleep are the clock (tests).
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error
@@ -198,8 +203,14 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		if err := c.slot(ctx); err != nil {
 			return err
 		}
-		req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(payload))
+		timeout := c.Attempt
+		if timeout == 0 {
+			timeout = AttemptTimeout
+		}
+		actx, cancel := context.WithTimeout(ctx, timeout)
+		req, err := http.NewRequestWithContext(actx, method, target, bytes.NewReader(payload))
 		if err != nil {
+			cancel()
 			return err
 		}
 		req.Header.Set("Accept", "application/json")
@@ -209,13 +220,19 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		resp, err := hc.Do(req)
 		pause := time.Duration(0)
 		if err != nil {
+			cancel()
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			// A network error, or the attempt's timeout: no answer.
 			lastErr = fmt.Errorf("%w: %s: %v", ErrUnavailable, path, err)
 		} else {
 			data, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 			resp.Body.Close()
+			cancel()
+			if rerr != nil && ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if resp.StatusCode == http.StatusOK {
 				switch {
 				case rerr != nil:
@@ -242,6 +259,10 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 			}
 		}
 		if attempt >= len(retries) {
+			// The run's own deadline is not the log's silence.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			return lastErr
 		}
 		if err := c.sleep(ctx, max(retries[attempt], pause)); err != nil {
@@ -287,12 +308,15 @@ func (c *Client) ConsistencyProof(ctx context.Context, first, last int64, treeID
 		q.Set("treeID", treeID)
 	}
 	var p struct {
-		Hashes []string `json:"hashes"`
+		Hashes *[]string `json:"hashes"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/api/v1/log/proof", q, nil, &p); err != nil {
 		return nil, err
 	}
-	return p.Hashes, nil
+	if p.Hashes == nil {
+		return nil, fmt.Errorf("%w: a consistency proof without hashes", ErrBadAnswer)
+	}
+	return *p.Hashes, nil
 }
 
 // SearchKey returns the entry IDs Rekor's index holds for a public key
@@ -303,11 +327,14 @@ func (c *Client) SearchKey(ctx context.Context, pem []byte) ([]string, error) {
 		Format  string `json:"format"`
 		Content []byte `json:"content"`
 	}
-	var ids []string
+	var ids *[]string
 	if err := c.do(ctx, http.MethodPost, "/api/v1/index/retrieve", nil, map[string]key{"publicKey": {Format: "x509", Content: pem}}, &ids); err != nil {
 		return nil, err
 	}
-	return ids, nil
+	if ids == nil {
+		return nil, fmt.Errorf("%w: a search answered null", ErrBadAnswer)
+	}
+	return *ids, nil
 }
 
 // Entry is a Rekor v1 log entry as the API gives it.

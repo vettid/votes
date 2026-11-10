@@ -43,7 +43,22 @@ func newTestLog(t *testing.T) *testLog {
 
 func (l *testLog) log(t *testing.T, body []byte, integrated time.Time) (string, *Entry) {
 	t.Helper()
-	leaf := rfc6962.DefaultHasher.HashLeaf(body)
+	return l.logIn(t, body, integrated, 1, 1)
+}
+
+// logIn logs body as leaf 0 of a tree of size leaves (1 or 4), the proof
+// claiming claimed as its tree size.
+func (l *testLog) logIn(t *testing.T, body []byte, integrated time.Time, size, claimed int64) (string, *Entry) {
+	t.Helper()
+	hs := rfc6962.DefaultHasher
+	leaf := hs.HashLeaf(body)
+	root, path := leaf, []string{}
+	if size == 4 {
+		l1, l2, l3 := hs.HashLeaf([]byte("x1")), hs.HashLeaf([]byte("x2")), hs.HashLeaf([]byte("x3"))
+		right := hs.HashChildren(l2, l3)
+		root = hs.HashChildren(hs.HashChildren(leaf, l1), right)
+		path = []string{hex.EncodeToString(l1), hex.EncodeToString(right)}
+	}
 	e := &Entry{Body: base64.StdEncoding.EncodeToString(body), IntegratedTime: integrated.Unix(), LogID: l.id, LogIndex: 0}
 	// The signed entry timestamp: over the canonical JSON of body,
 	// integratedTime, logID and logIndex (keys in order, no spaces).
@@ -63,7 +78,7 @@ func (l *testLog) log(t *testing.T, body []byte, integrated time.Time) (string, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	sc, err := util.CreateSignedCheckpoint(util.Checkpoint{Origin: host + " - 42", Size: 1, Hash: leaf})
+	sc, err := util.CreateSignedCheckpoint(util.Checkpoint{Origin: host + " - 42", Size: uint64(size), Hash: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +92,7 @@ func (l *testLog) log(t *testing.T, body []byte, integrated time.Time) (string, 
 		LogIndex   int64    `json:"logIndex"`
 		RootHash   string   `json:"rootHash"`
 		TreeSize   int64    `json:"treeSize"`
-	}{Checkpoint: string(cp), Hashes: []string{}, LogIndex: 0, RootHash: hex.EncodeToString(leaf), TreeSize: 1}
+	}{Checkpoint: string(cp), Hashes: path, LogIndex: 0, RootHash: hex.EncodeToString(root), TreeSize: claimed}
 	return "0000000000000042" + hex.EncodeToString(leaf), e
 }
 
@@ -97,7 +112,7 @@ func TestWrongKind(t *testing.T) {
 	when := at.Add(-time.Hour)
 
 	id, e := l.log(t, body(t, "hashedrekord", "0.0.1", "sha256", dh, keyPEM, sig), when)
-	v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, at)
+	v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{CheckpointAt: at}, at)
 	if err != nil || hex.EncodeToString(v.Digest) != dh || v.Proof.TreeID != "42" {
 		t.Fatalf("a good entry: %+v %v", v, err)
 	}
@@ -112,7 +127,7 @@ func TestWrongKind(t *testing.T) {
 		"other key": append([]byte(`{"x":`+string(mustJSON(t, string(keyPEM)))+`,"y":`), append(body(t, "hashedrekord", "0.0.1", "sha256", dh, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: mustSPKI(t, "another")}), sig), '}')...),
 	} {
 		id, e := l.log(t, b, when)
-		v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, at)
+		v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{CheckpointAt: at}, at)
 		if !errors.Is(err, ErrWrongKind) || errors.Is(err, ErrUnverified) {
 			t.Errorf("%s: %v", name, err)
 		}
@@ -125,7 +140,7 @@ func TestWrongKind(t *testing.T) {
 	// log's checks fail, so unverified, whatever its body.
 	id, e = l.log(t, dsse, when)
 	e.Verification.SignedEntryTimestamp[10] ^= 1
-	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, at); !errors.Is(err, ErrUnverified) {
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{CheckpointAt: at}, at); !errors.Is(err, ErrUnverified) {
 		t.Errorf("broken SET: %v", err)
 	}
 }
@@ -147,4 +162,101 @@ func mustSPKI(t *testing.T, seed string) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// The log's checks come before the body: a body that doesn't parse, or
+// names no anchor key, is reported only once the log holds it.
+func TestLogChecksFirst(t *testing.T) {
+	ctx := context.Background()
+	l := newTestLog(t)
+	anchor := mustSPKI(t, "votes anchor key")
+	when := at.Add(-time.Hour)
+	pl := Place{CheckpointAt: at}
+	id, e := l.log(t, []byte("not json"), when)
+	if v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{anchor}, pl, at); !errors.Is(err, ErrUnparsed) || v == nil {
+		t.Errorf("unparsed: %v", err)
+	}
+	other, _ := json.Marshal(map[string]any{"kind": "hashedrekord", "spec": map[string]any{}})
+	id, e = l.log(t, other, when)
+	if v, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{anchor}, pl, at); !errors.Is(err, ErrNotAnchor) || v == nil {
+		t.Errorf("not an anchor's: %v", err)
+	}
+	// A body substituted under an ID: unverified, not "not ours".
+	e.Body = base64.StdEncoding.EncodeToString([]byte(`{"kind":"x"}`))
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{anchor}, pl, at); !errors.Is(err, ErrUnverified) || errors.Is(err, ErrNotAnchor) {
+		t.Errorf("substituted body: %v", err)
+	}
+	// IDs: only 80 hex digits.
+	for _, bad := range []string{id[16:], "00000000" + id[16:], id + "00"} {
+		if _, err := VerifyEntry(ctx, bad, e, host, l.logs, [][]byte{anchor}, pl, at); !errors.Is(err, ErrUnverified) {
+			t.Errorf("id of %d: %v", len(bad), err)
+		}
+	}
+}
+
+// A proof claiming another tree size than its checkpoint's is refused,
+// even where the inclusion alone would verify (index 0 has the same path
+// at sizes 3 and 4).
+func TestProofSize(t *testing.T) {
+	ctx := context.Background()
+	l := newTestLog(t)
+	anchor := testKey("votes anchor key")
+	aspki := mustSPKI(t, "votes anchor key")
+	digest := sha256.Sum256([]byte("a proposal"))
+	sig, _ := ecdsa.SignASN1(rand.Reader, anchor, digest[:])
+	b := body(t, "hashedrekord", "0.0.1", "sha256", hex.EncodeToString(digest[:]), pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: aspki}), sig)
+	pl := Place{CheckpointAt: at}
+	id, e := l.logIn(t, b, at.Add(-time.Hour), 4, 4)
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, pl, at); err != nil {
+		t.Fatalf("size 4: %v", err)
+	}
+	id, e = l.logIn(t, b, at.Add(-time.Hour), 4, 3)
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, pl, at); !errors.Is(err, ErrUnverified) {
+		t.Errorf("size 3 claimed of 4: %v", err)
+	}
+	// The index mapping: the global index is the shard's plus the offset.
+	id, e = l.log(t, b, at.Add(-time.Hour))
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{Offset: 1, CheckpointAt: at}, at); !errors.Is(err, ErrUnverified) {
+		t.Errorf("another offset: %v", err)
+	}
+}
+
+// The checkpoint's key: checked at CheckpointAt (the run's, for the
+// active shard), or at the integrated time when it is zero (an inactive
+// shard's).
+func TestCheckpointKeyTime(t *testing.T) {
+	ctx := context.Background()
+	l := newTestLog(t)
+	when := at.Add(-time.Hour)
+	for _, tl := range l.logs {
+		tl.ValidityPeriodEnd = when.Add(time.Minute)
+	}
+	anchor := testKey("votes anchor key")
+	aspki := mustSPKI(t, "votes anchor key")
+	digest := sha256.Sum256([]byte("a proposal"))
+	sig, _ := ecdsa.SignASN1(rand.Reader, anchor, digest[:])
+	id, e := l.log(t, body(t, "hashedrekord", "0.0.1", "sha256", hex.EncodeToString(digest[:]), pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: aspki}), sig), when)
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{CheckpointAt: at}, at); !errors.Is(err, ErrUnverified) {
+		t.Errorf("active shard, key ended before the run: %v", err)
+	}
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{}, at); err != nil {
+		t.Errorf("inactive shard, key valid at the entry: %v", err)
+	}
+}
+
+// The entry's signing key must be the anchor key found: a body naming
+// another key first, then the anchor's, is wrong kind.
+func TestSigningKeyIsAnchor(t *testing.T) {
+	ctx := context.Background()
+	l := newTestLog(t)
+	other := testKey("another signer")
+	ospki := mustSPKI(t, "another signer")
+	aspki := mustSPKI(t, "votes anchor key")
+	digest := sha256.Sum256([]byte("a proposal"))
+	sig, _ := ecdsa.SignASN1(rand.Reader, other, digest[:])
+	two := append(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: ospki}), pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: aspki})...)
+	id, e := l.log(t, body(t, "hashedrekord", "0.0.1", "sha256", hex.EncodeToString(digest[:]), two, sig), at.Add(-time.Hour))
+	if _, err := VerifyEntry(ctx, id, e, host, l.logs, [][]byte{aspki}, Place{CheckpointAt: at}, at); !errors.Is(err, ErrWrongKind) {
+		t.Errorf("signed by another key: %v", err)
+	}
 }

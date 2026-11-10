@@ -160,8 +160,8 @@ type Verified struct {
 	Proof *Checkpoint
 }
 
-// ErrNotAnchor is an entry that names none of the anchor keys (from the
-// scan: not one the check looks at).
+// ErrNotAnchor is an entry that passed the log's checks and names none of
+// the anchor keys (from the scan: not one the check looks at).
 var ErrNotAnchor = errors.New("rekor: the entry names no anchor key")
 
 // ErrUnverified wraps why an entry under an anchor key fails the log's
@@ -329,39 +329,57 @@ func checkBody(body []byte) (digest, spki []byte, err error) {
 	return digest, spki, nil
 }
 
+// ErrUnparsed is an entry that passed the log's checks but whose body
+// doesn't parse as JSON: a warning, counted (VOTES-SITE §7, "Staging's
+// scan", rekor.unparsed), as nothing in it can be read as an anchor
+// key's.
+var ErrUnparsed = errors.New("rekor: the entry's body doesn't parse")
+
+// Place says where an entry is checked: Offset, the sizes of the shards
+// before the proof's (LogInfo.InactiveShards), so that the global log
+// index is the shard's plus Offset; and CheckpointAt, the time the proof's
+// checkpoint key must be valid at: the run's for the active shard, or
+// zero for an inactive shard's, whose key is checked at the entry's
+// integrated time.
+type Place struct {
+	Offset       int64
+	CheckpointAt time.Time
+}
+
 // VerifyEntry verifies an entry Rekor returned under id (VOTES-SITE §7,
-// "Each entry found"): the ID is the entry's leaf hash; the body is a
-// hashedrekord 0.0.1 over a sha256 digest naming an anchor key, whose
-// ECDSA signature over the digest verifies; its signed entry timestamp
-// and its inclusion proof verify under the log's key in the trusted root,
-// and the proof's checkpoint is the log's (host); its integrated time is
-// not after verifiedAt (the time it is verified) plus Skew. An entry
-// naming no anchor key is ErrNotAnchor; one naming one that fails
-// anything else is ErrUnverified. Whether the proof's checkpoint is the
-// run's or consistent with it is the caller's to check (Verified.Proof).
+// "Each entry found"), the log's part first, any failure of which is
+// ErrUnverified (never acknowledged):
 //
-// With ErrWrongKind the Verified is returned too, without a Digest: the
-// log's part held, but whether its proof's checkpoint is the run's or
-// consistent with it is still the caller's to check, as for any entry.
-// One that isn't is inconsistent, not wrong kind: only then is the
-// finding acknowledgeable.
-func VerifyEntry(ctx context.Context, id string, e *Entry, host string, logs Logs, anchors [][]byte, verifiedAt time.Time) (*Verified, error) {
-	id = strings.ToLower(id)
-	body, err := base64.StdEncoding.DecodeString(e.Body)
-	if err != nil {
-		return nil, fmt.Errorf("%w: body isn't base64", ErrUnverified)
-	}
-	spki := AnchorOf(e, anchors)
-	if spki == nil {
-		return nil, ErrNotAnchor
-	}
+//   - the ID is 80 lowercase hex digits ending in the body's leaf hash;
+//   - its integrated time is not after verifiedAt plus Skew;
+//   - the log's key is the instance's (host) in the trusted root, valid
+//     then; its signed entry timestamp (over the global log index) and its
+//     inclusion proof (at the shard's) verify; the proof's checkpoint
+//     verifies, with the proof's root and size;
+//   - the global index is the shard's plus pl.Offset.
+//
+// Then the body: one that doesn't parse is ErrUnparsed; one naming no
+// anchor key ErrNotAnchor; one naming one that isn't a hashedrekord 0.0.1
+// over a sha256 digest signed by that key ErrWrongKind. With each of these
+// the Verified is returned too, without a Digest.
+//
+// Whether the proof's checkpoint is the run's or consistent with it is
+// the caller's to check (Verified.Proof), for every entry: one that isn't
+// is inconsistent, whatever else it is. Only then is wrong kind a finding
+// that may be acknowledged.
+func VerifyEntry(ctx context.Context, id string, e *Entry, host string, logs Logs, anchors [][]byte, pl Place, verifiedAt time.Time) (*Verified, error) {
 	fail := func(format string, a ...any) (*Verified, error) {
 		return nil, fmt.Errorf("%w: %s", ErrUnverified, fmt.Sprintf(format, a...))
 	}
-	if len(id) != 80 && len(id) != 64 || strings.Trim(id, "0123456789abcdef") != "" {
-		return fail("entry ID %q isn't 80 or 64 hex digits", id)
+	id = strings.ToLower(id)
+	if len(id) != 80 || strings.Trim(id, "0123456789abcdef") != "" {
+		return fail("entry ID %q isn't 80 hex digits", id)
 	}
-	leaf := id[len(id)-64:]
+	body, err := base64.StdEncoding.DecodeString(e.Body)
+	if err != nil {
+		return fail("body isn't base64")
+	}
+	leaf := id[16:]
 	if got := hex.EncodeToString(rfc6962.DefaultHasher.HashLeaf(body)); got != leaf {
 		return fail("entry ID isn't the body's leaf hash")
 	}
@@ -396,16 +414,31 @@ func VerifyEntry(ctx context.Context, id string, e *Entry, host string, logs Log
 	if err := rekorverify.VerifyLogEntry(ctx, anon, v); err != nil {
 		return fail("%v", err)
 	}
-	cp, err := VerifyCheckpoint(ip.Checkpoint, host, logs, integrated)
+	cpAt := pl.CheckpointAt
+	if cpAt.IsZero() {
+		cpAt = integrated
+	}
+	cp, err := VerifyCheckpoint(ip.Checkpoint, host, logs, cpAt)
 	if err != nil {
 		return fail("%v", err)
 	}
 	if root, err := hex.DecodeString(ip.RootHash); err != nil || !bytes.Equal(root, cp.Root) || int64(cp.Size) != ip.TreeSize {
 		return fail("the proof's root or size isn't its checkpoint's")
 	}
+	if e.LogIndex != ip.LogIndex+pl.Offset {
+		return fail("global index %d isn't the shard's %d plus %d", e.LogIndex, ip.LogIndex, pl.Offset)
+	}
 	// The log's checks hold: the body is what the log holds under this ID.
-	out := &Verified{ID: id, Leaf: leaf, LogIndex: e.LogIndex, ShardIndex: ip.LogIndex, SPKI: spki,
+	out := &Verified{ID: id, Leaf: leaf, LogIndex: e.LogIndex, ShardIndex: ip.LogIndex,
 		Integrated: integrated.UTC(), Proof: cp}
+	if !json.Valid(body) {
+		return out, ErrUnparsed
+	}
+	spki := AnchorOf(e, anchors)
+	if spki == nil {
+		return out, ErrNotAnchor
+	}
+	out.SPKI = spki
 	digest, keySPKI, err := checkBody(body)
 	if err != nil {
 		return out, fmt.Errorf("%w: %v", ErrWrongKind, err)

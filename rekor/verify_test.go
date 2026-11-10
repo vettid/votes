@@ -85,6 +85,19 @@ func entries(t *testing.T) map[string]*Entry {
 
 var at = time.Date(2026, 11, 10, 16, 0, 0, 0, time.UTC)
 
+// place is where the fixtures' entries are: in the active shard, after
+// the inactive shards, its checkpoint checked at the run's time.
+func place(t *testing.T) Place {
+	t.Helper()
+	var li LogInfo
+	fixture(t, "log-before.json", &li)
+	var off int64
+	for _, sh := range li.InactiveShards {
+		off += sh.TreeSize
+	}
+	return Place{Offset: off, CheckpointAt: at}
+}
+
 // The recorded entries verify: each an anchor key's, its digest, its
 // global and shard indexes, against a checkpoint of the log's.
 func TestVerifyRecordedEntries(t *testing.T) {
@@ -93,7 +106,7 @@ func TestVerifyRecordedEntries(t *testing.T) {
 	var li LogInfo
 	fixture(t, "log-before.json", &li)
 	for id, e := range entries(t) {
-		v, err := VerifyEntry(ctx, id, e, host, logs, anchors(t), at)
+		v, err := VerifyEntry(ctx, id, e, host, logs, anchors(t), place(t), at)
 		if err != nil {
 			t.Fatalf("%s: %v", id, err)
 		}
@@ -161,24 +174,24 @@ func TestVerifyEntryRefuses(t *testing.T) {
 	}
 	for name, change := range cases {
 		gotID, e := change(clone())
-		if _, err := VerifyEntry(ctx, gotID, e, host, logs, anchors(t), at); !errors.Is(err, ErrUnverified) {
+		if _, err := VerifyEntry(ctx, gotID, e, host, logs, anchors(t), place(t), at); !errors.Is(err, ErrUnverified) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	if _, err := VerifyEntry(ctx, id, clone(), host, logs, nil, at); !errors.Is(err, ErrNotAnchor) {
+	if _, err := VerifyEntry(ctx, id, clone(), host, logs, nil, place(t), at); !errors.Is(err, ErrNotAnchor) {
 		t.Errorf("no anchor key: %v", err)
 	}
-	if _, err := VerifyEntry(ctx, id, clone(), "rekor.sigstore.dev", logs, anchors(t), at); !errors.Is(err, ErrUnverified) {
+	if _, err := VerifyEntry(ctx, id, clone(), "rekor.sigstore.dev", logs, anchors(t), place(t), at); !errors.Is(err, ErrUnverified) {
 		t.Errorf("another host: %v", err)
 	}
-	if _, err := VerifyEntry(ctx, id, clone(), host, Logs{}, anchors(t), at); !errors.Is(err, ErrUnverified) {
+	if _, err := VerifyEntry(ctx, id, clone(), host, Logs{}, anchors(t), place(t), at); !errors.Is(err, ErrUnverified) {
 		t.Errorf("no trusted log: %v", err)
 	}
-	if _, err := VerifyEntry(ctx, strings.ToUpper(id), clone(), host, logs, anchors(t), at); err != nil {
+	if _, err := VerifyEntry(ctx, strings.ToUpper(id), clone(), host, logs, anchors(t), place(t), at); err != nil {
 		t.Errorf("upper-case id: %v", err)
 	}
 	// Named by its leaf hash, whatever tree ID prefix Rekor gives it.
-	if v, err := VerifyEntry(ctx, flip(id), clone(), host, logs, anchors(t), at); err != nil || v.Leaf != id[16:] {
+	if v, err := VerifyEntry(ctx, flip(id), clone(), host, logs, anchors(t), place(t), at); err != nil || v.Leaf != id[16:] {
 		t.Errorf("another tree prefix: %v", err)
 	}
 }
@@ -350,7 +363,7 @@ func TestAnchorOfAnyKind(t *testing.T) {
 			continue
 		}
 		id := hex.EncodeToString(make([]byte, 8)) + hex.EncodeToString(leafHash(body))
-		if _, err := VerifyEntry(ctx, id, e, host, stagingLogs(t), anchors(t), at); !errors.Is(err, ErrUnverified) {
+		if _, err := VerifyEntry(ctx, id, e, host, stagingLogs(t), anchors(t), place(t), at); !errors.Is(err, ErrUnverified) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -378,13 +391,13 @@ func TestVerifyEntryTimeAndKeys(t *testing.T) {
 		break
 	}
 	integrated := time.Unix(e.IntegratedTime, 0)
-	if _, err := VerifyEntry(ctx, id, e, host, logs, anchors(t), integrated.Add(-Skew+time.Second)); err != nil {
+	if _, err := VerifyEntry(ctx, id, e, host, logs, anchors(t), place(t), integrated.Add(-Skew+time.Second)); err != nil {
 		t.Errorf("within the skew: %v", err)
 	}
-	if _, err := VerifyEntry(ctx, id, e, host, logs, anchors(t), integrated.Add(-Skew-time.Second)); !errors.Is(err, ErrUnverified) {
+	if _, err := VerifyEntry(ctx, id, e, host, logs, anchors(t), place(t), integrated.Add(-Skew-time.Second)); !errors.Is(err, ErrUnverified) {
 		t.Errorf("after it was verified: %v", err)
 	}
-	if _, err := VerifyEntry(ctx, "zz"+id[2:], e, host, logs, anchors(t), at); !errors.Is(err, ErrUnverified) {
+	if _, err := VerifyEntry(ctx, "zz"+id[2:], e, host, logs, anchors(t), place(t), at); !errors.Is(err, ErrUnverified) {
 		t.Errorf("an id not hex: %v", err)
 	}
 	change := func(f func(tl *root.TransparencyLog)) Logs {
@@ -402,7 +415,7 @@ func TestVerifyEntryTimeAndKeys(t *testing.T) {
 		"key without a start": change(func(tl *root.TransparencyLog) { tl.ValidityPeriodStart = time.Time{} }),
 		"key started after":   change(func(tl *root.TransparencyLog) { tl.ValidityPeriodStart = integrated.Add(time.Hour) }),
 	} {
-		if _, err := VerifyEntry(ctx, id, e, host, l, anchors(t), at); !errors.Is(err, ErrUnverified) {
+		if _, err := VerifyEntry(ctx, id, e, host, l, anchors(t), place(t), at); !errors.Is(err, ErrUnverified) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}

@@ -205,6 +205,17 @@ func TestCheckpointOrigin(t *testing.T) {
 			t.Errorf("origin %q: %v", origin, err)
 		}
 	}
+	short, err := util.CreateSignedCheckpoint(util.Checkpoint{Origin: host + " - 42", Size: 7, Hash: make([]byte, 31)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := short.Sign(host, signer, options.WithContext(context.Background())); err != nil {
+		t.Fatal(err)
+	}
+	sb, _ := short.MarshalText()
+	if _, err := VerifyCheckpoint(string(sb), host, logs, at); !errors.Is(err, ErrUnverified) {
+		t.Errorf("a 31-byte root: %v", err)
+	}
 	other := testKey("another log")
 	ospki, _ := x509.MarshalPKIXPublicKey(&other.PublicKey)
 	oid := sha256.Sum256(ospki)
@@ -227,5 +238,55 @@ func TestClientNoRedirect(t *testing.T) {
 	})
 	if _, err := c.SearchKey(context.Background(), []byte("pem")); !errors.Is(err, ErrBadAnswer) || hits != 1 {
 		t.Fatalf("%v, %d requests", err, hits)
+	}
+}
+
+// An attempt that hangs past its timeout got no answer: retried, then
+// ErrUnavailable. The run's own deadline, or a cancel, during an attempt
+// is the context's error, not the log's silence.
+func TestClientAttemptTimeout(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	})
+	c.Gap, c.Attempt = time.Nanosecond, 20*time.Millisecond
+	if _, err := c.LogInfo(context.Background()); !errors.Is(err, ErrUnavailable) || c.Requests() != 5 {
+		t.Fatalf("hanging: %v, %d requests", err, c.Requests())
+	}
+	c2, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	})
+	c2.Gap, c2.Attempt = time.Nanosecond, time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := c2.LogInfo(ctx); !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrUnavailable) {
+		t.Fatalf("deadline during an attempt: %v", err)
+	}
+}
+
+// A 200 without the answer's content is a bad answer: a proof without
+// hashes, a search answering null.
+func TestClientMissingContent(t *testing.T) {
+	ctx := context.Background()
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/log/proof" {
+			io.WriteString(w, `{"rootHash":"00"}`)
+			return
+		}
+		io.WriteString(w, `null`)
+	})
+	c.Gap = time.Nanosecond
+	if _, err := c.ConsistencyProof(ctx, 1, 2, ""); !errors.Is(err, ErrBadAnswer) {
+		t.Errorf("proof without hashes: %v", err)
+	}
+	if _, err := c.SearchKey(ctx, []byte("pem")); !errors.Is(err, ErrBadAnswer) {
+		t.Errorf("null search: %v", err)
 	}
 }
