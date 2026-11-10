@@ -182,7 +182,7 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 				return true, err
 			}
 		}
-		if _, code := uploadShape(name, u); code != "" {
+		if _, code := uploadShape(name, u, true); code != "" {
 			return true, fmt.Errorf("%s: an upload the site should have refused (%s)", name, code)
 		}
 		// The request it would take, at its smallest: the API measured
@@ -227,7 +227,7 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		}
 		return true, nil
 	}
-	found, err := put("proposal", false, func(u *Upload) (bool, error) { return s.putProposal(ctx, id, u) })
+	found, err := put("proposal", false, func(u *Upload) (bool, error) { return s.putProposal(ctx, id, u, false) })
 	if err != nil {
 		return nil, err
 	}
@@ -255,7 +255,7 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 			}
 			continue
 		}
-		found, err := put(name, false, func(u *Upload) (bool, error) { return s.putExtension(ctx, id, n, u) })
+		found, err := put(name, false, func(u *Upload) (bool, error) { return s.putExtension(ctx, id, n, u, false) })
 		if err != nil {
 			return nil, err
 		}
@@ -269,7 +269,7 @@ func Check(ctx context.Context, fetch Fetcher, anchors *Anchors, siteKey []byte,
 		e, _ := vote.ParseExtension(mem.Objects[docPath(id, name)])
 		rep.Extensions, rep.ClosesAt = n, e.ClosesAt
 	}
-	found, err = put("results", true, func(u *Upload) (bool, error) { return s.putResults(ctx, id, u) })
+	found, err = put("results", true, func(u *Upload) (bool, error) { return s.putResults(ctx, id, u, false) })
 	if err != nil {
 		return nil, err
 	}

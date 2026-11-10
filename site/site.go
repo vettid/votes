@@ -93,8 +93,7 @@ func refuse(status int, code, why string) error { return &refusal{status, code, 
 
 func (s *Site) upload(w http.ResponseWriter, r *http.Request) {
 	id, name := r.PathValue("id"), r.PathValue("name")
-	m := nameRe.FindStringSubmatch(name)
-	if n, _ := strconv.Atoi(m2(m)); !vote.ValidProposalID(id) || m == nil || n > maxExtensions {
+	if !validSlot(id, name) {
 		writeError(w, http.StatusNotFound, "not_found")
 		return
 	}
@@ -110,20 +109,11 @@ func (s *Site) upload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request")
 		return
 	}
-	if status, code := uploadShape(name, &u); status != 0 {
+	if status, code := uploadShape(name, &u, true); status != 0 {
 		writeError(w, status, code)
 		return
 	}
-	var created bool
-	switch {
-	case name == "proposal":
-		created, err = s.putProposal(r.Context(), id, &u)
-	case name == "results":
-		created, err = s.putResults(r.Context(), id, &u)
-	default:
-		n, _ := strconv.Atoi(m[2])
-		created, err = s.putExtension(r.Context(), id, n, &u)
-	}
+	created, err := s.put(r.Context(), id, name, &u, false)
 	var rf *refusal
 	var ie *indexError
 	stale := false
@@ -146,6 +136,93 @@ func (s *Site) upload(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{"published": name, "index_updated": !stale})
 	}
+}
+
+// validSlot is whether name is a document's name (proposal, results,
+// extension-1 to extension-24) and id a proposal id.
+func validSlot(id, name string) bool {
+	m := nameRe.FindStringSubmatch(name)
+	n, _ := strconv.Atoi(m2(m))
+	return vote.ValidProposalID(id) && m != nil && n <= maxExtensions
+}
+
+// put runs an upload's checks and, unless dry, writes it. A dry run
+// (Prepare) takes the time now for the anchor's, which a later anchor
+// can only follow, and stops before the write.
+func (s *Site) put(ctx context.Context, id, name string, u *Upload, dry bool) (bool, error) {
+	switch name {
+	case "proposal":
+		return s.putProposal(ctx, id, u, dry)
+	case "results":
+		return s.putResults(ctx, id, u, dry)
+	default:
+		n, _ := strconv.Atoi(m2(nameRe.FindStringSubmatch(name)))
+		return s.putExtension(ctx, id, n, u, dry)
+	}
+}
+
+// Prepared is what Prepare found.
+type Prepared struct {
+	// Published is whether the site already holds these exact bytes
+	// at the slot.
+	Published bool
+}
+
+// Refusal is an upload's refusal: the HTTP status and the error code the
+// site answers with.
+type Refusal struct {
+	Status int
+	Code   string
+}
+
+func (r *Refusal) Error() string { return "site refuses: " + r.Code }
+
+// Prepare runs every check an upload of doc, sig and rows to the slot
+// (id, name) would get, except the anchor, and writes nothing: the
+// signer's checks before it signs (key protection, GC #7406 §1). The time
+// now stands in for the anchor's, which can only be later, so a document
+// Prepare accepts may still be refused once anchored (a close that passes
+// in between), never the other way round. A document the site already
+// holds is judged with the bundle it holds. A refusal is a *Refusal; any
+// other error is the store's.
+func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []byte) (Prepared, error) {
+	if !validSlot(id, name) {
+		return Prepared{}, &Refusal{http.StatusNotFound, "not_found"}
+	}
+	u := &Upload{Doc: doc, Sig: sig, Rows: rows}
+	if status, code := uploadShape(name, u, false); status != 0 {
+		return Prepared{}, &Refusal{status, code}
+	}
+	prev, err := s.published(ctx, docPath(id, name))
+	if err != nil {
+		return Prepared{}, err
+	}
+	if prev != nil && !bytes.Equal(prev, doc) {
+		return Prepared{}, &Refusal{http.StatusConflict, "differs"}
+	}
+	if prev != nil {
+		// Published: judged by the bundle the site holds, as a re-upload
+		// of it would be.
+		if u.Bundle, err = s.published(ctx, docPath(id, name)+".sigstore.json"); err != nil {
+			return Prepared{}, err
+		}
+	}
+	if _, err := s.put(ctx, id, name, u, true); err != nil {
+		var rf *refusal
+		if errors.As(err, &rf) {
+			return Prepared{}, &Refusal{rf.status, rf.code}
+		}
+		return Prepared{}, err
+	}
+	return Prepared{Published: prev != nil}, nil
+}
+
+// anchorAt is the anchor's time, or, in a dry run without a bundle, now.
+func (s *Site) anchorAt(dry bool, svc *Service, u *Upload) (time.Time, error) {
+	if dry && len(u.Bundle) == 0 {
+		return s.Now(), nil
+	}
+	return s.anchor(svc, u)
 }
 
 // indexError is an index update that failed after the document was
@@ -258,7 +335,7 @@ func (s *Site) proposalOf(ctx context.Context, id string) ([]byte, *vote.Proposa
 	return doc, p, svc, nil
 }
 
-func (s *Site) putProposal(ctx context.Context, id string, u *Upload) (bool, error) {
+func (s *Site) putProposal(ctx context.Context, id string, u *Upload, dry bool) (bool, error) {
 	p, err := vote.ParseProposal(u.Doc)
 	if err != nil {
 		return false, refuse(http.StatusUnprocessableEntity, "bad_document", err.Error())
@@ -277,7 +354,7 @@ func (s *Site) putProposal(ctx context.Context, id string, u *Upload) (bool, err
 	if vote.Verify(p.Service, vote.LabelProposal, vote.ProposalSigMsg(u.Doc), u.Sig) != nil {
 		return false, refuse(http.StatusUnprocessableEntity, "bad_signature", "proposal")
 	}
-	ts, err := s.anchor(svc, u)
+	ts, err := s.anchorAt(dry, svc, u)
 	if err != nil {
 		return false, err
 	}
@@ -289,6 +366,9 @@ func (s *Site) putProposal(ctx context.Context, id string, u *Upload) (bool, err
 		return false, err
 	} else if !bytes.Equal(prev, u.Doc) && (!ts.Before(time.Unix(p.ClosesAt, 0)) || !s.Now().Before(time.Unix(p.ClosesAt, 0))) {
 		return false, refuse(http.StatusUnprocessableEntity, "too_late", "the vote has closed")
+	}
+	if dry {
+		return false, nil
 	}
 	created, err := s.write(ctx, id, "proposal", u, nil, svc)
 	if err != nil {
@@ -320,7 +400,7 @@ func withEntry(es []IndexEntry, id string, svc *Service, pdoc []byte, p *vote.Pr
 		OpensAt: p.OpensAt, ClosesAt: p.ClosesAt})
 }
 
-func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload) (bool, error) {
+func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload, dry bool) (bool, error) {
 	pdoc, p, svc, err := s.proposalOf(ctx, id)
 	if err != nil {
 		return false, err
@@ -344,7 +424,7 @@ func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload) (b
 	if err != nil {
 		return false, err
 	}
-	ts, err := s.anchor(svc, u)
+	ts, err := s.anchorAt(dry, svc, u)
 	if err != nil {
 		return false, err
 	}
@@ -368,6 +448,9 @@ func (s *Site) putExtension(ctx context.Context, id string, n int, u *Upload) (b
 		return false, refuse(http.StatusUnprocessableEntity, "bad_document", "the new close isn't later")
 	case e.ClosesAt-p.ClosesAt > vote.MaxExtension:
 		return false, refuse(http.StatusUnprocessableEntity, "bad_document", "extensions over 24 h")
+	}
+	if dry {
+		return false, nil
 	}
 	created, err := s.write(ctx, id, "extension-"+strconv.Itoa(n), u, nil, svc)
 	if err != nil {
@@ -421,7 +504,7 @@ func (s *Site) closeInForce(ctx context.Context, id string, p *vote.Proposal, n 
 	return e.ClosesAt, nil
 }
 
-func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, error) {
+func (s *Site) putResults(ctx context.Context, id string, u *Upload, dry bool) (bool, error) {
 	pdoc, p, svc, err := s.proposalOf(ctx, id)
 	if err != nil {
 		return false, err
@@ -470,7 +553,7 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 	if s.Now().Before(end) {
 		return false, refuse(http.StatusUnprocessableEntity, "too_early", "the vote hasn't closed")
 	}
-	ts, err := s.anchor(svc, u)
+	ts, err := s.anchorAt(dry, svc, u)
 	if err != nil {
 		return false, err
 	}
@@ -478,6 +561,9 @@ func (s *Site) putResults(ctx context.Context, id string, u *Upload) (bool, erro
 		// Collection ends a minute after the close (§7): results anchored
 		// sooner were counted before it ended.
 		return false, refuse(http.StatusUnprocessableEntity, "bad_anchor", "results anchored before collection ended")
+	}
+	if dry {
+		return false, nil
 	}
 	created, err := s.write(ctx, id, "results", u, u.Rows, svc)
 	if err != nil {
@@ -515,8 +601,8 @@ func (s *Site) samePublishedSig(ctx context.Context, id, name string, sig []byte
 // uploadShape applies the upload's request-level rules to a decoded
 // upload of a document called name: the parts present, the signature's
 // length and each part's size limit. It returns 0 when they hold.
-func uploadShape(name string, u *Upload) (status int, code string) {
-	if len(u.Doc) == 0 || len(u.Sig) != vote.SigLen || len(u.Bundle) == 0 || len(u.Bundle) > maxBundle ||
+func uploadShape(name string, u *Upload, bundled bool) (status int, code string) {
+	if len(u.Doc) == 0 || len(u.Sig) != vote.SigLen || bundled && len(u.Bundle) == 0 || len(u.Bundle) > maxBundle ||
 		name != "results" && u.Rows != nil {
 		return http.StatusBadRequest, "bad_request"
 	}
