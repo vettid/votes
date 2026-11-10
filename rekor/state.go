@@ -21,16 +21,21 @@ import (
 // position. Between runs it is an SSM parameter; the check reads and
 // writes a file.
 type State struct {
-	V          int    `json:"v"`
-	Origin     string `json:"origin"`
-	TreeID     string `json:"tree_id"`
-	TreeSize   uint64 `json:"tree_size"`
-	RootHash   string `json:"root_hash"`
-	StaleRuns  int    `json:"stale_runs"`
-	Failures   int    `json:"failures"`
-	ScanTreeID string `json:"scan_tree_id,omitempty"`
-	ScannedTo  uint64 `json:"scanned_to,omitempty"`
+	V         int    `json:"v"`
+	Origin    string `json:"origin"`
+	TreeID    string `json:"tree_id"`
+	TreeSize  uint64 `json:"tree_size"`
+	RootHash  string `json:"root_hash"`
+	StaleRuns int    `json:"stale_runs"`
+	Failures  int    `json:"failures"`
+	// Staging's scan: the tree it reads and the index within that tree it
+	// has read to (0 included); both or neither.
+	ScanTreeID string  `json:"scan_tree_id,omitempty"`
+	ScannedTo  *uint64 `json:"scanned_to,omitempty"`
 }
+
+// ScanAt sets staging's scan position.
+func (s *State) ScanAt(treeID string, to uint64) { s.ScanTreeID, s.ScannedTo = treeID, &to }
 
 // Sentinel is what the stack creates the parameter holding (SSM holds no
 // empty value): no state yet.
@@ -136,11 +141,11 @@ func isSentinel(b []byte) bool {
 	if !ok || len(keys) != 2 {
 		return false
 	}
-	var m map[string]any
+	var m map[string]json.RawMessage
 	if json.Unmarshal(b, &m) != nil {
 		return false
 	}
-	return m["v"] == float64(1) && m["bootstrap"] == true
+	return string(m["v"]) == "1" && string(m["bootstrap"]) == "true"
 }
 
 func (s State) valid() bool {
@@ -151,6 +156,9 @@ func (s State) valid() bool {
 		return false
 	}
 	if b, err := hex.DecodeString(s.RootHash); err != nil || len(b) != sha256.Size || hex.EncodeToString(b) != s.RootHash {
+		return false
+	}
+	if (s.ScanTreeID == "") != (s.ScannedTo == nil) {
 		return false
 	}
 	if s.ScanTreeID != "" {
@@ -292,6 +300,11 @@ type PinResult struct {
 	// or another error from the request): for "Rekor unavailable". What
 	// it would have proven is unknown; nothing it would have moved moved.
 	Unavailable error
+	// Stopped is the run's context ending during a proof request: the run
+	// is incomplete, neither adding to failures nor resetting them.
+	Stopped error
+
+	contradicted bool // a proof that failed, not a bad answer
 }
 
 func (r *PinResult) add(name, format string, a ...any) {
@@ -314,6 +327,11 @@ func (r *PinResult) prove(ctx context.Context, p Prover, a, b *Checkpoint, what 
 		case errors.Is(err, ErrBadAnswer):
 			r.add(FindingInconsistent, "%s: %v", what, err)
 			return false
+		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+			if r.Stopped == nil {
+				r.Stopped = err
+			}
+			return false
 		case err != nil:
 			if r.Unavailable == nil {
 				r.Unavailable = err
@@ -323,6 +341,7 @@ func (r *PinResult) prove(ctx context.Context, p Prover, a, b *Checkpoint, what 
 	}
 	if err := VerifyConsistency(a, b, hashes); err != nil {
 		r.add(FindingInconsistent, "%s: %v", what, err)
+		r.contradicted = true
 		return false
 	}
 	return true
@@ -359,8 +378,9 @@ func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 		}
 	}
 	// An admin step never records a pin the newest bundle contradicts, or
-	// that it couldn't be checked against.
-	if a.count() > 0 && (len(res.Findings) > 0 || res.Unavailable != nil) {
+	// that it couldn't be checked against: a transient outage refuses it
+	// too (exit 2), and the owner dispatches it again.
+	if a.count() > 0 && (len(res.Findings) > 0 || res.Unavailable != nil || res.Stopped != nil) {
 		return nil, fmt.Errorf("%w: the newest bundle's checkpoint isn't proven consistent with the log's", ErrAdminRefused)
 	}
 	switch ls.Kind {
@@ -385,7 +405,7 @@ func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 		}
 		next := &State{}
 		next.record(cur)
-		next.ScanTreeID, next.ScannedTo = cur.TreeID, cur.Size
+		next.ScanAt(cur.TreeID, cur.Size)
 		res.Next = next
 		return res, nil
 	}
@@ -425,8 +445,10 @@ func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 	var pin PinResult
 	ok := pin.prove(ctx, in.Prover, rec, cur, "the log's checkpoint, from the recorded one")
 	if a.ResetPin != "" {
-		if ok || pin.Unavailable != nil || len(pin.Findings) == 0 || pin.Findings[0].Name != FindingInconsistent {
-			return nil, fmt.Errorf("%w: a reset applies only to an inconsistent pin", ErrAdminRefused)
+		// Only a log shown contradicting the pin (a proof that failed, a
+		// shrunk tree, another root), not a malformed answer.
+		if ok || !pin.contradicted {
+			return nil, fmt.Errorf("%w: a reset applies only to a pin the log was shown to contradict", ErrAdminRefused)
 		}
 		if a.ResetPin != fmt.Sprintf("%d:%s", st.TreeSize, st.RootHash) {
 			return nil, fmt.Errorf("%w: the reset names %q, not the recorded %d:%s", ErrAdminRefused, a.ResetPin, st.TreeSize, st.RootHash)
@@ -438,6 +460,9 @@ func CheckPin(ctx context.Context, in PinInput) (*PinResult, error) {
 	res.Findings = append(res.Findings, pin.Findings...)
 	if res.Unavailable == nil {
 		res.Unavailable = pin.Unavailable
+	}
+	if res.Stopped == nil {
+		res.Stopped = pin.Stopped
 	}
 	if !ok {
 		// The recorded checkpoint is kept, so every later run reports it

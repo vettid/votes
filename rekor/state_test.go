@@ -58,9 +58,25 @@ func TestParseState(t *testing.T) {
 	a, _, _ := fixturePin(t)
 	ok := State{}
 	ok.record(a)
-	ok.Failures, ok.ScanTreeID, ok.ScannedTo = 2, a.TreeID, 7
-	if ls := ParseState(ok.Encode()); ls.Kind != StateOK || ls.State != ok {
+	ok.Failures = 2
+	ok.ScanAt(a.TreeID, 7)
+	if ls := ParseState(ok.Encode()); ls.Kind != StateOK || ls.State.Failures != 2 || *ls.State.ScannedTo != 7 {
 		t.Fatalf("round trip: %+v", ls)
+	}
+	// The scan at 0 (a new shard) survives its write-back; no scan at all
+	// too (production).
+	zero := ok
+	zero.ScanAt(a.TreeID, 0)
+	if ls := ParseState(zero.Encode()); ls.Kind != StateOK || ls.State.ScannedTo == nil || *ls.State.ScannedTo != 0 {
+		t.Fatalf("scan at 0: %+v %s", ls, zero.Encode())
+	}
+	noScan := ok
+	noScan.ScanTreeID, noScan.ScannedTo = "", nil
+	if ls := ParseState(noScan.Encode()); ls.Kind != StateOK || ls.State.ScannedTo != nil {
+		t.Fatalf("no scan: %+v", ls)
+	}
+	if ParseState([]byte(`{"v":1.0,"bootstrap":true}`)).Kind == StateEmpty {
+		t.Error("v 1.0 read as the sentinel")
 	}
 	for _, raw := range []string{"", "  ", Sentinel, ` {"bootstrap": true, "v": 1} `} {
 		if ls := ParseState([]byte(raw)); ls.Kind != StateEmpty {
@@ -119,7 +135,7 @@ func TestCheckPin(t *testing.T) {
 		t.Fatalf("empty: %+v", r)
 	}
 	r, err = CheckPin(ctx, PinInput{Loaded: empty, Current: b, Prover: p, Admin: Admin{Bootstrap: true}})
-	if err != nil || r.Next == nil || r.Next.TreeSize != b.Size || r.Next.ScannedTo != b.Size || r.Next.ScanTreeID != b.TreeID {
+	if err != nil || r.Next == nil || r.Next.TreeSize != b.Size || *r.Next.ScannedTo != b.Size || r.Next.ScanTreeID != b.TreeID {
 		t.Fatalf("bootstrap: %+v %v", r, err)
 	}
 	// Unparseable: bootstrap only with its hash; an empty state names none.
@@ -153,9 +169,10 @@ func TestCheckPin(t *testing.T) {
 	}
 	// Grown and consistent: recorded; the stale count reset.
 	staleA := stateAt(a).State
-	staleA.StaleRuns, staleA.Failures, staleA.ScanTreeID, staleA.ScannedTo = 1, 2, a.TreeID, 5
+	staleA.StaleRuns, staleA.Failures = 1, 2
+	staleA.ScanAt(a.TreeID, 5)
 	r, err = CheckPin(ctx, PinInput{Loaded: ParseState(staleA.Encode()), Current: b, Prover: p})
-	if err != nil || len(r.Findings) != 0 || r.Next.TreeSize != b.Size || r.Next.StaleRuns != 0 || r.Next.Failures != 2 || r.Next.ScannedTo != 5 {
+	if err != nil || len(r.Findings) != 0 || r.Next.TreeSize != b.Size || r.Next.StaleRuns != 0 || r.Next.Failures != 2 || *r.Next.ScannedTo != 5 {
 		t.Fatalf("grown: %+v %v", r, err)
 	}
 	// Not grown: stale on the second run.
@@ -266,6 +283,20 @@ func TestCheckPin(t *testing.T) {
 	}
 	if _, err := CheckPin(ctx, PinInput{Loaded: LoadedState{Kind: StateNone}, Current: b, Prover: p, Admin: Admin{Bootstrap: true}}); !errors.Is(err, ErrAdminRefused) {
 		t.Errorf("admin without a state: %v", err)
+	}
+	// The run's context ending during a proof: stopped (incomplete), not
+	// unavailable.
+	r, _ = CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{err: context.DeadlineExceeded}})
+	if !errors.Is(r.Stopped, context.DeadlineExceeded) || r.Unavailable != nil || r.Next.TreeSize != a.Size {
+		t.Errorf("stopped: %+v", r)
+	}
+	// A reset needs the log shown contradicting the pin, not a bad answer.
+	grown := stateAt(a).State
+	if _, err := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{err: ErrBadAnswer}, Admin: Admin{ResetPin: formatPin(grown)}}); !errors.Is(err, ErrAdminRefused) {
+		t.Errorf("reset after a bad answer: %v", err)
+	}
+	if r, err := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{proofs: map[[2]int64][]string{{int64(a.Size), int64(b.Size)}: {hex.EncodeToString(make([]byte, 32))}}}, Admin: Admin{ResetPin: formatPin(grown)}}); err != nil || r.Next.TreeSize != b.Size {
+		t.Errorf("reset after a failed proof: %+v %v", r, err)
 	}
 }
 
