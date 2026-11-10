@@ -46,6 +46,44 @@ const apiVersion = "/2018-06-01/runtime/invocation/"
 // Serve runs h for every invocation until ctx ends or the runtime API
 // fails. api is the AWS_LAMBDA_RUNTIME_API host:port.
 func Serve(ctx context.Context, api string, h http.Handler) error {
+	return loop(ctx, api, func(ctx context.Context, payload []byte) ([]byte, error) {
+		out, err := invoke(ctx, h, payload)
+		if err != nil {
+			return nil, &Failure{Type: "BadEvent", Message: "bad event"}
+		}
+		return out, nil
+	})
+}
+
+// Failure is a function error as the runtime API takes it: the caller's
+// invoke sees FunctionError, with this type and message.
+type Failure struct {
+	Type, Message string
+}
+
+func (f *Failure) Error() string { return f.Type + ": " + f.Message }
+
+// ServeFunc runs f for every invocation of a function invoked directly
+// (not through API Gateway) until ctx ends or the runtime API fails: f
+// gets the event's JSON and returns the answer's. An error is a function
+// error: a *Failure as it is, anything else as type "Failed" with the
+// error's text. A panic in f is a function error too, not the end of the
+// process.
+func ServeFunc(ctx context.Context, api string, f func(ctx context.Context, event []byte) ([]byte, error)) error {
+	return loop(ctx, api, func(ctx context.Context, payload []byte) (out []byte, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				out, err = nil, &Failure{Type: "Panic", Message: "the function panicked"}
+			}
+		}()
+		return f(ctx, payload)
+	})
+}
+
+// loop takes each invocation from the runtime API, runs f on it within
+// the invocation's deadline (a second before it, so that an answer still
+// goes out), and posts the answer or the error.
+func loop(ctx context.Context, api string, f func(ctx context.Context, payload []byte) ([]byte, error)) error {
 	c := &http.Client{} // the next-invocation call long-polls: no timeout
 	base := "http://" + api + apiVersion
 	for ctx.Err() == nil {
@@ -70,10 +108,17 @@ func Serve(ctx context.Context, api string, h http.Handler) error {
 		if ms, err := parseMS(resp.Header.Get("Lambda-Runtime-Deadline-Ms")); err == nil {
 			deadline = ms
 		}
-		out, err := invoke(ctx, h, payload, deadline)
+		ictx, cancel := context.WithDeadline(ctx, deadline.Add(-time.Second))
+		out, err := f(ictx, payload)
+		cancel()
 		path := base + id + "/response"
 		if err != nil {
-			path, out = base+id+"/error", []byte(`{"errorMessage":"bad event","errorType":"BadEvent"}`)
+			fl, ok := err.(*Failure)
+			if !ok {
+				fl = &Failure{Type: "Failed", Message: err.Error()}
+			}
+			out, _ = json.Marshal(map[string]string{"errorMessage": fl.Message, "errorType": fl.Type})
+			path = base + id + "/error"
 		}
 		post, err := http.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(out))
 		if err != nil {
@@ -108,8 +153,8 @@ func parseMS(s string) (time.Time, error) {
 	return time.UnixMilli(ms), nil
 }
 
-// invoke runs one event through h, within the invocation's deadline.
-func invoke(ctx context.Context, h http.Handler, payload []byte, deadline time.Time) ([]byte, error) {
+// invoke runs one event through h, within ctx's deadline.
+func invoke(ctx context.Context, h http.Handler, payload []byte) ([]byte, error) {
 	var ev event
 	if err := json.Unmarshal(payload, &ev); err != nil || ev.RequestContext.HTTP.Method == "" || !strings.HasPrefix(ev.RawPath, "/") {
 		return nil, errors.New("lambdahttp: not an HTTP API event")
@@ -122,9 +167,6 @@ func invoke(ctx context.Context, h http.Handler, payload []byte, deadline time.T
 		}
 		body = b
 	}
-	// A second before Lambda's deadline, so that an answer still goes out.
-	ctx, cancel := context.WithDeadline(ctx, deadline.Add(-time.Second))
-	defer cancel()
 	target := ev.RawPath
 	if ev.RawQueryString != "" {
 		target += "?" + ev.RawQueryString
