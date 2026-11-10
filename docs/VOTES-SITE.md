@@ -1,8 +1,8 @@
 # votes.vettid.org
 
-**Status:** 0.2.12 (2026-11-10), draft. The protocol this site serves is
+**Status:** 0.2.13 (2026-11-10), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
-(0.11.0); its §3.3 is this site's contract and §8.5 has the document
+(0.14.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
 and this document is corrected.
 
@@ -26,7 +26,7 @@ one: the service's signature and the Rekor anchor catch that.
 | Bucket | Private S3 bucket, versioned, blocking public access. Read only through CloudFront (origin access control). Written only by the upload function, which cannot delete. |
 | CloudFront | `votes.vettid.org`. Serves `/v1/*` from the bucket and `/api/*` from the API. Security headers as vettid.org's sites. No access logs. Behind an AWS WAF web ACL with one rate rule (§4, "Limits"). |
 | Upload API | API Gateway HTTP API → Lambda `votes-api` (Go, arm64). |
-| Service list | `services.json`, kept by VettID's operator (a service is added by the owner, BALLOT-PROTOCOL §3.3), not in this repository. The operator's `votesctl publish-services` signs it with the site's Ed25519 key and writes it to the bucket as `v1/services.json` and `.sig`, refusing a list that doesn't extend the published one, and keeps each version as `v1/services/<version>.json` (§3): the bucket's copies are the record of every list. The function reads it on every upload and checks it under the site's public key whenever its bytes or its signature's differ from the pair it checked last. |
+| Service list | `services.json`, kept by VettID's operator (a service is added by the owner, BALLOT-PROTOCOL §3.3), not in this repository. The operator's `votesctl publish-services` signs it with the site's Ed25519 key and writes it to the bucket as `v1/services.json` and `.sig`, refusing a list that doesn't extend the published one (BALLOT-PROTOCOL §3.3, retired keys included: §4 "Retired anchor keys"), and keeps each version as `v1/services/<version>.json` (§3): the bucket's copies are the record of every list. The function reads it on every upload and checks it under the site's public key whenever its bytes or its signature's differ from the pair it checked last. |
 | Stack | CDK (TypeScript), `VotesSite-staging` and `VotesSite-prod`, as member-service. |
 
 **(chosen; not in the spec:** Lambda rather than an ECS service, because
@@ -84,7 +84,10 @@ credential: the service's signature is the authentication.
    (`sigstore-go`) against the trusted root of the stack's Sigstore
    instance (staging or production): the ECDSA signature over the
    document under one of the service's listed anchor keys, the Rekor
-   entry and its inclusion proof, and one RFC 3161 timestamp. **The
+   entry and its inclusion proof, and one RFC 3161 timestamp, before
+   that key's `retired_at` if it has one (`retired_anchor_key`), and
+   under such a key within the stockpiling window (§4 "Retired anchor
+   keys"). **The
    trusted root** is fetched through the instance's TUF repository when
    the function starts, and again at most once every 24 hours; a fetch
    that fails, or takes over 5 seconds, keeps the root in use. Both
@@ -161,6 +164,66 @@ retries a `429` and takes a `403` as final) until its rate falls below
 the limit. Everything else is allowed. The
 ACL keeps CloudWatch metrics only: request sampling is off, so it keeps
 no source addresses (§5).
+
+**Retired anchor keys** (0.2.13; BALLOT-PROTOCOL 0.14.0 §3.3, which has
+the rules; key protection, phase 1, GC #7406 §8):
+- **The member:** an `anchor_keys[]` entry may carry `retired_at` (Unix
+  seconds). The site's service-list parser and `votesctl` take it; one
+  without it is as before.
+- **Times:** every comparison with `retired_at` uses the bundle's RFC
+  3161 time (`genTime`) truncated to whole seconds, never Rekor's
+  integrated time.
+- **The upload function** has no chain check: it parses the current
+  list, and applies `retired_at` in check 4 only. A document whose
+  bundle's time is at or after its anchor key's `retired_at` is refused,
+  `422 retired_anchor_key`.
+- **The chain check** is `votesctl`'s (`publish-services` and `check`).
+  Besides the existing rules, a version chains only by BALLOT-PROTOCOL
+  §3.3's two chain rules: **set once** (every `retired_at` of the version
+  before is kept with the same value, never removed or changed; an entry
+  may carry one from its first listing) and **another live key** (a
+  service with a retired key also lists another certified anchor key
+  without `retired_at`).
+- **Forward only** is the site's publishing condition, not a chain rule:
+  `publish-services` refuses a `retired_at` that is not **later than**
+  the time of every bundle the site holds under that key, partial uploads
+  included. `votesctl check` reports a bundle at or after its key's
+  `retired_at` as a failure of that document (`retired_anchor_key`), not
+  as a broken chain, so the run goes on (`site/chain.go`).
+- **The reader's bounds** (BALLOT-PROTOCOL §3.3, the owner's a2 of
+  #7504): `votesctl check` takes every version that chains, except one
+  newly setting a `retired_at` more than 600 s after its clock (a
+  warning; the run checks against the version before). Applying a
+  retirement, it fails a document under that key only if its bundle's
+  time is at or after max(`retired_at`, R − 300 s), where R is the time
+  the monitor's last run took the site's current list, kept in the SSM
+  parameter `/vettid/votes/<env>/monitor/list-state` (`{version, hash,
+  taken_at}`, written at the end of each run; with none, as on a first
+  run, R is unset and `retired_at` alone applies). `publish-services`
+  refuses a backdated or a far-future value.
+- **Stockpiling** (BALLOT-PROTOCOL §3.3): a bundle under a key with
+  `retired_at` counts only with −60 s ≤ `t_int` − `t_tsa` ≤ 600 s (Rekor
+  integrated time less RFC 3161 time). The upload function refuses one
+  outside it (`bad_anchor`, check 4), and `votesctl check` fails it.
+- **`votesctl publish-services -retire <key>`** (repeatable) is the only
+  way to set one: it sets `retired_at` from its own clock at publish
+  time, in whole seconds, never from the input, after checking its clock
+  against the site's `Date` header (refused if they differ by more than
+  60 s), and refuses an input list
+  that adds a `retired_at` itself. It refuses a key already retired, the
+  last live anchor key of its service, and a value that fails forward
+  only. The replacement key must be listed in an earlier version.
+- **Rollout** (BALLOT-PROTOCOL §3.3): an older reader refuses the
+  unknown member, so it can't take such a list and keeps its last one.
+  The order: the upload function, `votesctl` and the service's signer;
+  then the vault release that reads `retired_at` and the Android app
+  release that hands it the lists; then a list naming the
+  replacement key; and only once the **oldest supported vault release**
+  (the oldest that member vaults may still run) reads `retired_at`, a
+  list using it.
+- **The Rekor check** (§7, set aside for now): when it returns, an entry
+  under a retired key integrated after its `retired_at` is a mismatch,
+  whatever its digest.
 
 ## 5. What the site keeps about readers
 
@@ -634,6 +697,18 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 
 ## Changes
 
+- **0.2.13 (2026-11-10), draft:** §4: retired anchor keys (`retired_at`
+  on an `anchor_keys[]` entry), by BALLOT-PROTOCOL 0.14.0 §3.3: the
+  upload check (`retired_anchor_key`; the function has no chain check),
+  `votesctl`'s chain check with the two chain rules, forward only as the
+  site's own condition, `publish-services -retire` setting the value from
+  its clock (checked against the site's `Date`), the reader's bounds
+  (every chaining list taken; over 600 s ahead not yet; a retirement
+  cancels only what is at or after max(`retired_at`, R − 300 s), R in
+  the monitor's list state), the stockpiling window, the rollout order, and the Rekor check's rule for when it
+  returns. Times are RFC 3161 `genTime` in whole seconds. The status
+  line names BALLOT-PROTOCOL 0.14.0. Key protection, phase 1 (GC #7406,
+  the owner's (a) of #7385).
 - **0.2.12 (2026-11-10):** `votesctl check -all -rekor` (§7)
   reads Rekor v1 through an allowlist of four endpoints (never one that
   adds to the log), and the site by `GET` and `HEAD` only. It searches
