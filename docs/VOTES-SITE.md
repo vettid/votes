@@ -417,47 +417,46 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   One under an anchor key that passes the log's checks (its leaf hash,
   signed entry timestamp, inclusion proof and index mapping) but is
   anything else (another kind or version, a `sha384` or `sha512`
-  digest, a signature that doesn't verify) is told by where the anchor
-  key is (0.2.13, the owner's (a) of 2026-11-10, #7136). Its **signing
-  keys** are what Rekor's own type for its kind and API version gives
-  (`Verifiers()` in `pkg/types/<kind>/<version>/entry.go` of the rekor
-  module the check builds with, `v1.5.3`), the keys Rekor checked its
-  signature against when it was logged, each compared with the anchor
-  key by SPKI (DER): a bare key; with a certificate chain, every
-  certificate's subject key, as Rekor verifies the whole chain
-  (`pkg/pki/x509`); an OpenPGP, SSH or minisign key's own public key
-  (`Identities()`). For `tuf` 0.0.1, whose `Verifiers()` is the whole
-  root it carries, they are the keys a signature of the root or of the
-  metadata names by key ID in that root's `keys` (whether or not it
-  verifies), and an anchor key whose signature under a key ID the root
-  doesn't hold verifies over that signed part (go-tuf skips such a
-  signature; the check doesn't).
-  - **signed with it:** the anchor key is one of them: a mismatch,
-    `rekor: wrong kind`, whatever its digest. So is an entry no string
-    of which names the anchor key as PEM or DER, but one of whose signing
-    keys is it (in an OpenPGP or SSH key, say).
-  - **mentions it:** they are known, and the anchor key isn't among
-    them, so it is only written in the entry (anyone may write a public
-    key into an entry of their own): a warning, `rekor: mentions an
-    anchor key`, with the entry's ID, log index and kind, counted in the
-    report (`rekor.mentions`) and named in the alert whenever one goes
-    out, at most 20 with the count of the rest. It can come only from
-    staging's scan (production's search finds entries by their signing
-    key); it is never stored, and never an `index gap`.
-  - **fails closed** to `rekor: wrong kind`: a body Rekor's pinned
-    types don't read (another kind or version); an error from
-    `Verifiers()` or `Identities()` (`rfc3161` gives none; a `tuf` root
-    that doesn't verify itself); a key ID a `tuf` signature names whose
-    key doesn't parse.
+  digest, a signature that doesn't verify) is told by whether the
+  anchor key **signed** something in it (0.2.13, the owner's (a) of
+  2026-11-10, #7136, and (a) of #7216): only the private key can make a
+  signature that verifies, so nothing else can raise a standing alarm.
+  The check verifies, with maintained libraries, every signature it can
+  read from the entry alone, under each anchor key (ECDSA P-256):
+  - a `hashedrekord` 0.0.1's signature over its digest (whatever the
+    algorithm: a `sha384` or `sha512` digest, or a `sha256` one with
+    another key named);
+  - a `tuf` 0.0.1's signatures, of the root and of the metadata, each
+    over the canonical JSON (`cjson`, go-securesystemslib) of its signed
+    part, whatever key ID it names;
+  - every X.509 certificate in the entry (a PEM `CERTIFICATE` anywhere
+    in it, also inside base64), its signature over its to-be-signed part
+    (`crypto/x509`): a certificate the anchor key issued.
 
-  The check's tests cover each kind and version the pinned module
-  registers, and fail on another rekor version (an upgrade, or one Go's
-  version selection raises) or a kind they don't cover, until each is
-  looked at again. **Residual:** an SSH certificate's CA key, or a
-  certificate the anchor key issued, shows the private key was used but
-  isn't one of Rekor's signing keys, so its entry is a mention. One that
-  fails any of the log's checks is `rekor: unverified`: the answer
-  can't be trusted to be the log's.
+  Then:
+  - **signed:** one of them verifies under an anchor key: a mismatch,
+    `rekor: wrong kind`, whatever its digest, stored with its entry and
+    repeated every run until acknowledged.
+  - **mentions:** none verifies, and the entry is a `hashedrekord` 0.0.1
+    or a `tuf` 0.0.1 the check reads whole: the anchor key is only written
+    in it (anyone may write a public key into an entry of their own): a
+    warning, `rekor: mentions an anchor key`, with the entry's ID, log
+    index and kind, counted in the report (`rekor.mentions`) and named in
+    the alert whenever one goes out, at most 20 with the count of the
+    rest. It is never stored and never an `index gap`.
+  - **can't verify:** any other kind or version, or a body that doesn't
+    read as its kind: whether the anchor key signed it can't be told from
+    the entry (its signature is over data the log doesn't hold: a
+    `rekord`'s artifact, a `dsse` or `intoto` payload, a package), so it
+    is a mismatch, `rekor: unverifiable`, in the run that finds it, and
+    not again: its entry ID is added to the verified store's `alerted`
+    list (IDs only, no entry), and an entry on that list is skipped. It
+    can't be acknowledged; the alert is the record.
+
+  A mention, or an unverifiable entry, can come only from staging's scan
+  or from a search by a key a kind indexes (`rekord`, `alpine`, `cose`).
+  One that fails any of the log's checks is `rekor: unverified`: the
+  answer can't be trusted to be the log's.
 - **Digests:** a verified entry's digest is the `sha256` of a document's
   bytes, never of its `.sig`. Those known are the run's: each proposal's,
   extension's and results' `hashes`, the documents a partial upload's
@@ -499,11 +498,12 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   search is production's only check, so a sign that it misses entries
   has to reach someone. Production gains millions of entries a day and
   is never scanned.
-- **Rekor unavailable:** a request that gets no answer (**Two kinds of
-  failure**) is `rekor.error` and adds one to `failures` in the state,
-  which a run that gets every answer it asked for resets; a run cut
-  short by the cap or the time limit (`incomplete`) neither adds nor
-  resets. Below 3 it is neither a failed
+- **Rekor unavailable:** a run in which a request gets no answer (**Two
+  kinds of failure**) has `rekor.error` and adds one to `failures` in the
+  state (one for the run, however many requests), which a run that gets
+  every answer it asked for resets, whether or not those answers verify
+  (one that doesn't is its own mismatch); a run cut short by the cap or
+  the time limit (`incomplete`) neither adds nor resets. Below 3 it is neither a failed
   check nor a mismatch: the run exits `0` if the rest held, and puts the
   heartbeat. At 3 consecutive runs it is a mismatch, `rekor: search
   unavailable` **(the owner's (a) of 2026-11-05: 3, as the heartbeat
@@ -530,12 +530,14 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   SHA-256 of the key's canonical PEM (`hashedrekord`, `rekord`, `alpine`
   and `cose` in rekor v1.5.3: `pkg/api/index.go`'s lookup by key, and
   each kind's `IndexKeys`), with that key the anchor key alone, as a PEM
-  `PUBLIC KEY`. Such an entry, stored or scanned, that its key's search
-  didn't return, integrated more than `ListingGrace` before the search
-  began, is `rekor: index gap`. Other kinds (`dsse` and `intoto` index
-  the key as `"sha256:"` and its hash; `tuf`, `jar`, `helm`, `rpm` and
-  `rfc3161` not under a bare PEM key), a key inside a certificate, and a
-  mention never give one. A key whose search got no answer gives no
+  `PUBLIC KEY`. Of the entries stored (an anchor entry, a `wrong kind`)
+  that is a `hashedrekord` signed by the anchor key named bare. Such an
+  entry, stored or scanned, that its key's search didn't return,
+  integrated more than `ListingGrace` before the search began, is
+  `rekor: index gap`. Other kinds (`dsse` and `intoto` index the key as
+  `"sha256:"` and its hash; `tuf`, `jar`, `helm`, `rpm` and `rfc3161` not
+  under a bare PEM key), a key inside a certificate, a mention and an
+  unverifiable entry never give one. A key whose search got no answer gives no
   index gap that run, for the canary or anything else (`failures` counts
   the run), and neither does one cut short by the cap or the time limit
   (`incomplete`).
@@ -556,8 +558,11 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   final one. It is taken as proved while its checkpoint is of the
   state's tree, at most the recorded size, or of an inactive shard;
   otherwise (no state, another tree, a size past the recorded one) it is
-  proved again, and so is every stored entry in a run that bootstraps
-  or resets the pin, which move the pin without a proof. It is `-rekor-verified <file>`, between
+  proved again, and so is every stored entry after a run that bootstraps
+  or resets the pin, which move the pin without a proof: that run sets
+  the store's `reprove`, and only a run that proves every stored entry
+  clears it, so a run cut short leaves it set. The store is `{"v": 1,
+  "entries": {...}, "reprove": bool, "alerted": [IDs]}`. It is `-rekor-verified <file>`, between
   runs the S3 object `rekor-verified.json` in the monitor's bucket,
   `vettid-votes-<env>-monitor`, which the stack adds (private,
   versioned, its noncurrent versions kept 90 days, blocking public
@@ -582,7 +587,8 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   `log_index` its global log index, `sha256` its digest (64 lowercase
   hex digits, or empty for an entry whose body has none), and `finding`
   one of `unknown digest`, `unexpected digest`, `anchored again`,
-  `index gap` and `wrong kind`; no `(uuid, finding)` twice. `unverified`
+  `index gap` and `wrong kind`; no `(uuid, finding)` twice (`unverifiable` comes
+  once, so it needs none, 0.2.13). `unverified`
   is never acknowledged: an answer that fails the log's checks may be
   forged, and acknowledging one would silence a later forgery under the
   same ID. That finding for that entry is reported in `acknowledged`,
@@ -603,8 +609,9 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   n}` (the last three on staging only, together or not at all: a state
   with some of them doesn't parse; `scan_from`, 0.2.13, is where the scan
   of `scan_tree_id` began: the tree size a bootstrap found, or 0 for a
-  shard accepted; a state without the three starts the scan at the run's
-  checkpoint). **Known limit:** `scan_from` is the scanned shard's only,
+  shard accepted). On staging, a recorded state without the three is read as
+  one that doesn't parse (`rekor: no state`, a bootstrap naming its
+  hash), not a silent start. **Known limit:** `scan_from` is the scanned shard's only,
   so a store reset after an acceptance rewinds within the new shard, and
   the old shard's entries only the scan found (one the search can't
   return) aren't found again. When the log can't be read or verified at
@@ -698,7 +705,13 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
     with another verifier. (Another PEM form of the bare key doesn't
     hide an entry: the index holds its canonical form.) A key written
     in an entry in another encoding (OpenPGP, SSH, JWK) isn't recognised
-    as a mention; as a signing key it is (0.2.13).
+    at all (0.2.13).
+  - that a real anchor-key signature in a kind the check can't verify
+    from the entry alone (a `rekord`, `dsse`, `intoto`, `cose`, `jar`,
+    `helm`, `rpm`, `alpine` or `rfc3161` entry) raises more than one
+    alarm: `rekor: unverifiable` comes once, in the run that finds it
+    (0.2.13, the owner's (a) of #7216). An SSH certificate's CA key
+    isn't verified either.
   - that the log shows others the tree it shows this monitor (a split
     view: v1 has no witnesses, and comparing checkpoints from a second
     vantage point is future work);
@@ -712,20 +725,21 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 ## Changes
 
 - **0.2.13 (2026-11-10), draft:** the Rekor check (§7): an anchor key's
-  entry of another kind is `wrong kind` only when the anchor key is one
-  of its signing keys, as Rekor's own pinned types give them (every
-  certificate in a chain; OpenPGP and SSH keys too; for `tuf`, a
-  signature naming its key ID or verifying under it), failing closed;
-  one that only mentions the key is a warning, `mentions an anchor key`,
-  counted and named (at most 20) in the alert (the owner's (a) of
-  2026-11-10, #7136). Every stored entry is verified and reported on
-  every run; an entry stored or scanned that a search by its key can
-  return (four kinds, the key bare) and didn't is `index gap`, and a key
-  whose search got no answer, or was cut short, gives none. A stored
-  entry is re-proved off the state's chain, and after a bootstrap or a
-  pin reset. The state gains `scan_from`, which `rekor_reset_store`
-  rewinds the scan to; a run that can't read the log changes only
-  `failures`.
+  entry of another kind is `wrong kind` only when a signature in it
+  verifies under the anchor key (a `hashedrekord`'s, a `tuf` root's or
+  metadata's, any certificate's), stored and repeated; one where none
+  does, of a kind read whole (`hashedrekord`, `tuf`), only mentions the
+  key: a warning, counted and named (at most 20) in the alert; any other
+  is `unverifiable`, an alarm once, its ID kept so it isn't raised again
+  (the owner's (a) of #7136 and of #7216). Every stored entry is verified
+  and reported on every run; a stored or scanned entry a search by its
+  key can return and didn't is `index gap`, and a key whose search got
+  no answer, or was cut short, gives none. A stored entry is re-proved
+  off the state's chain, and after a bootstrap or a pin reset until a
+  run proves them all (the store's `reprove`). The state gains
+  `scan_from`, which `rekor_reset_store` rewinds the scan to; a staging
+  state without the scan members doesn't parse; a run that can't read
+  the log changes only `failures`, counted per run.
 - **0.2.12 (2026-11-10):** `votesctl check -all -rekor` (§7)
   reads Rekor v1 through an allowlist of four endpoints (never one that
   adds to the log), and the site by `GET` and `HEAD` only. It searches
