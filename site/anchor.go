@@ -84,24 +84,26 @@ func (a *Anchors) trusted() root.TrustedMaterial {
 type AnchorTimes struct {
 	TSA   time.Time
 	Rekor time.Time
-	// Entry is the bundle's own Rekor entry, as Sigstore's verifier
-	// checked it (nil if the bundle has no single entry with an inclusion
-	// proof): for the Rekor check (VOTES-SITE §7), which verifies its
-	// checkpoint itself.
+	// Entry is the bundle's own Rekor v1 entry, as Sigstore's verifier
+	// checked it, for the Rekor check (VOTES-SITE §7), which verifies its
+	// checkpoint itself. It is nil unless the bundle has a single v1 entry
+	// with both an inclusion promise (which signs the global log index and
+	// the integrated time) and an inclusion proof (whose checkpoint signs
+	// the root); the profile's bundles have both (§4).
 	Entry *RekorEntry
 }
 
 // RekorEntry is a bundle's Rekor entry: its leaf hash (the last 64 hex
-// digits of its entry ID), its global log index and its shard's, its
-// integrated time, and its inclusion proof's checkpoint (a signed note:
-// origin, tree size, root) with the proof's tree size.
+// digits of its entry ID), its global log index and integrated time (as
+// the inclusion promise signs them), its shard's index (the proof's), and
+// the proof's checkpoint, a signed note whose own size and root are the
+// ones to use once it is verified.
 type RekorEntry struct {
 	Leaf       []byte
 	LogIndex   int64
 	ShardIndex int64
 	Integrated time.Time
 	Checkpoint string
-	TreeSize   int64
 }
 
 // Verify checks that bundleJSON anchors exactly doc under the anchor key
@@ -165,15 +167,15 @@ func (a *Anchors) VerifyTimes(bundleJSON, doc, spki []byte) (AnchorTimes, error)
 	// has one (an entry whose promise fails is skipped, and one entry is
 	// required): with a single entry, a promised integrated time is
 	// signed by the log.
-	if es, err := b.TlogEntries(); err == nil && len(es) == 1 {
-		if es[0].HasInclusionPromise() {
-			t.Rekor = es[0].IntegratedTime()
-		}
-		if tle := es[0].TransparencyLogEntry(); tle != nil && tle.GetInclusionProof() != nil && tle.GetInclusionProof().GetCheckpoint() != nil {
+	if es, err := b.TlogEntries(); err == nil && len(es) == 1 && es[0].HasInclusionPromise() {
+		t.Rekor = es[0].IntegratedTime()
+		// The global index and the time only as the promise signs them,
+		// with a v1 proof against the canonical body.
+		if tle := es[0].TransparencyLogEntry(); !es[0].IsRekorV2() && tle != nil && tle.GetInclusionProof() != nil && tle.GetInclusionProof().GetCheckpoint() != nil {
 			ip := tle.GetInclusionProof()
 			leaf := sha256.Sum256(append([]byte{0}, tle.GetCanonicalizedBody()...))
 			t.Entry = &RekorEntry{Leaf: leaf[:], LogIndex: tle.GetLogIndex(), ShardIndex: ip.GetLogIndex(),
-				Integrated: es[0].IntegratedTime(), Checkpoint: ip.GetCheckpoint().GetEnvelope(), TreeSize: ip.GetTreeSize()}
+				Integrated: es[0].IntegratedTime(), Checkpoint: ip.GetCheckpoint().GetEnvelope()}
 		}
 	}
 	return t, nil

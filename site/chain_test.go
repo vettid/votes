@@ -86,6 +86,11 @@ func TestServiceChain(t *testing.T) {
 		if err != nil || !slices.Contains(rep.Mismatches, c.want) {
 			t.Fatalf("%s: %+v %v", name, rep, err)
 		}
+		// The digests are of the copies checked and the current list: a
+		// missing copy's is absent (unless it is the current list's).
+		if len(rep.Digests) != rep.Checked && len(rep.Digests) != rep.Checked+1 {
+			t.Errorf("%s: %d digests for %d checked", name, len(rep.Digests), rep.Checked)
+		}
 	}
 	// The current version's copy may lag services.json by ListingGrace.
 	o := maps.Clone(objs)

@@ -68,10 +68,10 @@ func TestAnchorVector(t *testing.T) {
 		VerificationMaterial struct {
 			TlogEntries []struct {
 				LogIndex          string `json:"logIndex"`
+				IntegratedTime    string `json:"integratedTime"`
 				CanonicalizedBody []byte `json:"canonicalizedBody"`
 				InclusionProof    struct {
 					LogIndex   string `json:"logIndex"`
-					TreeSize   string `json:"treeSize"`
 					Checkpoint struct {
 						Envelope string `json:"envelope"`
 					} `json:"checkpoint"`
@@ -86,8 +86,21 @@ func TestAnchorVector(t *testing.T) {
 	leaf := sha256.Sum256(append([]byte{0}, te.CanonicalizedBody...))
 	e := at.Entry
 	if !bytes.Equal(e.Leaf, leaf[:]) || strconv.FormatInt(e.LogIndex, 10) != te.LogIndex || strconv.FormatInt(e.ShardIndex, 10) != te.InclusionProof.LogIndex ||
-		strconv.FormatInt(e.TreeSize, 10) != te.InclusionProof.TreeSize || e.Checkpoint != te.InclusionProof.Checkpoint.Envelope || e.Integrated.IsZero() {
+		e.Checkpoint != te.InclusionProof.Checkpoint.Envelope || strconv.FormatInt(e.Integrated.Unix(), 10) != te.IntegratedTime {
 		t.Errorf("entry %+v, bundle %+v", e, te)
+	}
+	// Without the inclusion promise (which signs the global index and the
+	// time), the bundle may still verify, but gives no entry.
+	var bmap map[string]any
+	if err := json.Unmarshal(v.Bundle, &bmap); err != nil {
+		t.Fatal(err)
+	}
+	vmat := bmap["verificationMaterial"].(map[string]any)
+	tl := vmat["tlogEntries"].([]any)[0].(map[string]any)
+	delete(tl, "inclusionPromise")
+	noPromise, _ := json.Marshal(bmap)
+	if at, err := a.VerifyTimes(noPromise, doc, v.AnchorKey); err == nil && at.Entry != nil {
+		t.Errorf("an entry without its inclusion promise: %+v", at.Entry)
 	}
 	// Other bytes, another key, and a bundle whose entry is altered.
 	if _, err := a.Verify(v.Bundle, append(doc, ' '), v.AnchorKey); err == nil {
