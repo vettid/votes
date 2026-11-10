@@ -34,6 +34,13 @@ jobs:
           sha256sum "$RUNNER_TEMP/api/bootstrap"
           CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/votesctl
           CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/anchor-signer
+          # Each environment's signer, with its configuration compiled in:
+          # the hash the owner compares before signing (scripts/build-signer.sh).
+          for f in deploy/signer-*.conf; do
+            [ -e "$f" ] || continue
+            e=${f#deploy/signer-}; e=${e%.conf}
+            ./scripts/build-signer.sh "$e" "$RUNNER_TEMP/signer-$e"
+          done
 
   cdk:
     runs-on: ubuntu-26.04

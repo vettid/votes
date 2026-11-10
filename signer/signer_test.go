@@ -358,9 +358,13 @@ func (h *harness) counts(t *testing.T, signs, stamps, enters, uploads int) {
 
 func TestPublish(t *testing.T) {
 	h := newHarness(t)
+	h.s.ServiceIKs = [][]byte{[]byte("ik")}
 	r, err := h.s.Handle(context.Background(), req)
-	if err != nil || r.Status != 201 || r.Bundle == nil || !r.IndexUpdated {
+	if err != nil || r.Status != 201 || r.Bundle == nil || !r.IndexUpdated || !bytes.Equal(r.AnchorKey, h.a.PublicKeyDER()) {
 		t.Fatalf("%+v %v", r, err)
+	}
+	if len(h.st.opts.ServiceIKs) != 1 {
+		t.Fatal("Prepare wasn't given the compiled identity keys")
 	}
 	if d := time.Until(h.st.opts.At) - DefaultDeadlines.Lead(); d > time.Second || d < -time.Second {
 		t.Fatalf("Prepare's time %v", h.st.opts.At)

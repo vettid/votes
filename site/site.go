@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -196,6 +197,12 @@ type PrepareOptions struct {
 	// under: one the document's service doesn't list is refused
 	// (bad_anchor), before anything is signed. Nil skips the check.
 	AnchorKey []byte
+	// ServiceIKs are the identity keys the signer anchors for (compiled
+	// into it, GC #7638 item 1): a document whose service (the proposal's
+	// `service`, or the published proposal's) isn't one of them is refused
+	// (unknown_service), whatever the service list says. Nil skips the
+	// check.
+	ServiceIKs [][]byte
 }
 
 // Prepare runs every check an upload of doc, sig and rows to the slot
@@ -261,6 +268,15 @@ func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []by
 		return Prepared{}, err
 	}
 	u.Bundle = held
+	if opts.ServiceIKs != nil {
+		ik, err := s.docService(ctx, id, name, doc)
+		if err != nil {
+			return Prepared{}, err
+		}
+		if ik != nil && !slices.ContainsFunc(opts.ServiceIKs, func(k []byte) bool { return bytes.Equal(k, ik) }) {
+			return Prepared{}, &Refusal{http.StatusUnprocessableEntity, "unknown_service"}
+		}
+	}
 	if _, err := s.put(ctx, id, name, u, &dryRun{at: opts.At, key: opts.AnchorKey}); err != nil {
 		var rf *refusal
 		if errors.As(err, &rf) {
@@ -269,6 +285,26 @@ func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []by
 		return Prepared{}, err
 	}
 	return Prepared{Published: prev != nil, Held: held != nil}, nil
+}
+
+// docService is the identity key a document to (id, name) is under: a
+// proposal's own `service`, or the published proposal's for the others;
+// nil when it can't be read (the checks that follow refuse it).
+func (s *Site) docService(ctx context.Context, id, name string, doc []byte) ([]byte, error) {
+	if name == "proposal" {
+		if p, err := vote.ParseProposal(doc); err == nil {
+			return p.Service, nil
+		}
+		return nil, nil
+	}
+	pdoc, err := s.published(ctx, docPath(id, "proposal"))
+	if err != nil || pdoc == nil {
+		return nil, err
+	}
+	if p, err := vote.ParseProposal(pdoc); err == nil {
+		return p.Service, nil
+	}
+	return nil, nil
 }
 
 // lists is whether svc lists the anchor key spki.

@@ -1,7 +1,13 @@
 # The owner reviews a change to the monitor's exceptions, its workflow,
-# its embedded trusted root and this file (main is protected: a pull
+# its embedded trusted root, the AnchorSigner (its code, its build and
+# each environment's compiled configuration, which the owner signs) and
+# this file (main is protected: a pull
 # request, one approving review, and code-owner review are required).
 /monitor/                        @mesmerverse
 /.github/workflows/monitor.yml   @mesmerverse
 /site/roots/                     @mesmerverse
 /.github/CODEOWNERS              @mesmerverse
+/deploy/                         @mesmerverse
+/scripts/build-signer.sh         @mesmerverse
+/cmd/anchor-signer/              @mesmerverse
+/signer/                         @mesmerverse

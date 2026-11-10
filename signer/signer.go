@@ -51,6 +51,10 @@ type Result struct {
 	Code         string          `json:"code,omitempty"`
 	Bundle       json.RawMessage `json:"bundle,omitempty"`
 	IndexUpdated bool            `json:"index_updated"`
+	// AnchorKey is the anchor key's SubjectPublicKeyInfo, on every answer:
+	// the service lists it (with its certificate) without reading the key
+	// itself (GC #7648 item 3).
+	AnchorKey []byte `json:"anchor_key"`
 }
 
 // Claim is a slot's record (GC #7406 §2): created once for a digest, each
@@ -289,6 +293,9 @@ type Signer struct {
 	Now       func() time.Time
 	Log       *slog.Logger
 	Deadlines Deadlines
+	// ServiceIKs are the identity keys this signer anchors for, compiled
+	// into it; a document under any other is refused (unknown_service).
+	ServiceIKs [][]byte
 }
 
 // stuck alarms claim_stuck for a kept artifact that can't be read, and
@@ -334,6 +341,14 @@ func RequestIDSink(ctx context.Context) *string {
 // Handle runs one call. An error is a failure the caller retries (the
 // task treats it as not published); a refusal is a Result.
 func (s *Signer) Handle(ctx context.Context, req Request) (Result, error) {
+	r, err := s.handle(ctx, req)
+	if err == nil {
+		r.AnchorKey = s.Anchor.PublicKeyDER()
+	}
+	return r, err
+}
+
+func (s *Signer) handle(ctx context.Context, req Request) (Result, error) {
 	if req.ProposalID == "" || req.Name == "" || len(req.Doc) == 0 {
 		return Result{Status: http.StatusBadRequest, Code: CodeBadRequest}, nil
 	}
@@ -384,7 +399,7 @@ func (s *Signer) Handle(ctx context.Context, req Request) (Result, error) {
 	err := s.hop(ctx, s.Deadlines.Site, func(ctx context.Context) error {
 		var err error
 		prep, err = s.Site.Prepare(ctx, req.ProposalID, req.Name, req.Doc, req.Sig, req.Rows,
-			site.PrepareOptions{At: at, AnchorKey: s.Anchor.PublicKeyDER()})
+			site.PrepareOptions{At: at, AnchorKey: s.Anchor.PublicKeyDER(), ServiceIKs: s.ServiceIKs})
 		return err
 	})
 	var rf *site.Refusal

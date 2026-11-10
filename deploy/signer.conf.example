@@ -1,0 +1,25 @@
+# The AnchorSigner's configuration for one environment, compiled into its
+# binary by scripts/build-signer.sh <env> (copy this file to
+# deploy/signer-<env>.conf; the owner reviews every change, CODEOWNERS).
+# One KEY=VALUE per line; every key is required. The values are public:
+# names, ARNs and public keys, never a secret.
+#
+# Region: the signer account's region.
+Region=us-east-1
+# KeyAlias: the anchor key's alias ARN, in the signer account.
+KeyAlias=arn:aws:kms:us-east-1:000000000000:alias/vettid-anchor-staging
+# ClaimsTable, JournalGroup, JournalStream: AnchorSigner-<env>'s fixed names.
+ClaimsTable=vettid-anchor-claims-staging
+JournalGroup=/vettid/anchor/staging/journal
+JournalStream=signs
+# VotesBucket and VotesAPI: the votes site's bucket (read only) and origin.
+VotesBucket=votes-staging-site
+VotesAPI=https://votes-staging.example.org
+# Sigstore: staging or production.
+Sigstore=staging
+# SiteKey: the votes site key (Ed25519, base64), which signs the service list.
+SiteKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+# ServiceIKs: the identity keys (Ed25519, base64, comma-separated) of the
+# services this signer anchors for. A change is a new signed release
+# (before an identity-key rotation, both the old and the new).
+ServiceIKs=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=

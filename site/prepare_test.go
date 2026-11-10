@@ -155,3 +155,35 @@ func TestPrepareAnchorKey(t *testing.T) {
 		}
 	}
 }
+
+// Prepare refuses a document under an identity key the signer doesn't
+// anchor for, whatever the service list says.
+func TestPrepareServiceIKs(t *testing.T) {
+	f := loadFixture(t)
+	s, _ := newSite(t, f, f.during())
+	for _, c := range []struct {
+		iks  [][]byte
+		code string
+	}{{[][]byte{f.ik()}, ""}, {nil, ""}, {[][]byte{[]byte("another ik")}, "unknown_service"}} {
+		_, err := s.Prepare(context.Background(), testID, "proposal", f.Proposal.Doc, f.Proposal.Sig, nil, PrepareOptions{ServiceIKs: c.iks})
+		var rf *Refusal
+		got := ""
+		if errors.As(err, &rf) {
+			got = rf.Code
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if got != c.code {
+			t.Fatalf("iks %q: %q, want %q", c.iks, got, c.code)
+		}
+	}
+	// An extension: judged by the published proposal's service.
+	code, why := post(t, s, "proposal", &f.Proposal)
+	want(t, "proposal", code, why, 201, "")
+	_, err := s.Prepare(context.Background(), testID, "extension-1", f.Extension.Doc, f.Extension.Sig, nil,
+		PrepareOptions{ServiceIKs: [][]byte{[]byte("another ik")}})
+	var rf *Refusal
+	if !errors.As(err, &rf) || rf.Code != "unknown_service" {
+		t.Fatalf("an extension under another service: %v", err)
+	}
+}
