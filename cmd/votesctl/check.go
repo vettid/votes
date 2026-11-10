@@ -19,6 +19,7 @@ import (
 
 	"github.com/sigstore/sigstore-go/pkg/root"
 
+	"github.com/vettid/votes/rekor"
 	"github.com/vettid/votes/site"
 )
 
@@ -41,8 +42,20 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	all := fs.Bool("all", false, "check the service list's chain and every proposal the index and the archive list")
 	since := fs.String("since", firstMonth, "with -all: the first archive month read (YYYY-MM)")
 	ackFile := fs.String("acknowledged", "", "a file of acknowledged partial uploads (docs/VOTES-SITE.md §7)")
+	var rf rekorFlags
+	rf.register(fs)
 	if fs.Parse(args) != nil || *all != (fs.NArg() == 0) || fs.NArg() > 1 {
-		fmt.Fprintln(stderr, "usage: votesctl check [-all [-since YYYY-MM] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] [-acknowledged <file>]")
+		fmt.Fprintln(stderr, "usage: votesctl check [-all [-since YYYY-MM] [-rekor ...] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] [-acknowledged <file>]")
+		return exitUsage
+	}
+	sinceSet := false
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "since" {
+			sinceSet = true
+		}
+	})
+	if err := rf.usage(*all, sinceSet); err != nil {
+		fmt.Fprintln(stderr, "votesctl:", err)
 		return exitUsage
 	}
 	var acks []site.Acknowledgement
@@ -58,12 +71,20 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		c := noRedirects()
 		fetch := httpFetcher(*base, c)
 		if *all {
-			ok, err = checkAll(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, *since, acks, time.Now())
+			var rk *rekorStep
+			if rf.on {
+				rk = &rekorStep{flags: &rf, instance: *instance}
+			}
+			ok, err = checkAll(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, *since, acks, time.Now(), rk)
 		} else {
 			ok, err = checkVote(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, fs.Arg(0), acks, time.Now())
 		}
 	}
+	var adm *errRekorAdmin
 	switch {
+	case errors.As(err, &adm):
+		fmt.Fprintln(stderr, "votesctl:", err)
+		return exitUsage
 	case err != nil:
 		fmt.Fprintln(stderr, "votesctl:", err)
 		return exitFailed
@@ -293,6 +314,16 @@ type allReport struct {
 	// (a proposal's own are in its mismatches).
 	StaleAcknowledged []string `json:"stale_acknowledged,omitempty"`
 	Proposals         []report `json:"proposals"`
+	// Rekor: the Rekor check (-rekor; VOTES-SITE §7).
+	Rekor *rekor.RunReport `json:"rekor,omitempty"`
+}
+
+// rekorStep is -rekor's part of checkAll; log, if set, replaces the
+// Rekor client (tests).
+type rekorStep struct {
+	flags    *rekorFlags
+	instance string
+	log      rekor.Log
 }
 
 type servicesOut struct {
@@ -313,7 +344,8 @@ var errChecksFailed = errors.New("checks failed: see the report's errors")
 // failed, or the index or an archive month couldn't be read (the
 // report is still written, naming each).
 func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, modified func(context.Context, string) (time.Time, error),
-	anchors *site.Anchors, siteKeyB64, since string, acks []site.Acknowledgement, now time.Time) (ok bool, err error) {
+	anchors *site.Anchors, siteKeyB64, since string, acks []site.Acknowledgement, now time.Time, rk *rekorStep) (ok bool, err error) {
+	col := newRekorCollect()
 	key, err := decodeSiteKey(siteKeyB64)
 	if err != nil {
 		return false, err
@@ -328,6 +360,7 @@ func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, modified fun
 		out.Errors++
 	} else {
 		out.Services = servicesOut{Version: c.Version, Checked: c.Checked, Mismatches: c.Mismatches}
+		col.services(c)
 	}
 
 	// The proposals: the index's, then each month's archive.
@@ -380,6 +413,7 @@ func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, modified fun
 			continue
 		}
 		rep.Acknowledge(acks)
+		col.proposal(rep)
 		out.Proposals = append(out.Proposals, toReport(rep, now))
 	}
 	for _, a := range acks {
@@ -388,9 +422,25 @@ func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, modified fun
 		}
 	}
 
+	if rk != nil {
+		rr, err := runRekor(ctx, rk.flags, rk.instance, anchors, fetch, siteKeyB64, col, len(out.Lists) > 0, rk.log, now)
+		var adm *errRekorAdmin
+		if errors.As(err, &adm) {
+			return false, err
+		}
+		if err != nil {
+			out.Rekor = &rekor.RunReport{Instance: rk.instance, Error: err.Error(), Mismatches: []rekor.Item{}}
+			out.Errors++
+		} else {
+			out.Rekor = rr
+		}
+	}
 	out.OK = out.Errors == 0 && len(out.Services.Mismatches) == 0 && len(out.StaleAcknowledged) == 0
 	for _, p := range out.Proposals {
 		out.OK = out.OK && p.OK
+	}
+	if out.Rekor != nil && !out.Rekor.OK() {
+		out.OK = false
 	}
 	if err := writeReport(w, out); err != nil {
 		return false, err

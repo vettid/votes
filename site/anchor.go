@@ -73,6 +73,9 @@ func (a *Anchors) RootSource() string {
 	return a.r.from()
 }
 
+// Trusted is the trusted material in use (for the Rekor check's log keys).
+func (a *Anchors) Trusted() root.TrustedMaterial { return a.trusted() }
+
 func (a *Anchors) trusted() root.TrustedMaterial {
 	if a.r == nil {
 		return a.fixed

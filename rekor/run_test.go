@@ -229,6 +229,14 @@ func TestRunFailures(t *testing.T) {
 	if r, _ := Run(ctx, forged, s.input(LoadedState{Kind: StateNone}, false)); !slices.Contains(findings(r), FindingUnverified) || slices.Contains(findings(r), FindingUnknown) {
 		t.Errorf("forged: %+v", r.Mismatches)
 	}
+	// An owner-run step when the log's checkpoint can't be had: refused.
+	s.f.logErr = ErrUnavailable
+	bin := s.input(ParseState([]byte(Sentinel)), true)
+	bin.Admin = Admin{Bootstrap: true}
+	if _, err := Run(ctx, s.f, bin); !errors.Is(err, ErrAdminRefused) {
+		t.Errorf("bootstrap without a checkpoint: %v", err)
+	}
+	s.f.logErr = nil
 	// An admin request that doesn't apply.
 	in = s.input(LoadedState{Kind: StateNone}, false)
 	in.Admin = Admin{Bootstrap: true}

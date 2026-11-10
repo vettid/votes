@@ -21,6 +21,7 @@ import (
 
 	"github.com/vettid/service-vault/vote"
 	"github.com/vettid/vettid-vault/vms/suite"
+	"github.com/vettid/votes/rekor"
 	"github.com/vettid/votes/site"
 )
 
@@ -113,7 +114,7 @@ func TestCheckCommand(t *testing.T) {
 	all := func() (allReport, bool, error) {
 		t.Helper()
 		var out bytes.Buffer
-		ok, err := checkAll(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), httpModified(srv.URL, noRedirects()), anchors, key, "2026-10", nil, time.Now())
+		ok, err := checkAll(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), httpModified(srv.URL, noRedirects()), anchors, key, "2026-10", nil, time.Now(), nil)
 		var rep allReport
 		if jerr := json.Unmarshal(out.Bytes(), &rep); jerr != nil {
 			t.Fatalf("%v: %s", jerr, out.Bytes())
@@ -252,6 +253,51 @@ func TestCheckCommand(t *testing.T) {
 	}
 	delete(store.Objects, ext2)
 
+	// -rekor: usage errors.
+	for name, a := range map[string][]string{
+		"without -all":          args("-site-key", key, "-rekor", p.ProposalID),
+		"with -since":           args("-site-key", key, "-all", "-rekor", "-since", "2026-10"),
+		"flags without -rekor":  args("-site-key", key, "-all", "-rekor-state", "x"),
+		"admin without a state": args("-site-key", key, "-all", "-rekor", "-rekor-bootstrap"),
+		"reset store, no store": args("-site-key", key, "-all", "-rekor", "-rekor-reset-store"),
+	} {
+		if got := code(a); got != exitUsage {
+			t.Errorf("-rekor %s: exit %d, want %d", name, got, exitUsage)
+		}
+	}
+	// -rekor against a log that never answers: the site's report with the
+	// Rekor check's error; the state (the sentinel) written back as it was;
+	// the store written; a bootstrap is refused, nothing recorded.
+	rdir := t.TempDir()
+	stPath, vPath := filepath.Join(rdir, "state.json"), filepath.Join(rdir, "verified.json")
+	if err := os.WriteFile(stPath, []byte(rekor.Sentinel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rk := &rekorStep{flags: &rekorFlags{on: true, state: stPath, verified: vPath}, instance: site.Staging, log: deadLog{}}
+	var rout bytes.Buffer
+	rok, rerr := checkAll(context.Background(), &rout, httpFetcher(srv.URL, noRedirects()), httpModified(srv.URL, noRedirects()), anchors, key, "2026-10", nil, time.Now(), rk)
+	var rrep allReport
+	if err := json.Unmarshal(rout.Bytes(), &rrep); err != nil {
+		t.Fatalf("%v: %s", err, rout.Bytes())
+	}
+	if rrep.Rekor == nil || rrep.Rekor.Error == "" || rrep.Rekor.Instance != site.Staging {
+		t.Fatalf("rekor %+v (%v %v)", rrep.Rekor, rok, rerr)
+	}
+	if b, _ := os.ReadFile(stPath); string(b) != rekor.Sentinel {
+		t.Errorf("the state was rewritten: %s", b)
+	}
+	if _, err := os.Stat(vPath); err != nil {
+		t.Errorf("the store wasn't written: %v", err)
+	}
+	rk.flags.bootstrap = true
+	var adm *errRekorAdmin
+	if _, err := checkAll(context.Background(), &rout, httpFetcher(srv.URL, noRedirects()), httpModified(srv.URL, noRedirects()), anchors, key, "2026-10", nil, time.Now(), rk); !errors.As(err, &adm) {
+		t.Errorf("a bootstrap without the log's checkpoint: %v", err)
+	}
+	if b, _ := os.ReadFile(stPath); string(b) != rekor.Sentinel {
+		t.Errorf("a refused bootstrap rewrote the state: %s", b)
+	}
+
 	// Another site key, or a changed row, fails the check.
 	if _, err := checkVote(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), nil, anchors, other, p.ProposalID, nil, time.Now()); err == nil {
 		t.Fatal("checked under another site key")
@@ -353,5 +399,52 @@ func TestHTTPModified(t *testing.T) {
 	}
 	if _, err := modified(context.Background(), "v1/other"); err == nil {
 		t.Fatal("a 404 gave a time")
+	}
+}
+
+// deadLog is a Rekor log that never answers.
+type deadLog struct{}
+
+func (deadLog) LogInfo(context.Context) (*rekor.LogInfo, error) { return nil, rekor.ErrUnavailable }
+func (deadLog) ConsistencyProof(context.Context, int64, int64, string) ([]string, error) {
+	return nil, rekor.ErrUnavailable
+}
+func (deadLog) SearchKey(context.Context, []byte) ([]string, error) { return nil, rekor.ErrUnavailable }
+func (deadLog) Entries(context.Context, []string) (map[string]*rekor.Entry, error) {
+	return nil, rekor.ErrUnavailable
+}
+func (deadLog) EntriesAt(context.Context, []int64) (map[string]*rekor.Entry, error) {
+	return nil, rekor.ErrUnavailable
+}
+
+// The collector: a proposal's documents are known digests, its rows
+// unexpected; each bundle's entry is kept with the document's name, and a
+// document anchored without one is named; a service list's digests are
+// unexpected.
+func TestRekorCollect(t *testing.T) {
+	at := time.Unix(1_800_000_000, 0)
+	rep := &site.Report{ProposalID: "p1",
+		Hashes:         map[string][]byte{"proposal": {1}, "results": {2}, "rows": {3}},
+		Anchored:       map[string]time.Time{"proposal": at, "results": at},
+		Entries:        map[string]*site.RekorEntry{"proposal": {Leaf: []byte{9}, LogIndex: 7, Integrated: at, Checkpoint: "cp"}},
+		PartialObjects: map[string][]site.Object{"extension-2": {{Key: "v1/p/p1/extension-2.json", SHA256: "ab"}, {Key: "v1/p/p1/extension-2.json.sig", SHA256: "cd"}}},
+	}
+	c := newRekorCollect()
+	c.proposal(rep)
+	c.services(&site.ChainReport{Digests: [][]byte{{4}}})
+	if c.known["01"] != at || !c.known["02"].IsZero() || c.known["ab"] != (time.Time{}) {
+		t.Errorf("known %v", c.known)
+	}
+	if _, ok := c.known["cd"]; ok {
+		t.Error("a signature's digest is known")
+	}
+	if c.unexpected["03"] == "" || c.unexpected["04"] == "" || len(c.unexpected) != 2 {
+		t.Errorf("unexpected %v", c.unexpected)
+	}
+	if len(c.bundles) != 1 || c.bundles[0].Name != "p1/proposal" || c.bundles[0].LogIndex != 7 {
+		t.Errorf("bundles %+v", c.bundles)
+	}
+	if len(c.noEntry) != 1 || c.noEntry[0] != "p1/results" {
+		t.Errorf("no entry %v", c.noEntry)
 	}
 }

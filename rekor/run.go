@@ -305,6 +305,10 @@ func Run(ctx context.Context, log Log, in RunInput) (*RunReport, error) {
 	if err != nil {
 		return nil, err
 	}
+	if pin == nil && in.Admin.count() > 0 {
+		// An owner-run step needs the log's checkpoint: never silently skipped.
+		return nil, fmt.Errorf("%w: the log's checkpoint couldn't be had or verified (%v)", ErrAdminRefused, r.rep.Mismatches)
+	}
 	if r.cur != nil {
 		r.search()
 		r.fetchAndVerify(r.searchedIDs(), true)
