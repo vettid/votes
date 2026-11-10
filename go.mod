@@ -22,7 +22,7 @@ require (
 	github.com/sigstore/sigstore-go v1.3.0
 	github.com/theupdateframework/go-tuf/v2 v2.4.2
 	github.com/transparency-dev/merkle v0.0.2
-	github.com/vettid/service-vault v0.0.0-20261110222008-922d14d20fac
+	github.com/vettid/service-vault v0.0.0-20261110231600-1b2c54971159
 	github.com/vettid/vettid-vault v0.0.0-20261104162927-4e1750f37928
 	golang.org/x/crypto v0.58.0
 )
