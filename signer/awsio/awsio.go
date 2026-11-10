@@ -147,6 +147,12 @@ func decodeClaim(it map[string]ddbtypes.AttributeValue) (*signer.Claim, error) {
 	if v, ok := it["journaled"].(*ddbtypes.AttributeValueMemberBOOL); ok {
 		cl.Journaled = v.Value
 	}
+	if v, ok := it["enter_attempted"].(*ddbtypes.AttributeValueMemberBOOL); ok {
+		cl.EnterAttempted = v.Value
+	}
+	if v, ok := it["lease_owner"].(*ddbtypes.AttributeValueMemberS); ok {
+		cl.LeaseOwner = v.Value
+	}
 	if v, ok := it["lease_until"].(*ddbtypes.AttributeValueMemberN); ok {
 		if n, err := strconv.ParseInt(v.Value, 10, 64); err == nil {
 			cl.LeaseUntil = time.UnixMilli(n)
@@ -232,15 +238,16 @@ func (c *Claims) SetSig(ctx context.Context, slot string, digest, sig, r []byte,
 
 // Lease implements signer.Claims: lease_until (Unix milliseconds) is set
 // only on a claim with no signature and no live lease.
-func (c *Claims) Lease(ctx context.Context, slot string, digest []byte, until, now time.Time) error {
+func (c *Claims) Lease(ctx context.Context, slot string, digest []byte, owner string, until, now time.Time) error {
 	_, err := c.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(c.Table),
 		Key:              map[string]ddbtypes.AttributeValue{"slot": &ddbtypes.AttributeValueMemberS{Value: slot}},
-		UpdateExpression: aws.String("SET #l = :until"),
+		UpdateExpression: aws.String("SET #l = :until, #o = :owner"),
 		ConditionExpression: aws.String("attribute_exists(#s) AND #d = :d AND attribute_not_exists(#sig) AND " +
 			"(attribute_not_exists(#l) OR #l <= :now)"),
-		ExpressionAttributeNames: map[string]string{"#s": "slot", "#d": "digest", "#sig": "sig", "#l": "lease_until"},
+		ExpressionAttributeNames: map[string]string{"#s": "slot", "#d": "digest", "#sig": "sig", "#l": "lease_until", "#o": "lease_owner"},
 		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
 			":d":     &ddbtypes.AttributeValueMemberB{Value: digest},
+			":owner": &ddbtypes.AttributeValueMemberS{Value: owner},
 			":until": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(until.UnixMilli(), 10)},
 			":now":   &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(now.UnixMilli(), 10)},
 		},
@@ -262,6 +269,33 @@ func (c *Claims) SetToken(ctx context.Context, slot string, digest, r, token []b
 	return c.set(ctx, slot, digest, r, map[string]ddbtypes.AttributeValue{"tsa_token": &ddbtypes.AttributeValueMemberB{Value: token}}, "tsa_token")
 }
 
+// SetEnterAttempted implements signer.Claims.
+func (c *Claims) SetEnterAttempted(ctx context.Context, slot string, digest, r []byte) error {
+	return c.set(ctx, slot, digest, r, map[string]ddbtypes.AttributeValue{"enter_attempted": &ddbtypes.AttributeValueMemberBOOL{Value: true}}, "enter_attempted")
+}
+
+// ReplaceToken implements signer.Claims: only over the exact old token,
+// and only while there is neither an entry nor an attempt at one.
+func (c *Claims) ReplaceToken(ctx context.Context, slot string, digest, r, old, token []byte) error {
+	_, err := c.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String(c.Table),
+		Key:              map[string]ddbtypes.AttributeValue{"slot": &ddbtypes.AttributeValueMemberS{Value: slot}},
+		UpdateExpression: aws.String("SET #t = :new"),
+		ConditionExpression: aws.String("attribute_exists(#s) AND #d = :d AND #r = :r AND #t = :old AND " +
+			"attribute_not_exists(#e) AND attribute_not_exists(#a)"),
+		ExpressionAttributeNames: map[string]string{"#s": "slot", "#d": "digest", "#r": "r", "#t": "tsa_token",
+			"#e": "rekor_entry", "#a": "enter_attempted"},
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":d": &ddbtypes.AttributeValueMemberB{Value: digest}, ":r": &ddbtypes.AttributeValueMemberB{Value: r},
+			":old": &ddbtypes.AttributeValueMemberB{Value: old}, ":new": &ddbtypes.AttributeValueMemberB{Value: token},
+		},
+	})
+	var ccf *ddbtypes.ConditionalCheckFailedException
+	if errors.As(err, &ccf) {
+		return signer.ErrSet
+	}
+	return err
+}
+
 // SetEntry implements signer.Claims.
 func (c *Claims) SetEntry(ctx context.Context, slot string, digest, r []byte, entry json.RawMessage) error {
 	return c.set(ctx, slot, digest, r, map[string]ddbtypes.AttributeValue{"rekor_entry": &ddbtypes.AttributeValueMemberB{Value: entry}}, "rekor_entry")
@@ -273,7 +307,7 @@ type LogsAPI interface {
 }
 
 // Journal is the signer's journal (GC #7406 §3): one JSON event per entry,
-// {"kind": "sign" | "complete", ...}, in a log group and stream only the
+// {"kind": "sign" | "note" | "complete", ...}, in a log group and stream only the
 // signer's role writes.
 type Journal struct {
 	Client LogsAPI
@@ -304,6 +338,9 @@ func (j *Journal) put(ctx context.Context, kind string, e any) error {
 
 // Sign implements signer.Journal.
 func (j *Journal) Sign(ctx context.Context, e signer.SignEntry) error { return j.put(ctx, "sign", e) }
+
+// Note implements signer.Journal.
+func (j *Journal) Note(ctx context.Context, e signer.NoteEntry) error { return j.put(ctx, "note", e) }
 
 // Complete implements signer.Journal.
 func (j *Journal) Complete(ctx context.Context, e signer.CompletionEntry) error {
@@ -336,8 +373,8 @@ type Site struct {
 var _ signer.Site = (*Site)(nil)
 
 // Prepare implements signer.Site.
-func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []byte, lead time.Duration) (site.Prepared, error) {
-	return s.Site.Prepare(ctx, id, name, doc, sig, rows, lead)
+func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []byte, opts site.PrepareOptions) (site.Prepared, error) {
+	return s.Site.Prepare(ctx, id, name, doc, sig, rows, opts)
 }
 
 // Bundle implements signer.Site.

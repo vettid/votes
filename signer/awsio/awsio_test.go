@@ -131,12 +131,12 @@ func TestClaimsUnit(t *testing.T) {
 		*f.update.ConditionExpression != "attribute_exists(#s) AND #d = :d AND attribute_not_exists(#f) AND #r = :r" {
 		t.Fatalf("%v %+v", err, f.update)
 	}
-	if err := c.Lease(ctx, "s", make([]byte, 32), time.Unix(9, 0), time.Unix(8, 0)); err != nil ||
+	if err := c.Lease(ctx, "s", make([]byte, 32), "a1", time.Unix(9, 0), time.Unix(8, 0)); err != nil ||
 		f.update.ExpressionAttributeValues[":now"].(*ddbtypes.AttributeValueMemberN).Value != "8000" {
 		t.Fatalf("%v %+v", err, f.update)
 	}
 	f.err = &ddbtypes.ConditionalCheckFailedException{}
-	if err := c.Lease(ctx, "s", make([]byte, 32), time.Unix(9, 0), time.Unix(8, 0)); !errors.Is(err, signer.ErrSet) {
+	if err := c.Lease(ctx, "s", make([]byte, 32), "a1", time.Unix(9, 0), time.Unix(8, 0)); !errors.Is(err, signer.ErrSet) {
 		t.Fatal(err)
 	}
 	if err := c.Create(ctx, "s", make([]byte, 32), time.Unix(5, 0)); !errors.Is(err, signer.ErrExists) {

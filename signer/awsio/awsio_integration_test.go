@@ -87,13 +87,13 @@ func TestClaims(t *testing.T) {
 	// The lease: refused while live, taken again once it has passed, and
 	// never once a signature is kept; nothing is set before the signature.
 	now := time.Unix(1000, 0)
-	if err := cl.Lease(ctx, slot, d[:], now.Add(time.Minute), now); err != nil {
+	if err := cl.Lease(ctx, slot, d[:], "a1", now.Add(time.Minute), now); err != nil {
 		t.Fatal(err)
 	}
-	if err := cl.Lease(ctx, slot, d[:], now.Add(2*time.Minute), now.Add(time.Second)); !errors.Is(err, signer.ErrSet) {
+	if err := cl.Lease(ctx, slot, d[:], "a1", now.Add(2*time.Minute), now.Add(time.Second)); !errors.Is(err, signer.ErrSet) {
 		t.Fatalf("a live lease taken again: %v", err)
 	}
-	if err := cl.Lease(ctx, slot, d[:], now.Add(3*time.Minute), now.Add(time.Minute)); err != nil {
+	if err := cl.Lease(ctx, slot, d[:], "a1", now.Add(3*time.Minute), now.Add(time.Minute)); err != nil {
 		t.Fatalf("a passed lease: %v", err)
 	}
 	if err := cl.SetToken(ctx, slot, d[:], []byte{1}, []byte("early")); !errors.Is(err, signer.ErrSet) {
@@ -103,6 +103,8 @@ func TestClaims(t *testing.T) {
 		func() error { return cl.SetSig(ctx, slot, d[:], []byte("sig"), []byte{1}, "req-1") },
 		func() error { return cl.SetJournaled(ctx, slot, d[:], []byte{1}) },
 		func() error { return cl.SetToken(ctx, slot, d[:], []byte{1}, []byte("token")) },
+		func() error { return cl.ReplaceToken(ctx, slot, d[:], []byte{1}, []byte("token"), []byte("token2")) },
+		func() error { return cl.SetEnterAttempted(ctx, slot, d[:], []byte{1}) },
 		func() error { return cl.SetEntry(ctx, slot, d[:], []byte{1}, []byte(`{"logIndex":"7"}`)) },
 	}
 	for i, f := range steps {
@@ -113,14 +115,18 @@ func TestClaims(t *testing.T) {
 			t.Fatalf("step %d again: %v", i, err)
 		}
 	}
-	if err := cl.Lease(ctx, slot, d[:], now.Add(time.Hour), now.Add(time.Hour)); !errors.Is(err, signer.ErrSet) {
+	if err := cl.Lease(ctx, slot, d[:], "a1", now.Add(time.Hour), now.Add(time.Hour)); !errors.Is(err, signer.ErrSet) {
 		t.Fatalf("a lease after the signature: %v", err)
+	}
+	// The token is never replaced once an entry is attempted.
+	if err := cl.ReplaceToken(ctx, slot, d[:], []byte{1}, []byte("token2"), []byte("token3")); !errors.Is(err, signer.ErrSet) {
+		t.Fatalf("a token replaced after the attempt: %v", err)
 	}
 	if err := cl.SetEntry(ctx, "x", d[:], []byte{2}, []byte("{}")); !errors.Is(err, signer.ErrSet) {
 		t.Fatalf("no claim: %v", err)
 	}
 	got, err := cl.Get(ctx, slot)
-	if err != nil || string(got.Sig) != "sig" || got.RequestID != "req-1" || !got.Journaled || string(got.TSAToken) != "token" ||
+	if err != nil || string(got.Sig) != "sig" || got.RequestID != "req-1" || !got.Journaled || string(got.TSAToken) != "token2" || !got.EnterAttempted || got.LeaseOwner != "a1" ||
 		string(got.RekorEntry) != `{"logIndex":"7"}` || got.Created.Unix() != 100 || string(got.Digest) != string(d[:]) {
 		t.Fatalf("%+v %v", got, err)
 	}

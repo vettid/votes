@@ -10,9 +10,11 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -73,9 +75,20 @@ func (m *memClaims) set(slot string, digest []byte, which string, ok func(*Claim
 	return nil
 }
 
-func (m *memClaims) Lease(_ context.Context, slot string, digest []byte, until, now time.Time) error {
+func (m *memClaims) Lease(_ context.Context, slot string, digest []byte, owner string, until, now time.Time) error {
 	return m.set(slot, digest, "lease", func(c *Claim) bool { return c.Sig == nil && !c.LeaseUntil.After(now) },
-		func(c *Claim) { c.LeaseUntil = until })
+		func(c *Claim) { c.LeaseUntil, c.LeaseOwner = until, owner })
+}
+
+func (m *memClaims) SetEnterAttempted(_ context.Context, slot string, digest, r []byte) error {
+	return m.set(slot, digest, "attempt", func(c *Claim) bool { return bytes.Equal(c.R, r) && !c.EnterAttempted },
+		func(c *Claim) { c.EnterAttempted = true })
+}
+
+func (m *memClaims) ReplaceToken(_ context.Context, slot string, digest, r, old, tok []byte) error {
+	return m.set(slot, digest, "replace", func(c *Claim) bool {
+		return bytes.Equal(c.R, r) && bytes.Equal(c.TSAToken, old) && c.RekorEntry == nil && !c.EnterAttempted
+	}, func(c *Claim) { c.TSAToken = tok })
 }
 
 func (m *memClaims) SetSig(ctx context.Context, slot string, digest, sig, r []byte, id string) error {
@@ -104,6 +117,7 @@ func (m *memClaims) SetEntry(_ context.Context, slot string, digest, r []byte, e
 type memJournal struct {
 	mu       sync.Mutex
 	signs    []SignEntry
+	notes    []NoteEntry
 	done     []CompletionEntry
 	failSign int // fail this many Sign writes
 }
@@ -120,6 +134,23 @@ func (j *memJournal) Sign(ctx context.Context, e SignEntry) error {
 	}
 	j.signs = append(j.signs, e)
 	return nil
+}
+
+func (j *memJournal) Note(_ context.Context, e NoteEntry) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.notes = append(j.notes, e)
+	return nil
+}
+
+func (j *memJournal) kinds() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var k []string
+	for _, n := range j.notes {
+		k = append(k, n.Kind)
+	}
+	return k
 }
 
 func (j *memJournal) Complete(_ context.Context, e CompletionEntry) error {
@@ -139,7 +170,10 @@ type fakeAnchor struct {
 	blockStamp            bool
 	wrongDigest           bool
 	signGate              chan struct{} // if set, Sign waits on it
-	onSign                func()        // if set, runs as Sign answers
+	clock                 func() time.Time
+	failSign              bool
+	failBundle            int
+	onSign                func() // if set, runs as Sign answers
 }
 
 func (a *fakeAnchor) Sign(ctx context.Context, doc []byte) ([]byte, []byte, error) {
@@ -149,6 +183,12 @@ func (a *fakeAnchor) Sign(ctx context.Context, doc []byte) ([]byte, []byte, erro
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.signs++
+	if a.failSign {
+		if p := RequestIDSink(ctx); p != nil {
+			*p = "req-lost"
+		}
+		return nil, nil, errors.New("connection reset")
+	}
 	d := sha256.Sum256(doc)
 	if a.wrongDigest {
 		d[0] ^= 1
@@ -178,7 +218,15 @@ func (a *fakeAnchor) Timestamp(ctx context.Context, sig []byte) ([]byte, error) 
 	if fail {
 		return nil, errors.New("TSA down")
 	}
-	return []byte("token:" + strconv.Itoa(n)), nil
+	return []byte("token:" + strconv.Itoa(n) + ":" + strconv.FormatInt(a.clock().Unix(), 10)), nil
+}
+
+func (a *fakeAnchor) TokenTime(tok []byte) (time.Time, error) {
+	var n, t int64
+	if _, err := fmt.Sscanf(string(tok), "token:%d:%d", &n, &t); err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(t, 0), nil
 }
 
 func (a *fakeAnchor) Enter(_ context.Context, digest, sig []byte) (json.RawMessage, error) {
@@ -193,6 +241,10 @@ func (a *fakeAnchor) Enter(_ context.Context, digest, sig []byte) (json.RawMessa
 }
 
 func (a *fakeAnchor) Bundle(digest, sig, ts []byte, entry json.RawMessage) (json.RawMessage, error) {
+	if a.failBundle > 0 {
+		a.failBundle--
+		return nil, errors.New("too far apart")
+	}
 	b, _ := json.Marshal(map[string]any{"digest": digest, "sig": sig, "ts": ts, "entry": entry})
 	return b, nil
 }
@@ -210,7 +262,7 @@ type fakeSite struct {
 	heldOnly  bool     // Prepare reports a held bundle, not a published document
 	answers   []answer // answers to uploads, in turn; then 201, indexed
 	uploads   []site.Upload
-	lead      time.Duration
+	opts      site.PrepareOptions
 }
 
 type answer struct {
@@ -219,10 +271,10 @@ type answer struct {
 	indexed bool
 }
 
-func (f *fakeSite) Prepare(_ context.Context, _, _ string, _, _, _ []byte, lead time.Duration) (site.Prepared, error) {
+func (f *fakeSite) Prepare(_ context.Context, _, _ string, _, _, _ []byte, opts site.PrepareOptions) (site.Prepared, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.lead = lead
+	f.opts = opts
 	if f.refuse != nil {
 		return site.Prepared{}, f.refuse
 	}
@@ -265,7 +317,7 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &harness{c: &memClaims{}, j: &memJournal{}, a: &fakeAnchor{key: k}, st: &fakeSite{}}
+	h := &harness{c: &memClaims{}, j: &memJournal{}, a: &fakeAnchor{key: k, clock: time.Now}, st: &fakeSite{}}
 	h.s = &Signer{Claims: h.c, Journal: h.j, Anchor: h.a, Site: h.st, Now: time.Now, Deadlines: DefaultDeadlines}
 	return h
 }
@@ -288,8 +340,15 @@ func TestPublish(t *testing.T) {
 	if err != nil || r.Status != 201 || r.Bundle == nil || !r.IndexUpdated {
 		t.Fatalf("%+v %v", r, err)
 	}
-	if h.st.lead != DefaultLead {
-		t.Fatalf("Prepare's lead %v", h.st.lead)
+	if d := time.Until(h.st.opts.At) - DefaultDeadlines.Lead(); d > time.Second || d < -time.Second {
+		t.Fatalf("Prepare's time %v", h.st.opts.At)
+	}
+	if !bytes.Equal(h.st.opts.AnchorKey, h.a.PublicKeyDER()) {
+		t.Fatal("Prepare wasn't given the signer's key")
+	}
+	if k := h.j.kinds(); len(k) != 1 || k[0] != NoteIntent || h.j.notes[0].AttemptID == "" ||
+		h.j.notes[0].AttemptID != h.j.signs[0].AttemptID {
+		t.Fatalf("notes %+v", h.j.notes)
 	}
 	h.counts(t, 1, 1, 1, 1)
 	c, _ := h.c.Get(context.Background(), slot)
@@ -449,19 +508,18 @@ func TestWrongDigest(t *testing.T) {
 func TestConcurrent(t *testing.T) {
 	h := newHarness(t)
 	h.a.signGate = make(chan struct{})
-	var wg sync.WaitGroup
-	errs := make([]error, 2)
-	for i := range 2 {
-		wg.Add(1)
+	results := make(chan error, 2)
+	for range 2 {
 		go func() {
-			defer wg.Done()
-			_, errs[i] = h.s.Handle(context.Background(), req)
+			_, err := h.s.Handle(context.Background(), req)
+			results <- err
 		}()
 	}
-	// Let the lease holder sign once both have had time to try.
-	time.Sleep(100 * time.Millisecond)
+	// The lease holder waits in Sign; the other finds the lease and
+	// answers first. Then the holder may sign.
+	first := <-results
 	close(h.a.signGate)
-	wg.Wait()
+	errs := []error{first, <-results}
 	if h.a.signs != 1 {
 		t.Fatalf("%d signs", h.a.signs)
 	}
@@ -494,7 +552,7 @@ func TestKeptByAnother(t *testing.T) {
 		}
 		h.c.before = nil
 		h.c.mu.Lock()
-		h.c.c[slot].TSAToken = []byte("token:other")
+		h.c.c[slot].TSAToken = []byte("token:99:" + strconv.FormatInt(time.Now().Unix(), 10))
 		h.c.mu.Unlock()
 	}
 	if _, err := h.s.Handle(context.Background(), req); err != nil {
@@ -502,7 +560,7 @@ func TestKeptByAnother(t *testing.T) {
 	}
 	var b map[string][]byte
 	_ = json.Unmarshal(h.st.uploads[0].Bundle, &b)
-	if string(b["ts"]) != "token:other" {
+	if !strings.HasPrefix(string(b["ts"]), "token:99:") {
 		t.Fatalf("the bundle carries %q, not the kept token", b["ts"])
 	}
 }
@@ -521,11 +579,19 @@ func TestNoTime(t *testing.T) {
 // The deadlines fit the function's 120 s, less the second the runtime
 // loop keeps back.
 func TestDeadlinesFit(t *testing.T) {
-	if w := DefaultDeadlines.Worst(); w > 119*time.Second {
+	d := DefaultDeadlines
+	if w := d.Worst(); w > 115*time.Second {
 		t.Fatalf("worst case %v", w)
 	}
-	if DefaultLead < DefaultDeadlines.Site+3*DefaultDeadlines.Claims+DefaultDeadlines.signWindow()+DefaultDeadlines.TSA {
+	// The lead covers everything from the checks to the token.
+	// The claim (3), the lease, the intent, the sign, keeping, journaling
+	// and marking it, then the TSA.
+	if d.Lead() < 8*d.Claims+d.Key+d.TSA {
 		t.Fatal("the lead is shorter than the steps before the TSA")
+	}
+	// A re-timestamped token still pairs with an entry asked for at once.
+	if after := d.RetimestampAfter(); after < 7*time.Minute || after+d.Rekor+3*d.Claims+d.Margin >= 600*time.Second {
+		t.Fatalf("re-timestamp after %v", after)
 	}
 }
 
@@ -617,5 +683,124 @@ func TestRFromDER(t *testing.T) {
 		if _, err := RFromDER(bad); err == nil {
 			t.Fatalf("%x taken", bad)
 		}
+	}
+}
+
+// A token too old to pair with an entry is replaced by a fresh one for the
+// same signature, before the entry; never a second sign.
+func TestRetimestamp(t *testing.T) {
+	h := newHarness(t)
+	h.a.failEnter = 1
+	n := 0
+	h.a.clock = func() time.Time { // the first token is old, as after a long wait
+		n++
+		if n == 1 {
+			return time.Now().Add(-20 * time.Minute)
+		}
+		return time.Now()
+	}
+	if _, err := h.s.Handle(context.Background(), req); err == nil {
+		t.Fatal("Rekor down, and no error")
+	}
+	if c, _ := h.c.Get(context.Background(), slot); !c.EnterAttempted {
+		t.Fatal("no attempt mark before Rekor")
+	}
+	r, err := h.s.Handle(context.Background(), req)
+	if err != nil || r.Status != 201 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	h.counts(t, 1, 2, 2, 1)
+	found := false
+	for _, k := range h.j.kinds() {
+		found = found || k == NoteRetimestamp
+	}
+	if !found {
+		t.Fatalf("no retimestamp note: %v", h.j.kinds())
+	}
+	var b map[string][]byte
+	_ = json.Unmarshal(h.st.uploads[0].Bundle, &b)
+	if tt, _ := h.a.TokenTime(b["ts"]); time.Since(tt) > time.Minute {
+		t.Fatalf("the bundle carries the old token (%v)", tt)
+	}
+}
+
+// Once an entry may exist, the kept token is never replaced, however old.
+func TestNoRetimestampAfterAttempt(t *testing.T) {
+	h := newHarness(t)
+	h.a.failEnter = 1
+	_, _ = h.s.Handle(context.Background(), req)
+	h.c.mu.Lock()
+	h.c.c[slot].TSAToken = []byte("token:1:" + strconv.FormatInt(time.Now().Add(-20*time.Minute).Unix(), 10))
+	h.c.mu.Unlock()
+	_, _ = h.s.Handle(context.Background(), req)
+	h.counts(t, 1, 1, 2, 1)
+	for _, k := range h.j.kinds() {
+		if k == NoteRetimestamp {
+			t.Fatal("a token replaced after an entry attempt")
+		}
+	}
+}
+
+// A resume is judged at the kept token's time, not at now.
+func TestResumeAtTokenTime(t *testing.T) {
+	h := newHarness(t)
+	h.a.failEnter = 1
+	at := time.Now().Add(-3 * time.Minute).Truncate(time.Second)
+	h.a.clock = func() time.Time { return at }
+	_, _ = h.s.Handle(context.Background(), req)
+	_, _ = h.s.Handle(context.Background(), req)
+	if !h.st.opts.At.Equal(at) {
+		t.Fatalf("the resume was judged at %v, not the token's %v", h.st.opts.At, at)
+	}
+}
+
+// A Sign whose answer is lost is journaled as of unknown outcome, with the
+// request id.
+func TestSignOutcomeUnknown(t *testing.T) {
+	h := newHarness(t)
+	h.a.failSign = true
+	if _, err := h.s.Handle(context.Background(), req); err == nil {
+		t.Fatal("no error")
+	}
+	k := h.j.kinds()
+	if len(k) != 2 || k[0] != NoteIntent || k[1] != NoteOutcomeUnknown || h.j.notes[1].KMSRequestID != "req-lost" ||
+		h.j.notes[1].AttemptID != h.j.notes[0].AttemptID {
+		t.Fatalf("notes %+v", h.j.notes)
+	}
+}
+
+// A kept but unjournaled signature is journaled even when the site
+// already holds the document; a held document with no bundle read is an
+// error, never a sign.
+func TestHeldPaths(t *testing.T) {
+	h := newHarness(t)
+	h.j.failSign = 1
+	_, _ = h.s.Handle(context.Background(), req)
+	h.st.published, h.st.held = true, []byte(`{"held":1}`)
+	if _, err := h.s.Handle(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.j.signs) != 1 {
+		t.Fatalf("journal %+v", h.j.signs)
+	}
+	h2 := newHarness(t)
+	h2.st.published = true
+	if _, err := h2.s.Handle(context.Background(), req); err == nil {
+		t.Fatal("a held document with no bundle passed")
+	}
+	h2.counts(t, 0, 0, 0, 0)
+}
+
+// A bundle that fails is tried once more from the claim before it alarms.
+func TestBundleRetried(t *testing.T) {
+	h := newHarness(t)
+	h.a.failBundle = 1
+	if r, err := h.s.Handle(context.Background(), req); err != nil || r.Status != 201 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	h3 := newHarness(t)
+	h3.a.failBundle = 2
+	if _, err := h3.s.Handle(context.Background(), req); err == nil {
+		t.Fatal("a bundle failing twice passed")
 	}
 }

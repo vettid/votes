@@ -13,7 +13,7 @@ import (
 // prepare runs Prepare on an upload's parts, without its bundle.
 func prepare(t *testing.T, s *Site, name string, u *Upload) (Prepared, string) {
 	t.Helper()
-	p, err := s.Prepare(context.Background(), testID, name, u.Doc, u.Sig, u.Rows, 0)
+	p, err := s.Prepare(context.Background(), testID, name, u.Doc, u.Sig, u.Rows, PrepareOptions{})
 	var rf *Refusal
 	switch {
 	case errors.As(err, &rf):
@@ -118,7 +118,8 @@ func TestPrepareRequest(t *testing.T) {
 	want(t, "proposal", st201, why, 201, "")
 	at(s, time.Unix(f.p.ClosesAt-30, 0))
 	for lead, wantCode := range map[time.Duration]string{0: "", 10 * time.Second: "", 30 * time.Second: "too_late", time.Minute: "too_late"} {
-		_, err := s.Prepare(context.Background(), testID, "extension-1", f.Extension.Doc, f.Extension.Sig, nil, lead)
+		_, err := s.Prepare(context.Background(), testID, "extension-1", f.Extension.Doc, f.Extension.Sig, nil,
+			PrepareOptions{At: s.Now().Add(lead)})
 		var rf *Refusal
 		got := ""
 		if errors.As(err, &rf) {
@@ -128,6 +129,29 @@ func TestPrepareRequest(t *testing.T) {
 		}
 		if got != wantCode {
 			t.Fatalf("lead %v: %q, want %q", lead, got, wantCode)
+		}
+	}
+}
+
+// Prepare refuses a document the signer's key can't anchor: one its
+// service doesn't list.
+func TestPrepareAnchorKey(t *testing.T) {
+	f := loadFixture(t)
+	s, _ := newSite(t, f, f.during())
+	for _, c := range []struct {
+		key  []byte
+		code string
+	}{{f.AnchorKey, ""}, {nil, ""}, {[]byte("another key"), "bad_anchor"}} {
+		_, err := s.Prepare(context.Background(), testID, "proposal", f.Proposal.Doc, f.Proposal.Sig, nil, PrepareOptions{AnchorKey: c.key})
+		var rf *Refusal
+		got := ""
+		if errors.As(err, &rf) {
+			got = rf.Code
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if got != c.code {
+			t.Fatalf("key %q: %q, want %q", c.key, got, c.code)
 		}
 	}
 }

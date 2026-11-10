@@ -187,16 +187,25 @@ type Refusal struct {
 
 func (r *Refusal) Error() string { return "site refuses: " + r.Code }
 
+// PrepareOptions are a Prepare's inputs beyond the upload.
+type PrepareOptions struct {
+	// At is the anchor's time to judge by: the kept timestamp's time when
+	// a signer resumes, or now plus its lead before it signs. Zero is now.
+	At time.Time
+	// AnchorKey is the SubjectPublicKeyInfo the document will be anchored
+	// under: one the document's service doesn't list is refused
+	// (bad_anchor), before anything is signed. Nil skips the check.
+	AnchorKey []byte
+}
+
 // Prepare runs every check an upload of doc, sig and rows to the slot
 // (id, name) would get, except the anchor, and writes nothing: the
-// signer's checks before it signs (key protection, GC #7406 §1). The time
-// now plus lead stands in for the anchor's (the signer's lead is the time
-// its steps may take), so a document Prepare accepts is refused once
-// anchored only if the anchor takes longer than lead; and the request is
-// measured with the largest bundle the site takes. A document the site already
-// holds is judged with the bundle it holds. A refusal is a *Refusal; any
-// other error is the store's.
-func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []byte, lead time.Duration) (Prepared, error) {
+// signer's checks before it signs (key protection, GC #7406 §1). The
+// anchor's time is opts.At, and its key must be one the service lists; the
+// request is measured with the largest bundle the site takes. A document
+// or a bundle the site already holds is judged with the bundle it holds. A
+// refusal is a *Refusal; any other error is the store's.
+func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []byte, opts PrepareOptions) (Prepared, error) {
 	if !validSlot(id, name) {
 		return Prepared{}, &Refusal{http.StatusNotFound, "not_found"}
 	}
@@ -252,7 +261,7 @@ func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []by
 		return Prepared{}, err
 	}
 	u.Bundle = held
-	if _, err := s.put(ctx, id, name, u, &dryRun{lead: max(lead, 0)}); err != nil {
+	if _, err := s.put(ctx, id, name, u, &dryRun{at: opts.At, key: opts.AnchorKey}); err != nil {
 		var rf *refusal
 		if errors.As(err, &rf) {
 			return Prepared{}, &Refusal{rf.status, rf.code}
@@ -262,15 +271,33 @@ func (s *Site) Prepare(ctx context.Context, id, name string, doc, sig, rows []by
 	return Prepared{Published: prev != nil, Held: held != nil}, nil
 }
 
-// dryRun is a run of the checks with nothing written (Prepare): lead is
-// how much later than now the anchor is taken to be.
-type dryRun struct{ lead time.Duration }
+// lists is whether svc lists the anchor key spki.
+func lists(svc *Service, spki []byte) bool {
+	for _, k := range svc.AnchorKeys {
+		if bytes.Equal(k.Key, spki) {
+			return true
+		}
+	}
+	return false
+}
 
-// anchorAt is the anchor's time, or, in a dry run without a bundle, now
-// plus the run's lead.
+// dryRun is a run of the checks with nothing written (Prepare).
+type dryRun struct {
+	at  time.Time // the anchor's time; zero is now
+	key []byte    // the anchor key, which the service must list; nil skips it
+}
+
+// anchorAt is the anchor's time, or, in a dry run without a bundle, the
+// run's time, under a key the service lists.
 func (s *Site) anchorAt(dry *dryRun, svc *Service, u *Upload) (time.Time, error) {
 	if dry != nil && len(u.Bundle) == 0 {
-		return s.Now().Add(dry.lead), nil
+		if dry.key != nil && !lists(svc, dry.key) {
+			return time.Time{}, refuse(http.StatusUnprocessableEntity, "bad_anchor", "the signer's key isn't one of the service's anchor keys")
+		}
+		if dry.at.IsZero() {
+			return s.Now(), nil
+		}
+		return dry.at, nil
 	}
 	return s.anchor(svc, u)
 }

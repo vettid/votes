@@ -110,7 +110,7 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	s := &signer.Signer{
 		Claims:    &awsio.Claims{Client: dynamodb.NewFromConfig(cfg), Table: e.table},
 		Journal:   &awsio.Journal{Client: cloudwatchlogs.NewFromConfig(cfg), Group: e.group, Stream: e.stream, Now: time.Now},
-		Anchor:    anch,
+		Anchor:    awsio.Anchor{Anchorer: anch},
 		Site:      &awsio.Site{Site: st, API: e.api, Client: anchor.Client(signer.DefaultDeadlines.Site), Anchors: anchors},
 		Now:       time.Now,
 		Log:       log,
