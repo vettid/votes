@@ -270,7 +270,9 @@ reports to AWS (**Alerts**, below).
   OIDC tokens with audience `sts.amazonaws.com`, subject
   `repo:vettid@168311946/votes@1438447065:ref:refs/heads/main` (the
   repository uses GitHub's immutable subjects, with the owner's and the
-  repository's ids) and `job_workflow_ref`
+  repository's ids), or (0.2.12, for the owner-run Rekor jobs, **The
+  Rekor check**) `…:environment:monitor-<env>-admin` for its own
+  environment, and `job_workflow_ref`
   `vettid/votes/.github/workflows/monitor.yml@refs/heads/main` may assume
   it, and it may only `sns:Publish` to that topic and
   `cloudwatch:PutMetricData` in its environment's namespace
@@ -326,11 +328,16 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   (the search is gone in Rekor v2) is the mismatch `rekor: search
   unavailable` at once.
 - **The log's keys:** each checkpoint and entry is verified under the
-  Rekor key of the trusted root (§4 item 4, `RekorLogs()`) its key hint
-  or `logID` names, valid at its time (an entry's integrated time, the
-  run's time for a checkpoint). A key not in the trusted root is
-  `unverified`: a new log key reaches the check only through the
-  trusted root's update, by PR (`site/roots/`).
+  Rekor key, at the instance's host, of the trusted root `votesctl
+  check` runs on (§4 item 4: fetched through the instance's TUF
+  repository, or the embedded one) that its key hint or `logID` names,
+  valid at its time: an entry's integrated time; the run's time for the
+  active shard's checkpoint; for an inactive shard's checkpoint, the
+  integrated time of the entry it proves. A new log key so reaches the
+  check through TUF, or the embedded root's update by PR (`site/roots/`).
+  An entry or checkpoint under a key in neither is `unverified`; the
+  active checkpoint's is one mismatch for the run, which then checks no
+  consistency and no entry against it.
 - **The checkpoint:** the active shard's signed checkpoint (`GET
   /api/v1/log`: origin, tree ID, tree size and root hash), verified
   under its key; its origin must be `<host> - <tree ID>`, and one that
@@ -349,11 +356,13 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   against the cap. v1 checkpoints have no witness cosignatures, so this
   shows only that the log never contradicts what this monitor and the
   site's bundles saw before.
-- **Freshness:** a checkpoint whose tree size hasn't grown since the
-  recorded one, two runs in a row (`stale_runs` in the state), is a
-  mismatch, `rekor: stale`: a log that stops growing, or serves this
-  monitor an old view, is reported, not trusted. Both instances gain
-  thousands of entries an hour.
+- **Freshness:** a checkpoint of the recorded tree ID whose tree size
+  hasn't grown since the recorded one, two runs in a row (`stale_runs`
+  in the state), is a mismatch, `rekor: stale`: a log that stops
+  growing, or serves this monitor an old view, is reported, not trusted.
+  `stale_runs` counts within one tree ID and is reset by a shard change
+  or its acceptance. Staging gains about 600 entries an hour, production
+  hundreds of thousands.
 - **Shards:** a tree ID other than the state's is its own mismatch,
   `rekor: shard changed`, on every run until the owner accepts it
   (**Clearing**). Meanwhile the run still searches, verifies entries
@@ -405,9 +414,12 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   - its integrated time is not after the time it is verified plus 60
     seconds (clock skew).
 
-  One under an anchor key that is anything else (another kind or
-  version, a `sha384` or `sha512` digest), or that fails, is a mismatch
-  (`rekor: unverified`), whatever its digest.
+  One under an anchor key that passes the log's checks (its leaf hash,
+  signed entry timestamp, inclusion proof and index mapping) but is
+  anything else (another kind or version, a `sha384` or `sha512`
+  digest, a signature that doesn't verify) is a mismatch, `rekor: wrong
+  kind`, whatever its digest. One that fails any of the log's checks is
+  `rekor: unverified`: the answer can't be trusted to be the log's.
 - **Digests:** a verified entry's digest is the `sha256` of a document's
   bytes, never of its `.sig`. Those known are the run's: each proposal's,
   extension's and results' `hashes`, the documents a partial upload's
@@ -417,10 +429,10 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   `rekor: unknown digest`; one that is a service-list version's or a
   results' `rows` is `rekor: unexpected digest` (the anchor key never
   signs those; the site key signs the list). An entry integrated less
-  than `ListingGrace` (10 minutes) before the time it is verified (0 ≤
-  verified − integrated < 10 min) is `pending`, not a mismatch, as its
-  upload may not be done, so an anchor made during the run doesn't
-  alarm. When the run's `lists` have an error (an index or archive month
+  than `ListingGrace` (10 minutes) before the time it is verified, or up
+  to the 60 seconds of skew after it (−60 s ≤ verified − integrated <
+  10 min), is `pending`, not a mismatch, as its upload may not be done,
+  so an anchor made during the run doesn't alarm. When the run's `lists` have an error (an index or archive month
   unread), its unknown and unexpected digests are reported with
   `lists_incomplete`: the run already exits `1`, and they are checked
   again by the next run that reads every list.
@@ -434,13 +446,15 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 - **Staging's scan:** on staging only, the check also reads every entry
   of the active shard from `scanned_to` (an index within that shard,
   recorded with its tree ID) to the run's tree size, 10 by log index a
-  request (about 14,000 entries a day, so some 60 requests a run). It
+  request (about 600 entries an hour, so some 60 requests a run). It
   keeps every entry, of any kind, whose key or certificate carries an
   anchor key's SPKI (compared as SPKI, never as PEM bytes), each verified
   in full, as above (leaf hash, inclusion against the run's checkpoint,
-  index mapping), and compared as above. An entry that doesn't parse as
-  any kind the scan knows is a warning (`rekor.warnings`), not a
-  mismatch: nothing in it can be read as an anchor key's. An anchor
+  index mapping), and compared as above. An entry whose body doesn't
+  parse is a warning (`rekor.warnings`), not a mismatch, as nothing in it
+  can be read as an anchor key's: the report counts them
+  (`rekor.unparsed`), and the alert names the count whenever the run
+  alerts. An anchor
   key's entry the search didn't return, though integrated more than
   `ListingGrace` before the search began, is a mismatch, `rekor: index
   gap` **(the owner's (a) of 2026-11-05: an alarm, not a warning)**: the
@@ -449,7 +463,9 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   is never scanned.
 - **Rekor unavailable:** a request that gets no answer (**Two kinds of
   failure**) is `rekor.error` and adds one to `failures` in the state,
-  which a run that completes resets. Below 3 it is neither a failed
+  which a run that gets every answer it asked for resets; a run cut
+  short by the cap or the time limit (`incomplete`) neither adds nor
+  resets. Below 3 it is neither a failed
   check nor a mismatch: the run exits `0` if the rest held, and puts the
   heartbeat. At 3 consecutive runs it is a mismatch, `rekor: search
   unavailable` **(the owner's (a) of 2026-11-05: 3, as the heartbeat
@@ -468,11 +484,16 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   `search unavailable`: it says the work outgrew the cap, not that
   Rekor is down).
 - **The verified store:** each verified entry is kept by its 80-hex
-  entry ID with its whole answer (body, integrated time, log ID, log
-  indexes, signed entry timestamp and inclusion proof), never a digest
-  alone, and every run verifies each stored entry again, locally, before
-  using its digest (no fetch; its proof's checkpoint must still be the
-  run's or consistent with it). It is `-rekor-verified <file>`, between
+  entry ID (matched on the last 64) with its whole answer (body,
+  integrated time, log ID, log indexes, signed entry timestamp and
+  inclusion proof with its signed checkpoint), never a digest alone. Its
+  checkpoint is proved consistent with the run's once, when the entry is
+  fetched; every later run verifies the stored entry again locally, with
+  no fetch: the leaf hash and the body, the signature over the digest,
+  the signed entry timestamp, the inclusion under the stored checkpoint,
+  that checkpoint's signature, and that its size is at most the recorded
+  tree size. Consistency carries over through the state's chain of
+  consistent checkpoints, so no stored size needs a proof again. It is `-rekor-verified <file>`, between
   runs the S3 object `rekor-verified.json` in the monitor's bucket,
   `vettid-votes-<env>-monitor`, which the stack adds (private,
   versioned, its noncurrent versions kept 90 days, blocking public
@@ -497,11 +518,16 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   `log_index` its global log index, `sha256` its digest (64 lowercase
   hex digits, or empty for an entry whose body has none), and `finding`
   one of `unknown digest`, `unexpected digest`, `anchored again`,
-  `index gap` and `unverified`; none twice. That finding for that entry
-  is reported in `acknowledged`, and is not a mismatch; nothing else is
-  covered. Each run fetches every listed entry by entry ID: one that
-  isn't there, whose log index or digest differs, or that isn't an anchor
-  key's is a mismatch, so the list stays true. A finding not
+  `index gap` and `wrong kind`; no `(uuid, finding)` twice. `unverified`
+  is never acknowledged: an answer that fails the log's checks may be
+  forged, and acknowledging one would silence a later forgery under the
+  same ID. That finding for that entry is reported in `acknowledged`,
+  and is not a mismatch; nothing else is covered. Each run checks every
+  listed entry (from the verified store, or fetched by entry ID): one
+  that isn't there (`entries/retrieve` leaves a missing ID out of its
+  answer rather than answering `404`), whose log index or digest
+  differs, or that isn't an anchor key's is a mismatch, so the list stays
+  true. A finding not
   acknowledged repeats on every run. As with the other lists, each entry
   is added by a PR that gives its reason, the owner reviews it
   (`.github/CODEOWNERS` covers `monitor/`), and both start empty; the
@@ -519,17 +545,33 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   does nothing on update and keeps it on delete, so no deploy rewrites
   the state. An empty, sentinel or unparseable state is a mismatch,
   `rekor: no state`, and a run without `-rekor-bootstrap` writes it back
-  unchanged. A run without the state (another branch, or the role unset)
+  unchanged (the report gives an unparseable state's SHA-256). A run without the state (another branch, or the role unset)
   checks no consistency from it, counts no failures and says so
   (`rekor.state` `none`).
-- **Clearing** (owner-run only): `workflow_dispatch` inputs, each with an
-  `env` input so that one dispatch touches one environment, run in a
-  GitHub Environment `monitor-<env>-admin` whose required reviewer is the
-  owner:
+- **Clearing** (owner-run only): `workflow_dispatch` inputs, with an
+  `env` input so that one dispatch touches one environment. A dispatch
+  with an admin input runs a separate job, for that `env` alone, in a
+  GitHub Environment `monitor-<env>-admin` whose required reviewer is
+  the owner and whose deployment-branch policy allows only `main`; the
+  hourly job and a dispatch without one stay outside any environment.
+  The admin job takes the `monitor` concurrency group at job level, so
+  it waits for its approval without holding the group, and the hourly
+  runs (and the heartbeat) go on meanwhile. A job in an environment
+  presents the OIDC subject
+  `repo:vettid@168311946/votes@1438447065:environment:monitor-<env>-admin`
+  (the repository's immutable subjects), so the role's trust policy
+  allows that subject for its environment as well as the `main` one,
+  each with the same `job_workflow_ref` condition (**Alerts**).
   - `rekor_bootstrap` passes `-rekor-bootstrap`, which records the
     checkpoint it finds and starts staging's scan at the current tree
-    size. It refuses (exit `1`) a state that is neither empty nor the
-    sentinel. The newest bundle's checkpoint still binds it.
+    size. It refuses (exit `2`) a state that is neither empty, nor the
+    sentinel, nor unparseable with the SHA-256 the dispatch names
+    (`rekor_state_sha256`, from the report). The newest bundle's
+    checkpoint still binds it.
+  - `rekor_reset_store` passes `-rekor-reset-store`, which starts the
+    verified store empty (for one that doesn't parse): every entry is
+    fetched and verified again, and on staging the scan rewinds to the
+    bootstrap's start, as the store held what it had kept.
   - `rekor_accept_shard` passes `-rekor-accept-shard <tree ID>`
     (**Shards**).
   - `rekor_reset_pin` passes `-rekor-reset-pin <tree size>:<root hash>`,
@@ -574,8 +616,12 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
     inside a certificate (a self-signed one, say) is indexed under the
     certificate, not the key, so production's search doesn't find it:
     it catches misuse through standard clients, not a thief who wraps
-    the key to avoid it. (Another PEM form of the bare key doesn't hide
-    an entry: the index holds its canonical form.)
+    the key to avoid it. Such an entry anchors nothing for VettID's
+    verifiers: the site's (sigstore-go's key comparison) and the member
+    vaults' (`vms/votewire`, which takes only a `PUBLIC KEY` block)
+    refuse a bundle whose key is in a certificate; it could pass only
+    with another verifier. (Another PEM form of the bare key doesn't
+    hide an entry: the index holds its canonical form.)
   - that the log shows others the tree it shows this monitor (a split
     view: v1 has no witnesses, and comparing checkpoints from a second
     vantage point is future work);
@@ -610,11 +656,13 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   stops growing for two runs is `stale`; a changed shard is a mismatch
   until accepted, though the rest goes on. Acknowledgments, by PR, name
   an entry and its finding (`unknown digest`, `unexpected digest`,
-  `anchored again`, `index gap`, `unverified`); bootstrap, shard
-  acceptance and a reset of an `inconsistent` pin are owner-run,
-  per environment, behind a GitHub Environment the owner approves.
-  Verified entries are kept whole, in an S3 object, and verified again
-  each run. Requests are paced, capped and time-limited (`incomplete`);
+  `anchored again`, `index gap`, `wrong kind`), never an answer that
+  fails the log's checks (`unverified`); bootstrap, shard
+  acceptance, a reset of an `inconsistent` pin and a reset of the store
+  are owner-run, per environment, behind a GitHub Environment the owner
+  approves, whose OIDC subject the role also trusts.
+  Verified entries are kept whole, in an S3 object, proved consistent
+  once and verified again locally each run. Requests are paced, capped and time-limited (`incomplete`);
   the check step has no AWS credentials, a separate step writes the
   store then the state back, atomically, a failed write-back alerts,
   and the heartbeat follows it; the alert names each Rekor mismatch's
