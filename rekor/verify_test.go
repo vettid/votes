@@ -199,13 +199,10 @@ func TestVerifyEntryRefuses(t *testing.T) {
 // testKey is a P-256 key from a fixed, public test seed.
 func testKey(seed string) *ecdsa.PrivateKey {
 	h := sha256.Sum256([]byte(seed))
-	c := elliptic.P256()
-	d := new(big.Int).SetBytes(h[:])
-	d.Mod(d, new(big.Int).Sub(c.Params().N, big.NewInt(1)))
-	d.Add(d, big.NewInt(1))
-	k := &ecdsa.PrivateKey{D: d}
-	k.PublicKey.Curve = c
-	k.PublicKey.X, k.PublicKey.Y = c.ScalarBaseMult(d.Bytes())
+	k, err := ecdsa.ParseRawPrivateKey(elliptic.P256(), h[:])
+	if err != nil {
+		panic("test key: " + err.Error()) // a seed whose hash isn't a valid scalar: pick another
+	}
 	return k
 }
 
