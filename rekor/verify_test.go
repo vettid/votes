@@ -95,7 +95,7 @@ func place(t *testing.T) Place {
 	for _, sh := range li.InactiveShards {
 		off += sh.TreeSize
 	}
-	return Place{Offset: off, CheckpointAt: at}
+	return Place{TreeID: li.TreeID, Offset: off, CheckpointAt: at}
 }
 
 // The recorded entries verify: each an anchor key's, its digest, its
@@ -366,6 +366,11 @@ func TestAnchorOfAnyKind(t *testing.T) {
 		if _, err := VerifyEntry(ctx, id, e, host, stagingLogs(t), anchors(t), place(t), at); !errors.Is(err, ErrUnverified) {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+	// The SPKI's DER bytes in base64, without PEM.
+	der, _ := json.Marshal(map[string]any{"kind": "x", "spec": map[string]any{"key": stagingSPKI}})
+	if AnchorOf(&Entry{Body: base64.StdEncoding.EncodeToString(der)}, anchors(t)) == nil {
+		t.Error("raw base64 DER not found")
 	}
 	none, _ := json.Marshal(map[string]any{"kind": "dsse", "spec": map[string]any{"x": base64.StdEncoding.EncodeToString([]byte("not a key"))}})
 	if AnchorOf(&Entry{Body: base64.StdEncoding.EncodeToString(none)}, anchors(t)) != nil {

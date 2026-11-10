@@ -65,6 +65,7 @@ func TestClientErrorKinds(t *testing.T) {
 		{"400", answer(400, ""), ErrBadAnswer, 1, nil},
 		{"malformed 200", answer(200, "{"), ErrBadAnswer, 1, nil},
 		{"too big", answer(200, `"`+strings.Repeat("a", maxBody)+`"`), ErrBadAnswer, 1, nil},
+		{"too big, valid once cut", answer(200, `{}`+strings.Repeat(" ", maxBody)), ErrBadAnswer, 1, nil},
 		{"entry without content", answer(200, `[{"ab":null}]`), ErrBadAnswer, 1, func(c *Client) error { _, err := c.Entries(ctx, []string{"ab"}); return err }},
 	}
 	for _, tc := range cases {
@@ -288,5 +289,29 @@ func TestClientMissingContent(t *testing.T) {
 	}
 	if _, err := c.SearchKey(ctx, []byte("pem")); !errors.Is(err, ErrBadAnswer) {
 		t.Errorf("null search: %v", err)
+	}
+}
+
+// The run's deadline during the last attempt, after four answers of 503:
+// the context's error, not "no answer".
+func TestClientDeadlineLastAttempt(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var n atomic.Int32
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) < 5 {
+			w.WriteHeader(503)
+			return
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	})
+	c.Gap, c.Attempt = time.Nanosecond, time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := c.LogInfo(ctx); !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrUnavailable) || n.Load() != 5 {
+		t.Fatalf("%v after %d attempts", err, n.Load())
 	}
 }
