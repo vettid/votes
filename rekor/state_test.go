@@ -290,6 +290,13 @@ func TestCheckPin(t *testing.T) {
 	if !errors.Is(r.Stopped, context.DeadlineExceeded) || r.Unavailable != nil || r.Next.TreeSize != a.Size {
 		t.Errorf("stopped: %+v", r)
 	}
+	if r, _ := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{err: context.Canceled}}); !errors.Is(r.Stopped, context.Canceled) || r.Unavailable != nil {
+		t.Errorf("cancelled: %+v", r)
+	}
+	// A stopped proof refuses an admin step.
+	if _, err := CheckPin(ctx, PinInput{Loaded: empty, Current: b, Bundle: a, Prover: &fakeProver{err: context.Canceled}, Admin: Admin{Bootstrap: true}}); !errors.Is(err, ErrAdminRefused) {
+		t.Errorf("bootstrap after a stopped proof: %v", err)
+	}
 	// A reset needs the log shown contradicting the pin, not a bad answer.
 	grown := stateAt(a).State
 	if _, err := CheckPin(ctx, PinInput{Loaded: stateAt(a), Current: b, Prover: &fakeProver{err: ErrBadAnswer}, Admin: Admin{ResetPin: formatPin(grown)}}); !errors.Is(err, ErrAdminRefused) {
