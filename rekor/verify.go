@@ -164,9 +164,18 @@ type Verified struct {
 // scan: not one the check looks at).
 var ErrNotAnchor = errors.New("rekor: the entry names no anchor key")
 
-// ErrUnverified wraps why an entry under an anchor key fails to verify
-// (VOTES-SITE §7: "rekor: unverified", whatever its digest).
+// ErrUnverified wraps why an entry under an anchor key fails the log's
+// checks (its ID's leaf hash, signed entry timestamp, inclusion proof,
+// checkpoint or time; VOTES-SITE §7, "rekor: unverified"): the answer
+// can't be trusted to be the log's.
 var ErrUnverified = errors.New("rekor: unverified")
+
+// ErrWrongKind wraps why an entry that passes the log's checks, and
+// names an anchor key, isn't a hashedrekord 0.0.1 over a sha256 digest
+// whose signature verifies under that key ("rekor: wrong kind"). Anyone
+// may log an anchor key's public key in an entry of their own, so this is
+// logged truth, and may be acknowledged; ErrUnverified never is.
+var ErrWrongKind = errors.New("rekor: wrong kind")
 
 // hashedRekord is the body of a hashedrekord 0.0.1 entry.
 type hashedRekord struct {
@@ -255,16 +264,26 @@ func AnchorOf(e *Entry, anchors [][]byte) []byte {
 	return found
 }
 
+// maxPEMBlocks bounds the PEM markers tried in one string (chosen; not
+// in the spec): a decode that fails scans the rest of the string, so a
+// hostile string of markers would otherwise take quadratic time. Keys
+// and certificate chains have a few.
+const maxPEMBlocks = 16
+
 // anchorIn returns the anchor key among the PEM blocks in b, if any.
 func anchorIn(b []byte, anchors [][]byte) []byte {
-	for {
+	for tries := 0; tries < maxPEMBlocks; tries++ {
 		i := bytes.Index(b, []byte("-----BEGIN "))
 		if i < 0 {
 			return nil
 		}
 		blk, rest := pem.Decode(b[i:])
 		if blk == nil {
+			// Past this marker's line.
 			b = b[i+len("-----BEGIN "):]
+			if j := bytes.IndexByte(b, '\n'); j >= 0 {
+				b = b[j+1:]
+			}
 			continue
 		}
 		b = rest
@@ -278,6 +297,7 @@ func anchorIn(b []byte, anchors [][]byte) []byte {
 			}
 		}
 	}
+	return nil
 }
 
 // checkBody checks a body is a hashedrekord 0.0.1 over a sha256 digest
@@ -339,13 +359,6 @@ func VerifyEntry(ctx context.Context, id string, e *Entry, host string, logs Log
 	if got := hex.EncodeToString(rfc6962.DefaultHasher.HashLeaf(body)); got != leaf {
 		return fail("entry ID isn't the body's leaf hash")
 	}
-	digest, keySPKI, err := checkBody(body)
-	if err != nil {
-		return fail("%v", err)
-	}
-	if !bytes.Equal(keySPKI, spki) {
-		return fail("the anchor key isn't the entry's signing key")
-	}
 	ip := e.Verification.InclusionProof
 	if ip == nil || len(e.Verification.SignedEntryTimestamp) == 0 {
 		return fail("no inclusion proof or signed entry timestamp")
@@ -383,6 +396,14 @@ func VerifyEntry(ctx context.Context, id string, e *Entry, host string, logs Log
 	}
 	if root, err := hex.DecodeString(ip.RootHash); err != nil || !bytes.Equal(root, cp.Root) || int64(cp.Size) != ip.TreeSize {
 		return fail("the proof's root or size isn't its checkpoint's")
+	}
+	// The log's checks hold: the body is what the log holds under this ID.
+	digest, keySPKI, err := checkBody(body)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrWrongKind, err)
+	}
+	if !bytes.Equal(keySPKI, spki) {
+		return nil, fmt.Errorf("%w: the anchor key isn't the entry's signing key", ErrWrongKind)
 	}
 	return &Verified{ID: id, Leaf: leaf, LogIndex: e.LogIndex, ShardIndex: ip.LogIndex, Digest: digest, SPKI: spki,
 		Integrated: integrated.UTC(), Proof: cp}, nil

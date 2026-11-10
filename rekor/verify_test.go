@@ -412,3 +412,17 @@ func TestVerifyEntryTimeAndKeys(t *testing.T) {
 		t.Errorf("a checkpoint under another host's key: %v", err)
 	}
 }
+
+// A hostile body (a string of PEM markers with no end) is walked in
+// bounded time.
+func TestAnchorOfHostile(t *testing.T) {
+	big := strings.Repeat("-----BEGIN A-----\n", 4<<20/18)
+	body, _ := json.Marshal(map[string]any{"kind": "x", "spec": map[string]any{"a": big, "b": base64.StdEncoding.EncodeToString([]byte(big))}})
+	start := time.Now()
+	if AnchorOf(&Entry{Body: base64.StdEncoding.EncodeToString(body)}, anchors(t)) != nil {
+		t.Fatal("found an anchor key")
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("took %v", d)
+	}
+}

@@ -217,3 +217,15 @@ func TestCheckpointOrigin(t *testing.T) {
 		t.Errorf("a log at another host: %v", err)
 	}
 }
+
+// A redirect is not followed: a bad answer.
+func TestClientNoRedirect(t *testing.T) {
+	hits := 0
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		http.Redirect(w, r, "/api/v1/log/entries", http.StatusTemporaryRedirect)
+	})
+	if _, err := c.SearchKey(context.Background(), []byte("pem")); !errors.Is(err, ErrBadAnswer) || hits != 1 {
+		t.Fatalf("%v, %d requests", err, hits)
+	}
+}

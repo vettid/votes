@@ -164,7 +164,9 @@ func (c *Client) slot(ctx context.Context) error {
 }
 
 // do sends one request (body as JSON if non-nil) and decodes a 200's JSON
-// into out, retrying an attempt that got no answer.
+// into out, retrying an attempt that got no answer. A cancelled ctx ends
+// it with ctx's error, which is none of the kinds of failure: the run is
+// stopping.
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, body, out any) error {
 	if allowed[path] != method {
 		return fmt.Errorf("%w: %s %s", ErrNotAllowed, method, path)
@@ -176,10 +178,15 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 			return err
 		}
 	}
-	hc := c.HTTP
-	if hc == nil {
-		hc = http.DefaultClient
+	hc := http.DefaultClient
+	if c.HTTP != nil {
+		hc = c.HTTP
 	}
+	// No redirect is followed: a 3xx is a bad answer (it could send an
+	// allowlisted request elsewhere).
+	noRedirect := *hc
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	hc = &noRedirect
 	target := strings.TrimSuffix(c.Base, "/") + path
 	if len(query) > 0 {
 		target += "?" + query.Encode()

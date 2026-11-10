@@ -9,11 +9,13 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sigstore/sigstore-go/pkg/root"
 )
@@ -73,6 +75,29 @@ func TestAnchorVector(t *testing.T) {
 	}
 	if _, err := a.Verify(renamed, doc, other); err == nil {
 		t.Error("another key, named by the bundle, verified")
+	}
+	// The anchor key inside a certificate, not as a bare key: refused.
+	// The Rekor check's production search can't find such an entry
+	// (VOTES-SITE §7, "Not guaranteed"), so it must anchor nothing here.
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Unix(0, 0), NotAfter: time.Unix(1<<31, 0)}
+	anchorPub, err := x509.ParsePKIXPublicKey(v.AnchorKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, anchorPub, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bundle, material map[string]json.RawMessage
+	if json.Unmarshal(v.Bundle, &bundle) != nil || json.Unmarshal(bundle["verificationMaterial"], &material) != nil || material["publicKey"] == nil {
+		t.Fatal("bundle: no publicKey")
+	}
+	delete(material, "publicKey")
+	material["certificate"], _ = json.Marshal(map[string][]byte{"rawBytes": certDER})
+	bundle["verificationMaterial"], _ = json.Marshal(material)
+	wrapped, _ := json.Marshal(bundle)
+	if _, err := a.Verify(wrapped, doc, v.AnchorKey); err == nil {
+		t.Error("a bundle with its key in a certificate verified")
 	}
 	// The RFC 3161 timestamp is required.
 	var bm, vm map[string]json.RawMessage
