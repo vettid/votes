@@ -1,6 +1,7 @@
 // Package awsread reads what one reconcile pass needs, read-only: the
-// signer's journal and KMS's Sign calls (from the trail's log group), what
-// the votes site holds, and the signer function as deployed.
+// signer's journal and KMS's Sign calls (from the trail's log group), the
+// trail's status, the claim table, what the votes site holds, and the
+// signer function as deployed.
 package awsread
 
 import (
@@ -10,10 +11,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -137,28 +140,25 @@ type cloudTrailRecord struct {
 	} `json:"resources"`
 }
 
-// KMSSigns reads every KMS Sign on keyARN in the period from the trail's
-// log group. A Sign on another key is no concern of the anchor's (the
-// account holds none other; its own alarms cover a new key).
-func KMSSigns(ctx context.Context, c LogsAPI, trailGroup, keyARN string, from, to time.Time) ([]reconcile.KMSSign, error) {
+// KMSSigns reads every KMS Sign in the period from the trail's log group,
+// on any key: the account holds no other signing key, so a Sign on another
+// is itself a finding.
+func KMSSigns(ctx context.Context, c LogsAPI, trailGroup string, from, to time.Time) ([]reconcile.KMSSign, error) {
 	var out []reconcile.KMSSign
 	err := filter(ctx, c, trailGroup, nil, SignPattern, from, to, func(msg string) error {
 		var r cloudTrailRecord
 		if err := json.Unmarshal([]byte(msg), &r); err != nil {
 			return errors.New("trail: a record isn't JSON")
 		}
-		onKey := false
-		for _, res := range r.Resources {
-			onKey = onKey || res.ARN == keyARN
-		}
-		if !onKey {
-			return nil
+		key := ""
+		if len(r.Resources) > 0 {
+			key = r.Resources[0].ARN
 		}
 		principal := r.UserIdentity.SessionContext.SessionIssuer.ARN
 		if principal == "" {
 			principal = r.UserIdentity.ARN
 		}
-		out = append(out, reconcile.KMSSign{RequestID: r.RequestID, At: r.EventTime, Principal: principal,
+		out = append(out, reconcile.KMSSign{RequestID: r.RequestID, At: r.EventTime, KeyARN: key, Principal: principal,
 			Algorithm: r.RequestParameters.SigningAlgorithm, MessageType: r.RequestParameters.MessageType, ErrorCode: r.ErrorCode})
 		return nil
 	})
@@ -172,39 +172,40 @@ type ListAPI interface {
 
 const bundleSuffix = ".json.sigstore.json"
 
-// Slots lists the documents the site holds for the proposals its index
-// shows (every proposal it keeps there, §3.3), as proposal_id/name.
-func Slots(ctx context.Context, store site.Storage, list ListAPI, bucket string) ([]string, error) {
-	raw, _, err := store.Get(ctx, "v1/index.json")
-	if err != nil {
-		return nil, fmt.Errorf("the index: %w", err)
-	}
-	var idx []site.IndexEntry
-	if err := json.Unmarshal(raw, &idx); err != nil {
-		return nil, errors.New("the index isn't a list of entries")
-	}
-	var slots []string
-	for _, e := range idx {
-		prefix := "v1/p/" + e.ProposalID + "/"
-		in := &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String(prefix)}
-		for {
-			out, err := list.ListObjectsV2(ctx, in)
-			if err != nil {
-				return nil, fmt.Errorf("listing %s: %w", prefix, err)
-			}
-			for _, o := range out.Contents {
-				k := aws.ToString(o.Key)
-				if name, ok := strings.CutSuffix(strings.TrimPrefix(k, prefix), bundleSuffix); ok && name != "" && !strings.Contains(name, "/") {
-					slots = append(slots, e.ProposalID+"/"+name)
-				}
-			}
-			if !aws.ToBool(out.IsTruncated) {
-				break
-			}
-			in.ContinuationToken = out.NextContinuationToken
+// slotRe is a slot as the site names it: a proposal id and a document name.
+var slotRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}/(proposal|results|extension-[1-9][0-9]?)$`)
+
+// ValidSlot reports whether slot is a site slot (proposal_id/name), before
+// it goes into a key.
+func ValidSlot(slot string) bool { return slotRe.MatchString(slot) }
+
+// Slots lists every document the site holds a bundle for under v1/p/,
+// indexed or not, as proposal_id/name. A bundle key that isn't a slot is
+// returned in odd, never dropped.
+func Slots(ctx context.Context, list ListAPI, bucket string) (slots, odd []string, err error) {
+	in := &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("v1/p/")}
+	for {
+		out, err := list.ListObjectsV2(ctx, in)
+		if err != nil {
+			return nil, nil, fmt.Errorf("listing v1/p/: %w", err)
 		}
+		for _, o := range out.Contents {
+			k := aws.ToString(o.Key)
+			slot, ok := strings.CutSuffix(strings.TrimPrefix(k, "v1/p/"), bundleSuffix)
+			if !ok {
+				continue
+			}
+			if ValidSlot(slot) {
+				slots = append(slots, slot)
+			} else {
+				odd = append(odd, k)
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			return slots, odd, nil
+		}
+		in.ContinuationToken = out.NextContinuationToken
 	}
-	return slots, nil
 }
 
 // Verifier checks a bundle for a document under the anchor key.
@@ -217,6 +218,9 @@ type Verifier interface {
 // signature. ok is false when it couldn't be read (an error other than a
 // missing object).
 func Holding(ctx context.Context, store site.Storage, v Verifier, spki []byte, slot string) (reconcile.Published, error) {
+	if !ValidSlot(slot) {
+		return reconcile.Published{}, fmt.Errorf("%q isn't a slot", slot)
+	}
 	base := "v1/p/" + slot
 	bundle, _, err := store.Get(ctx, base+bundleSuffix)
 	if errors.Is(err, site.ErrNotExist) {
@@ -288,4 +292,91 @@ func Canonical(policy string) string {
 		return policy
 	}
 	return b.String()
+}
+
+// VersionLister lists the function's published versions and aliases.
+type VersionLister interface {
+	ListVersionsByFunction(ctx context.Context, in *lambda.ListVersionsByFunctionInput, opts ...func(*lambda.Options)) (*lambda.ListVersionsByFunctionOutput, error)
+	ListAliases(ctx context.Context, in *lambda.ListAliasesInput, opts ...func(*lambda.Options)) (*lambda.ListAliasesOutput, error)
+}
+
+// VersionsAndAliases lists the function's versions other than $LATEST,
+// and its aliases: a release has none, so each is code (and a resource
+// policy) the pass would otherwise not see.
+func VersionsAndAliases(ctx context.Context, c VersionLister, fn string) (versions, aliases []string, err error) {
+	vin := &lambda.ListVersionsByFunctionInput{FunctionName: aws.String(fn)}
+	for {
+		out, err := c.ListVersionsByFunction(ctx, vin)
+		if err != nil {
+			return nil, nil, fmt.Errorf("its versions: %w", err)
+		}
+		for _, v := range out.Versions {
+			if aws.ToString(v.Version) != "$LATEST" {
+				versions = append(versions, aws.ToString(v.Version))
+			}
+		}
+		if out.NextMarker == nil {
+			break
+		}
+		vin.Marker = out.NextMarker
+	}
+	ain := &lambda.ListAliasesInput{FunctionName: aws.String(fn)}
+	for {
+		out, err := c.ListAliases(ctx, ain)
+		if err != nil {
+			return nil, nil, fmt.Errorf("its aliases: %w", err)
+		}
+		for _, a := range out.Aliases {
+			aliases = append(aliases, aws.ToString(a.Name))
+		}
+		if out.NextMarker == nil {
+			break
+		}
+		ain.Marker = out.NextMarker
+	}
+	return versions, aliases, nil
+}
+
+// ClaimsAPI reads one claim (signer/awsio.Claims).
+type ClaimsAPI interface {
+	Get(ctx context.Context, slot string) (*signer.Claim, error)
+}
+
+// Claim reads a slot's claim.
+func Claim(ctx context.Context, c ClaimsAPI, slot string) (reconcile.Claim, error) {
+	if !ValidSlot(slot) {
+		return reconcile.Claim{}, fmt.Errorf("%q isn't a slot", slot)
+	}
+	cl, err := c.Get(ctx, slot)
+	if err != nil || cl == nil {
+		return reconcile.Claim{}, err
+	}
+	return reconcile.Claim{Exists: true, Digest: cl.Digest, Sig: cl.Sig, R: cl.R, RequestID: cl.RequestID}, nil
+}
+
+// TrailAPI reads the trail's status.
+type TrailAPI interface {
+	GetTrailStatus(ctx context.Context, in *cloudtrail.GetTrailStatusInput, opts ...func(*cloudtrail.Options)) (*cloudtrail.GetTrailStatusOutput, error)
+}
+
+// TrailDeliveryLimit is how long the trail's log group may go without a
+// delivery before the pass reports it.
+const TrailDeliveryLimit = 30 * time.Minute
+
+// TrailProblem reads the trail's status: "" while it logs and delivers to
+// its log group, else what's wrong.
+func TrailProblem(ctx context.Context, c TrailAPI, trail string, now time.Time) (string, error) {
+	st, err := c.GetTrailStatus(ctx, &cloudtrail.GetTrailStatusInput{Name: aws.String(trail)})
+	if err != nil {
+		return "", fmt.Errorf("the trail's status: %w", err)
+	}
+	switch {
+	case !aws.ToBool(st.IsLogging):
+		return "the trail isn't logging", nil
+	case aws.ToString(st.LatestCloudWatchLogsDeliveryError) != "":
+		return "the trail's delivery to its log group fails: " + aws.ToString(st.LatestCloudWatchLogsDeliveryError), nil
+	case st.LatestCloudWatchLogsDeliveryTime == nil || now.Sub(*st.LatestCloudWatchLogsDeliveryTime) > TrailDeliveryLimit:
+		return "the trail hasn't delivered to its log group in " + TrailDeliveryLimit.String(), nil
+	}
+	return "", nil
 }

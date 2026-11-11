@@ -1,18 +1,20 @@
-// Package reconcile is the AnchorSigner's reconciler (key protection,
-// docs: the design of record's §6): an hourly, read-only pass that
-// accounts for every sign. It holds no keys and changes nothing; it reads
-// the signer's journal, KMS's own record of Sign calls (the trail), what
-// the votes site holds, and the anchor key, and reports what it can't
-// account for.
+// Package reconcile is the AnchorSigner's reconciler (key protection, the
+// design of record's §6): an hourly, read-only pass that accounts for
+// every sign. It holds no keys and changes nothing. It reads the signer's
+// journal, KMS's own record of Sign calls (the trail), the claim table
+// (the long-term record of each slot's kept signature and its KMS request
+// id), what the votes site holds, the anchor key and the signer function,
+// and reports what it can't account for.
 //
 // Run is pure: the reading is the adapters' (cmd/anchor-reconciler).
-// What it can't confirm it reports: an input it wasn't given is not taken
-// as fine.
+// What it can't confirm it reports: an input it wasn't given is never
+// taken as fine.
 package reconcile
 
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/hex"
@@ -27,27 +29,46 @@ import (
 
 // Rules: an alarm is a security alarm; a notice is reported, not alarmed.
 const (
-	// RuleUnattributed: a KMS Sign with no journal sign entry of its
-	// request id, or by another principal, algorithm or message type. A
-	// lone Sign inside a sign_intent's lease window, with no sign entry,
-	// is a notice instead (an answer lost).
+	// RuleUnattributed: a KMS Sign the journal doesn't account for: no
+	// sign entry of its request id, another key, principal, algorithm or
+	// message type. A Sign a note of its request id names (the outcome
+	// unknown, or a signature not kept), or one inside a sign_intent's
+	// lease whose attempt has no sign entry (each intent excusing one), is
+	// a notice.
 	RuleUnattributed = "unattributed_sign"
+	// RuleSignRefused: a failed Sign by another principal than the signer
+	// role: a probe (notice).
+	RuleSignRefused = "sign_refused"
 	// RuleTrailMissing: a journaled sign with no KMS Sign of its request
 	// id in the trail, once the trail has had time to deliver it.
 	RuleTrailMissing = "trail_missing"
+	// RuleTrailDelivery: the trail isn't logging, or isn't delivering to
+	// its log group.
+	RuleTrailDelivery = "trail_delivery"
+	// RuleJournalConflict: journal entries that disagree with each other
+	// or with the claim: one request id for two signatures, one signature
+	// under two request ids, a kept signature journaled under another
+	// request id than the claim's, a sign for another digest than the
+	// slot's claim. A copied or forged entry.
+	RuleJournalConflict = "journal_conflict"
+	// RuleUnclaimed: a journaled sign for a slot with no claim.
+	RuleUnclaimed = "unclaimed_sign"
 	// RuleSignatureMismatch: a journaled signature that doesn't verify
-	// under the anchor key, or whose r isn't the journaled r; or a bundle
-	// on the site whose signature is no journaled sign.
+	// under the anchor key, or whose r isn't the journaled r; a site bundle
+	// that doesn't verify, or whose signature isn't its slot's claim's.
 	RuleSignatureMismatch = "signature_mismatch"
-	// RuleUnpublished: a journaled sign with no published document holding
-	// it, an hour on. An extension the site refused as too_late, its
-	// lateness verified, is a notice.
+	// RuleUnpublished: a kept sign with no published document holding it,
+	// an hour on. An extension the site refused as too_late, its lateness
+	// verified, is a notice.
 	RuleUnpublished = "unpublished_sign"
-	// RuleSecondSign: a second signature (another r) for a digest already
-	// signed: a notice.
+	// RuleSecondSign: another signature (another r) for a digest already
+	// signed, not kept: a notice, one per extra r.
 	RuleSecondSign = "second_sign"
-	// RuleCodeDrift and RulePolicyDrift: the signer function's code or
-	// resource policy isn't the release's.
+	// RuleKeyDrift: the alias doesn't resolve to the compiled anchor key,
+	// or the key isn't the compiled public key.
+	RuleKeyDrift = "key_drift"
+	// RuleCodeDrift and RulePolicyDrift: the signer function's code,
+	// versions or aliases, or its resource policy, aren't the release's.
 	RuleCodeDrift   = "code_drift"
 	RulePolicyDrift = "policy_drift"
 	// RuleIncomplete: an input the pass needs couldn't be read; nothing
@@ -71,20 +92,31 @@ type Finding struct {
 	// Slot is proposal_id/name, when the finding is about one.
 	Slot      string `json:"slot,omitempty"`
 	Digest    string `json:"digest,omitempty"` // hex
+	R         string `json:"r,omitempty"`      // hex
 	RequestID string `json:"kms_request_id,omitempty"`
 	Detail    string `json:"detail"`
 	// Acknowledged: listed in the acknowledged signs (reported, not alarmed).
 	Acknowledged bool `json:"acknowledged,omitempty"`
 }
 
-// KMSSign is one KMS Sign call on the anchor key, from the trail.
+// KMSSign is one KMS Sign call, from the trail.
 type KMSSign struct {
 	RequestID   string
 	At          time.Time
+	KeyARN      string // the resource's ARN
 	Principal   string // the session issuer's role ARN, or the caller's ARN
 	Algorithm   string // requestParameters.signingAlgorithm
 	MessageType string // requestParameters.messageType
 	ErrorCode   string // set: the call failed, and signed nothing
+}
+
+// Claim is a slot's claim, as read: Exists false for a slot with none.
+type Claim struct {
+	Exists    bool
+	Digest    []byte
+	Sig       []byte // the kept signature, if any
+	R         []byte
+	RequestID string
 }
 
 // Published is what the site holds for a slot.
@@ -100,14 +132,17 @@ type Published struct {
 type Release struct {
 	WantCodeSha256, GotCodeSha256 string
 	WantPolicy, GotPolicy         string // the resource policy, canonical JSON
+	// Versions and Aliases other than $LATEST: a release has none.
+	Versions, Aliases []string
 }
 
-// Acknowledgement excuses one finding (by rule, slot and digest), listed
+// Acknowledgement excuses one finding (by rule, slot, digest and r), listed
 // in the reviewed file monitor/acknowledged-signs-<env>.json.
 type Acknowledgement struct {
 	Rule   string `json:"rule"`
 	Slot   string `json:"slot"`
 	Digest string `json:"digest"` // hex
+	R      string `json:"r"`      // hex; "" for a finding with none
 	Reason string `json:"reason"`
 }
 
@@ -125,93 +160,173 @@ type Input struct {
 	Completions []signer.CompletionEntry
 	Notes       []signer.NoteEntry
 	KMSSigns    []KMSSign
-	// SignerRole is the signer role's ARN: KMS Signs by anything else are
-	// unattributed.
-	SignerRole string
+	// KeyARN is the anchor key (compiled in); SignerRole the signer role.
+	KeyARN, SignerRole string
 	// AnchorSPKI is the anchor key (DER SubjectPublicKeyInfo).
 	AnchorSPKI []byte
+	// Claims holds the claim of every slot in the journal and on the site;
+	// a slot missing from it was not read.
+	Claims map[string]Claim
 	// Published holds what the site holds, for every slot in the journal
-	// and every slot the site shows in the period; a slot missing from it
-	// was not read.
+	// and every slot the site holds; a slot missing from it was not read.
 	Published map[string]Published
 	// LateVerified lists slots whose too_late refusal the adapter verified
 	// (its bundle time at or after the close).
 	LateVerified map[string]bool
 	Release      *Release // nil: not read
-	Acks         []Acknowledgement
+	// KeyProblem and TrailProblem: what the adapter found wrong with the
+	// key (the alias, the public key) or the trail's delivery.
+	KeyProblem, TrailProblem string
+	Acks                     []Acknowledgement
 	// Incomplete names inputs that couldn't be read.
 	Incomplete []string
 }
 
-// UnpublishedAfter is how long a journaled sign may wait for its
-// publication (the design of record, §6).
+// UnpublishedAfter is how long a kept sign may wait for its publication
+// (the design of record, §6).
 const UnpublishedAfter = time.Hour
 
 // Run checks one pass's input and returns its findings, sorted.
 func Run(in Input) []Finding {
 	var out []Finding
 	add := func(f Finding) { out = append(out, f) }
+	h := hex.EncodeToString
 	for _, what := range in.Incomplete {
 		add(Finding{Rule: RuleIncomplete, Severity: Alarm, Detail: "could not read " + what})
 	}
-
+	if in.KeyProblem != "" {
+		add(Finding{Rule: RuleKeyDrift, Severity: Alarm, Detail: in.KeyProblem})
+	}
+	if in.TrailProblem != "" {
+		add(Finding{Rule: RuleTrailDelivery, Severity: Alarm, Detail: in.TrailProblem})
+	}
 	pub, err := anchorKey(in.AnchorSPKI)
 	if err != nil {
 		add(Finding{Rule: RuleIncomplete, Severity: Alarm, Detail: "the anchor key: " + err.Error()})
 	}
 
-	signsByID := map[string]signer.SignEntry{}
-	// One sign per (digest, r): the journal may hold it more than once.
-	type dr struct{ digest, r string }
-	seen := map[dr]bool{}
-	rsByDigest := map[string]map[string]bool{}
-	journaledSigs := map[string]bool{} // hex signature
+	// The journal's signs, each distinct entry once; then the entries'
+	// agreement with each other and with the claims.
+	type ident struct{ id, digest, r, sig string }
+	var signs []signer.SignEntry
+	seen := map[ident]bool{}
 	for _, s := range in.Signs {
-		if s.KMSRequestID != "" {
-			signsByID[s.KMSRequestID] = s
+		k := ident{s.KMSRequestID, h(s.Digest), h(s.R), h(s.Signature)}
+		if !seen[k] {
+			seen[k] = true
+			signs = append(signs, s)
 		}
-		key := dr{hex.EncodeToString(s.Digest), hex.EncodeToString(s.R)}
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		journaledSigs[hex.EncodeToString(s.Signature)] = true
+	}
+	byID := map[string][]signer.SignEntry{}
+	byDR := map[string][]signer.SignEntry{}
+	rsByDigest := map[string][]string{}
+	for _, s := range signs {
 		slot := s.ProposalID + "/" + s.Name
-		if rsByDigest[key.digest] == nil {
-			rsByDigest[key.digest] = map[string]bool{}
+		byID[s.KMSRequestID] = append(byID[s.KMSRequestID], s)
+		dr := h(s.Digest) + "/" + h(s.R)
+		byDR[dr] = append(byDR[dr], s)
+		if len(byDR[dr]) == 1 {
+			if n := len(rsByDigest[h(s.Digest)]); n > 0 {
+				add(Finding{Rule: RuleSecondSign, Severity: Notice, Slot: slot, Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID,
+					Detail: fmt.Sprintf("signature %d for a digest already signed", n+1)})
+			}
+			rsByDigest[h(s.Digest)] = append(rsByDigest[h(s.Digest)], h(s.R))
 		}
-		rsByDigest[key.digest][key.r] = true
-		if len(rsByDigest[key.digest]) == 2 {
-			add(Finding{Rule: RuleSecondSign, Severity: Notice, Slot: slot, Digest: key.digest,
-				Detail: "a second signature for a digest already signed"})
+		if s.KMSRequestID == "" {
+			add(Finding{Rule: RuleJournalConflict, Severity: Alarm, Slot: slot, Digest: h(s.Digest), R: h(s.R), Detail: "a sign entry with no request id"})
 		}
 		if pub != nil {
 			if err := verifySign(pub, s); err != nil {
-				add(Finding{Rule: RuleSignatureMismatch, Severity: Alarm, Slot: slot, Digest: key.digest, RequestID: s.KMSRequestID,
+				add(Finding{Rule: RuleSignatureMismatch, Severity: Alarm, Slot: slot, Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID,
 					Detail: "the journaled signature: " + err.Error()})
 			}
 		}
 	}
+	for _, id := range sortedKeys(byID) {
+		if es := byID[id]; id != "" && len(es) > 1 {
+			add(Finding{Rule: RuleJournalConflict, Severity: Alarm, Slot: es[0].ProposalID + "/" + es[0].Name, RequestID: id,
+				Detail: fmt.Sprintf("one request id journaled for %d signatures", len(es))})
+		}
+	}
+	for _, dr := range sortedKeys(byDR) {
+		if es := byDR[dr]; len(es) > 1 {
+			add(Finding{Rule: RuleJournalConflict, Severity: Alarm, Slot: es[0].ProposalID + "/" + es[0].Name, Digest: h(es[0].Digest), R: h(es[0].R),
+				Detail: fmt.Sprintf("one signature journaled %d ways (request ids or signatures differ)", len(es))})
+		}
+	}
 
-	// unattributed_sign: every KMS Sign accounted for by a sign entry.
+	// Each sign against its slot's claim, the long-term record: the kept
+	// signature must be journaled under the claim's request id; any sign
+	// is for the claim's digest.
+	kept := map[string]bool{} // h(signature) of journaled signs that are their slot's kept one
+	for _, s := range signs {
+		slot := s.ProposalID + "/" + s.Name
+		f := Finding{Slot: slot, Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID}
+		c, read := in.Claims[slot]
+		switch {
+		case !read:
+			f.Rule, f.Severity, f.Detail = RuleIncomplete, Alarm, "the claim of a journaled slot was not read"
+		case !c.Exists:
+			f.Rule, f.Severity, f.Detail = RuleUnclaimed, Alarm, "a journaled sign for a slot with no claim"
+		case !bytes.Equal(c.Digest, s.Digest):
+			f.Rule, f.Severity, f.Detail = RuleJournalConflict, Alarm, "a sign for another digest than the slot's claim"
+		case bytes.Equal(c.R, s.R) && (c.RequestID != s.KMSRequestID || !bytes.Equal(c.Sig, s.Signature)):
+			f.Rule, f.Severity, f.Detail = RuleJournalConflict, Alarm, "the kept signature journaled under another request id or signature than the claim's"
+		default:
+			if bytes.Equal(c.R, s.R) {
+				kept[h(s.Signature)] = true
+			}
+			continue
+		}
+		add(f)
+	}
+
+	// unattributed_sign: every KMS Sign accounted for, one to one.
 	settled := in.To.Add(-in.TrailLag)
+	attemptSigned := map[string]bool{}
+	for _, s := range signs {
+		if s.AttemptID != "" {
+			attemptSigned[s.AttemptID] = true
+		}
+	}
+	usedNote := map[int]bool{}
 	for _, k := range in.KMSSigns {
-		if k.ErrorCode != "" || k.At.After(settled) {
+		if k.At.After(settled) {
+			continue
+		}
+		if k.ErrorCode != "" {
+			if k.Principal != in.SignerRole {
+				add(Finding{Rule: RuleSignRefused, Severity: Notice, RequestID: k.RequestID, Detail: "a refused Sign by another principal than the signer: " + k.ErrorCode})
+			}
 			continue
 		}
 		f := Finding{Rule: RuleUnattributed, Severity: Alarm, RequestID: k.RequestID}
 		switch {
+		case k.KeyARN != in.KeyARN:
+			f.Detail = "a Sign on another key than the anchor key"
 		case k.Principal != in.SignerRole:
 			f.Detail = "a Sign by another principal than the signer role"
 		case k.Algorithm != "ECDSA_SHA_256" || k.MessageType != "DIGEST":
 			f.Detail = fmt.Sprintf("a Sign with %s/%s", k.Algorithm, k.MessageType)
+		case len(byID[k.RequestID]) > 0:
+			continue
 		default:
-			if _, ok := signsByID[k.RequestID]; ok {
-				continue
-			}
-			if n, ok := intentCovering(in.Notes, k.At); ok {
-				f.Severity, f.Slot, f.Digest = Notice, n.ProposalID+"/"+n.Name, hex.EncodeToString(n.Digest)
-				f.Detail = "a Sign inside a sign_intent's lease with no sign entry (an answer lost)"
+			if i, ok := noteNaming(in.Notes, k.RequestID, usedNote); ok {
+				n := in.Notes[i]
+				usedNote[i] = true
+				f.Severity, f.Slot, f.Digest = Notice, n.ProposalID+"/"+n.Name, h(n.Digest)
+				f.Detail = "a Sign its call journaled as " + n.Kind
+				if n.Kind == signer.NoteUnkept && pub != nil && len(n.Signature) > 0 {
+					if !ecdsa.VerifyASN1(pub, n.Digest, n.Signature) {
+						f.Severity, f.Rule = Alarm, RuleSignatureMismatch
+						f.Detail = "a signature journaled as not kept that doesn't verify under the anchor key"
+					}
+				}
+			} else if i, ok := loneIntent(in.Notes, k.At, attemptSigned, usedNote); ok {
+				n := in.Notes[i]
+				usedNote[i] = true
+				f.Severity, f.Slot, f.Digest = Notice, n.ProposalID+"/"+n.Name, h(n.Digest)
+				f.Detail = "a Sign inside a sign_intent's lease whose attempt has no sign entry (an answer lost)"
 			} else {
 				f.Detail = "a Sign with no journal entry"
 			}
@@ -227,19 +342,20 @@ func Run(in Input) []Finding {
 		}
 	}
 	trailFrom := in.From.Add(in.TrailLag)
-	for _, s := range dedupe(in.Signs) {
-		if s.At.Before(trailFrom) || s.At.After(settled) {
+	for _, s := range signs {
+		if s.At.Before(trailFrom) || s.At.After(settled) || kmsByID[s.KMSRequestID] {
 			continue
 		}
-		if !kmsByID[s.KMSRequestID] {
-			add(Finding{Rule: RuleTrailMissing, Severity: Alarm, Slot: s.ProposalID + "/" + s.Name,
-				Digest: hex.EncodeToString(s.Digest), RequestID: s.KMSRequestID, Detail: "a journaled sign the trail doesn't show"})
-		}
+		add(Finding{Rule: RuleTrailMissing, Severity: Alarm, Slot: s.ProposalID + "/" + s.Name,
+			Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID, Detail: "a journaled sign the trail doesn't show"})
 	}
 
-	// unpublished_sign, and bundles that are no journaled sign.
-	for _, s := range dedupe(in.Signs) {
+	// unpublished_sign: each kept sign, an hour on, held by the site.
+	for _, s := range signs {
 		slot := s.ProposalID + "/" + s.Name
+		if !kept[h(s.Signature)] || in.Now.Sub(s.At) < UnpublishedAfter {
+			continue
+		}
 		p, read := in.Published[slot]
 		if !read {
 			add(Finding{Rule: RuleIncomplete, Severity: Alarm, Slot: slot, Detail: "the site's holding for a journaled slot was not read"})
@@ -248,85 +364,98 @@ func Run(in Input) []Finding {
 		if p.Held && bytes.Equal(p.Signature, s.Signature) {
 			continue
 		}
-		if in.Now.Sub(s.At) < UnpublishedAfter {
-			continue
-		}
-		f := Finding{Rule: RuleUnpublished, Severity: Alarm, Slot: slot, Digest: hex.EncodeToString(s.Digest), RequestID: s.KMSRequestID,
-			Detail: "a journaled sign with no published document holding it"}
-		if p.Held {
-			f.Detail = "the slot holds another signature than this journaled sign"
-		}
+		f := Finding{Rule: RuleUnpublished, Severity: Alarm, Slot: slot, Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID,
+			Detail: "a kept sign with no published document holding it"}
 		if tooLate(in.Completions, s) && in.LateVerified[slot] {
 			f.Severity, f.Detail = Notice, "an extension the site refused as too_late, its lateness verified"
 		}
 		add(f)
 	}
-	slots := make([]string, 0, len(in.Published))
-	for slot := range in.Published {
-		slots = append(slots, slot)
-	}
-	sort.Strings(slots)
-	for _, slot := range slots {
+
+	// Every bundle the site holds: verified, and its slot's kept signature.
+	for _, slot := range sortedKeys(in.Published) {
 		p := in.Published[slot]
 		if !p.Held {
 			continue
 		}
-		if p.VerifyErr != "" {
-			add(Finding{Rule: RuleSignatureMismatch, Severity: Alarm, Slot: slot, Detail: "the site's bundle doesn't verify: " + p.VerifyErr})
+		f := Finding{Rule: RuleSignatureMismatch, Severity: Alarm, Slot: slot}
+		c, read := in.Claims[slot]
+		switch {
+		case p.VerifyErr != "":
+			f.Detail = "the site's bundle doesn't verify: " + p.VerifyErr
+		case !read:
+			f.Rule, f.Detail = RuleIncomplete, "the claim of a slot the site holds was not read"
+		case !c.Exists || !bytes.Equal(c.Sig, p.Signature):
+			f.Detail = "the site's bundle signature isn't its slot's kept signature"
+			if c.Exists {
+				f.Digest, f.R = h(c.Digest), h(c.R)
+			}
+		default:
 			continue
 		}
-		if !journaledSigs[hex.EncodeToString(p.Signature)] {
-			add(Finding{Rule: RuleSignatureMismatch, Severity: Alarm, Slot: slot, Detail: "the site's bundle signature is no journaled sign"})
-		}
+		add(f)
 	}
 
 	// The function as released.
 	if in.Release == nil {
 		add(Finding{Rule: RuleIncomplete, Severity: Alarm, Detail: "the signer function's code and policy were not read"})
 	} else {
-		if in.Release.WantCodeSha256 == "" || in.Release.GotCodeSha256 != in.Release.WantCodeSha256 {
-			add(Finding{Rule: RuleCodeDrift, Severity: Alarm, Detail: "CodeSha256 " + in.Release.GotCodeSha256 + ", not the release's " + in.Release.WantCodeSha256})
+		r := in.Release
+		if r.WantCodeSha256 == "" || r.GotCodeSha256 != r.WantCodeSha256 {
+			add(Finding{Rule: RuleCodeDrift, Severity: Alarm, Detail: "CodeSha256 " + r.GotCodeSha256 + ", not the release's " + r.WantCodeSha256})
 		}
-		if in.Release.WantPolicy == "" || in.Release.GotPolicy != in.Release.WantPolicy {
+		if len(r.Versions) > 0 || len(r.Aliases) > 0 {
+			add(Finding{Rule: RuleCodeDrift, Severity: Alarm, Detail: fmt.Sprintf("the function has versions %v and aliases %v; a release has none", r.Versions, r.Aliases)})
+		}
+		if r.WantPolicy == "" || r.GotPolicy != r.WantPolicy {
 			add(Finding{Rule: RulePolicyDrift, Severity: Alarm, Detail: "the function's resource policy isn't the release's"})
 		}
 	}
 
 	acknowledge(out, in.Acks)
 	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Rule != out[j].Rule {
-			return out[i].Rule < out[j].Rule
+		a, b := out[i], out[j]
+		if a.Rule != b.Rule {
+			return a.Rule < b.Rule
 		}
-		if out[i].Slot != out[j].Slot {
-			return out[i].Slot < out[j].Slot
+		if a.Slot != b.Slot {
+			return a.Slot < b.Slot
 		}
-		return out[i].RequestID < out[j].RequestID
+		return a.RequestID < b.RequestID
 	})
 	return out
 }
 
-// dedupe keeps the first journal entry of each (digest, r).
-func dedupe(signs []signer.SignEntry) []signer.SignEntry {
-	seen := map[string]bool{}
-	var out []signer.SignEntry
-	for _, s := range signs {
-		k := hex.EncodeToString(s.Digest) + "/" + hex.EncodeToString(s.R)
-		if !seen[k] {
-			seen[k] = true
-			out = append(out, s)
-		}
+func sortedKeys[V any](m map[string]V) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
 	}
-	return out
+	sort.Strings(ks)
+	return ks
 }
 
-// intentCovering finds a sign_intent whose lease window holds t.
-func intentCovering(notes []signer.NoteEntry, t time.Time) (signer.NoteEntry, bool) {
-	for _, n := range notes {
-		if n.Kind == signer.NoteIntent && !t.Before(n.At) && !t.After(n.LeaseUntil) {
-			return n, true
+// noteNaming finds an unused sign_outcome_unknown or sign_unkept note of
+// the request id.
+func noteNaming(notes []signer.NoteEntry, id string, used map[int]bool) (int, bool) {
+	for i, n := range notes {
+		if !used[i] && id != "" && n.KMSRequestID == id && (n.Kind == signer.NoteOutcomeUnknown || n.Kind == signer.NoteUnkept) {
+			return i, true
 		}
 	}
-	return signer.NoteEntry{}, false
+	return 0, false
+}
+
+// loneIntent finds an unused sign_intent whose lease window holds t and
+// whose attempt has no sign entry.
+func loneIntent(notes []signer.NoteEntry, t time.Time, attemptSigned map[string]bool, used map[int]bool) (int, bool) {
+	for i, n := range notes {
+		if !used[i] && n.Kind == signer.NoteIntent && n.AttemptID != "" && !attemptSigned[n.AttemptID] &&
+			!t.Before(n.At) && !t.After(n.LeaseUntil) {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // tooLate reports whether the sign's call ended with the site refusing it
@@ -350,8 +479,8 @@ func anchorKey(spki []byte) (*ecdsa.PublicKey, error) {
 		return nil, err
 	}
 	pub, ok := k.(*ecdsa.PublicKey)
-	if !ok {
-		return nil, errors.New("not an ECDSA key")
+	if !ok || pub.Curve != elliptic.P256() {
+		return nil, errors.New("not an ECDSA P-256 key")
 	}
 	return pub, nil
 }
@@ -375,12 +504,12 @@ func verifySign(pub *ecdsa.PublicKey, s signer.SignEntry) error {
 	return nil
 }
 
-// acknowledge marks the findings an acknowledgement lists (rule, slot and
-// digest all equal): they stay in the report, as notices.
+// acknowledge marks the findings an acknowledgement lists (rule, slot,
+// digest and r all equal): they stay in the report, as notices.
 func acknowledge(fs []Finding, acks []Acknowledgement) {
 	for i := range fs {
 		for _, a := range acks {
-			if a.Rule == fs[i].Rule && a.Slot == fs[i].Slot && a.Digest == fs[i].Digest && a.Slot != "" {
+			if a.Slot != "" && a.Rule == fs[i].Rule && a.Slot == fs[i].Slot && a.Digest == fs[i].Digest && a.R == fs[i].R {
 				fs[i].Acknowledged, fs[i].Severity = true, Notice
 			}
 		}

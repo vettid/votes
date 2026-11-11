@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -19,15 +20,18 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
+	lambdatypes "github.com/aws/aws-sdk-go-v2/service/lambda/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/vettid/votes/reconcile"
+	"github.com/vettid/votes/signer"
 	"github.com/vettid/votes/site"
 )
 
@@ -66,6 +70,25 @@ type fakeLambda struct{ code, policy string }
 func (f fakeLambda) GetFunctionConfiguration(context.Context, *lambda.GetFunctionConfigurationInput, ...func(*lambda.Options)) (*lambda.GetFunctionConfigurationOutput, error) {
 	return &lambda.GetFunctionConfigurationOutput{CodeSha256: aws.String(f.code)}, nil
 }
+
+func (f fakeLambda) ListVersionsByFunction(context.Context, *lambda.ListVersionsByFunctionInput, ...func(*lambda.Options)) (*lambda.ListVersionsByFunctionOutput, error) {
+	return &lambda.ListVersionsByFunctionOutput{Versions: []lambdatypes.FunctionConfiguration{{Version: aws.String("$LATEST")}}}, nil
+}
+
+func (f fakeLambda) ListAliases(context.Context, *lambda.ListAliasesInput, ...func(*lambda.Options)) (*lambda.ListAliasesOutput, error) {
+	return &lambda.ListAliasesOutput{}, nil
+}
+
+type fakeTrail struct{}
+
+func (fakeTrail) GetTrailStatus(context.Context, *cloudtrail.GetTrailStatusInput, ...func(*cloudtrail.Options)) (*cloudtrail.GetTrailStatusOutput, error) {
+	t := time.Date(2026, 11, 11, 11, 55, 0, 0, time.UTC)
+	return &cloudtrail.GetTrailStatusOutput{IsLogging: aws.Bool(true), LatestCloudWatchLogsDeliveryTime: &t}, nil
+}
+
+type fakeClaims map[string]*signer.Claim
+
+func (f fakeClaims) Get(_ context.Context, slot string) (*signer.Claim, error) { return f[slot], nil }
 
 func (f fakeLambda) GetPolicy(context.Context, *lambda.GetPolicyInput, ...func(*lambda.Options)) (*lambda.GetPolicyOutput, error) {
 	return &lambda.GetPolicyOutput{Policy: aws.String(f.policy)}, nil
@@ -111,15 +134,18 @@ func world(t *testing.T) (*sources, []byte) {
 		`"}}},"requestParameters":{"signingAlgorithm":"ECDSA_SHA_256","messageType":"DIGEST"},"resources":[{"ARN":"` + keyARN + `"}]}`
 	store := &site.MemStorage{}
 	ctx := context.Background()
-	_ = store.PutOnce(ctx, "v1/index.json", []byte(`[{"proposal_id":"p1"}]`), "")
 	_ = store.PutOnce(ctx, "v1/p/p1/proposal.json", []byte("doc"), "")
 	_ = store.PutOnce(ctx, "v1/p/p1/proposal.json.sigstore.json", []byte(`{"messageSignature":{"signature":"`+b64(sig)+`"}}`), "")
-	c := &cfg{keyAlias: "arn:aws:kms:us-east-1:444455556666:alias/vettid-anchor-staging", journalGroup: "/j", journalStream: "signs",
+	sum := sha256.Sum256(spki)
+	c := &cfg{keyAlias: "arn:aws:kms:us-east-1:444455556666:alias/vettid-anchor-staging", keyARN: keyARN, keySPKISHA256: hex.EncodeToString(sum[:]),
+		trailName: "t", journalGroup: "/j", journalStream: "signs",
 		trailGroup: "/trail", bucket: "b", function: "fn", role: role, codeSha256: code, policy: `{"Statement": []}`}
 	return &sources{
 		logs: fakeLogs{"/j": {signLine}, "/trail": {trailLine}}, kms: fakeKMS{spki: spki},
 		lambda: fakeLambda{code: code, policy: `{"Statement":[]}`}, store: store,
-		list:   fakeList{"v1/p/p1/": {"v1/p/p1/proposal.json", "v1/p/p1/proposal.json.sigstore.json"}},
+		list:   fakeList{"v1/p/": {"v1/p/p1/proposal.json", "v1/p/p1/proposal.json.sigstore.json"}},
+		trail:  fakeTrail{},
+		claims: fakeClaims{"p1/proposal": {Digest: digest[:], Sig: sig, R: rs.R.Bytes(), RequestID: "req-1"}},
 		verify: okVerifier{}, c: c, now: func() time.Time { return now }, log: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
 	}, sig
 }
@@ -149,6 +175,37 @@ func TestPassReportsWhatItCantRead(t *testing.T) {
 	if fs := s.pass(context.Background()); len(fs) != 1 || fs[0].Rule != reconcile.RuleCodeDrift {
 		t.Fatalf("code drift: %+v", fs)
 	}
+	// The key: the alias resolving elsewhere, or another public key.
+	s, _ = world(t)
+	s.c.keyARN = "arn:aws:kms:us-east-1:444455556666:key/other"
+	if fs := s.pass(context.Background()); !hasRule(fs, reconcile.RuleKeyDrift) {
+		t.Fatalf("the alias elsewhere: %+v", fs)
+	}
+	s, _ = world(t)
+	s.c.keySPKISHA256 = strings.Repeat("0", 64)
+	if fs := s.pass(context.Background()); !hasRule(fs, reconcile.RuleKeyDrift) || !hasRule(fs, reconcile.RuleIncomplete) {
+		t.Fatalf("another public key: %+v", fs)
+	}
+	// An old document on the site, outside the period: its claim accounts for it.
+	s, _ = world(t)
+	ctx := context.Background()
+	st := s.store.(*site.MemStorage)
+	_ = st.PutOnce(ctx, "v1/p/p0/proposal.json", []byte("old"), "")
+	_ = st.PutOnce(ctx, "v1/p/p0/proposal.json.sigstore.json", []byte(`{"messageSignature":{"signature":"AQI="}}`), "")
+	s.list = fakeList{"v1/p/": {"v1/p/p0/proposal.json.sigstore.json", "v1/p/p1/proposal.json.sigstore.json"}}
+	s.claims.(fakeClaims)["p0/proposal"] = &signer.Claim{Digest: []byte{9}, Sig: []byte{1, 2}, R: []byte{1}, RequestID: "req-old"}
+	if fs := s.pass(ctx); len(fs) != 0 {
+		t.Fatalf("an old document: %+v", fs)
+	}
+}
+
+func hasRule(fs []reconcile.Finding, rule string) bool {
+	for _, f := range fs {
+		if f.Rule == rule {
+			return true
+		}
+	}
+	return false
 }
 
 func TestReport(t *testing.T) {
@@ -177,6 +234,8 @@ func TestReport(t *testing.T) {
 func TestCompiled(t *testing.T) {
 	set := func() {
 		compiledRegion, compiledKeyAlias = "us-east-1", "arn:aws:kms:us-east-1:444455556666:alias/vettid-anchor-staging"
+		compiledKeyARN, compiledKeySPKISHA256 = keyARN, strings.Repeat("ab", 32)
+		compiledClaimsTable, compiledTrailName = "claims", "trail"
 		compiledJournalGroup, compiledJournalStream, compiledTrailGroup = "/j", "signs", "/t"
 		compiledVotesBucket, compiledSigstore, compiledSignerFunction = "b", "staging", "fn"
 		compiledSignerRole, compiledCodeSha256 = role, code
@@ -189,6 +248,8 @@ func TestCompiled(t *testing.T) {
 	}
 	for _, mod := range []func(){
 		func() { compiledTrailGroup = "" },
+		func() { compiledKeyARN = "arn:aws:kms:us-east-1:444455556666:alias/x" },
+		func() { compiledKeySPKISHA256 = "AB" },
 		func() { compiledKeyAlias = "arn:aws:kms:us-east-1:444455556666:key/abc" },
 		func() { compiledSigstore = "other" },
 		func() { compiledSignerRole = "signer" },
@@ -206,7 +267,7 @@ func TestCompiled(t *testing.T) {
 
 func TestParseAcknowledged(t *testing.T) {
 	d := strings.Repeat("ab", 32)
-	if a, err := ParseAcknowledged([]byte(`[{"rule":"unpublished_sign","slot":"p/n","digest":"` + d + `","reason":"why"}]`)); err != nil || len(a) != 1 {
+	if a, err := ParseAcknowledged([]byte(`[{"rule":"unpublished_sign","slot":"p/n","digest":"` + d + `","r":"0a1b","reason":"why"}]`)); err != nil || len(a) != 1 || a[0].R != "0a1b" {
 		t.Fatalf("%v %v", a, err)
 	}
 	for _, bad := range []string{
@@ -214,6 +275,7 @@ func TestParseAcknowledged(t *testing.T) {
 		`[{"rule":"unpublished_sign","slot":"pn","digest":"` + d + `","reason":"why"}]`,
 		`[{"rule":"unpublished_sign","slot":"p/n","digest":"AB","reason":"why"}]`,
 		`[{"rule":"x","slot":"p/n","digest":"` + d + `","reason":"why","extra":1}]`,
+		`[{"rule":"x","slot":"p/n","digest":"` + d + `","r":"xyz","reason":"why"}]`,
 		`[] []`, `null`,
 	} {
 		if _, err := ParseAcknowledged([]byte(bad)); err == nil {

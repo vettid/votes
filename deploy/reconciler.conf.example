@@ -9,13 +9,21 @@
 #   as released (Lambda GetPolicy's Policy, as JSON). A difference alarms
 #   (policy_drift).
 # - monitor/acknowledged-signs-<env>.json: the acknowledged signs, a JSON
-#   array of {rule, slot, digest, reason}; [] for none. A change is a new
+#   array of {rule, slot, digest, r, reason} (r "" for a finding with
+#   none); [] for none. A change is a new
 #   signed release.
 #
 # Region: the signer account's region.
 Region=us-east-1
-# KeyAlias: the anchor key's alias ARN.
+# KeyAlias: the anchor key's alias ARN; KeyARN: the key's own ARN, which
+# the alias must resolve to; KeySPKISHA256: the hex SHA-256 of its public
+# key (DER). Either changing alarms (key_drift).
 KeyAlias=arn:aws:kms:us-east-1:000000000000:alias/vettid-anchor-staging
+KeyARN=arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000
+KeySPKISHA256=0000000000000000000000000000000000000000000000000000000000000000
+# ClaimsTable and TrailName: AnchorSigner-<env>'s fixed names.
+ClaimsTable=vettid-anchor-claims-staging
+TrailName=vettid-anchor-staging
 # JournalGroup, JournalStream: AnchorSigner-<env>'s fixed names.
 JournalGroup=/vettid/anchor/staging/journal
 JournalStream=signs

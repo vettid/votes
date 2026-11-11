@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -47,4 +49,35 @@ func TestSameAsTheSigner(t *testing.T) {
 			t.Errorf("%s is denied in the signer, not here", d)
 		}
 	}
+	// The prefixes and the known names too.
+	for _, l := range []struct {
+		re   string
+		ours []string
+	}{
+		{`(?s)var deniedPrefixes = \[\]string\{(.*?)\}`, DeniedPrefixes},
+		{`(?s)var knownEnv = map\[string\]bool\{(.*?)\n\}`, keys(Known)},
+	} {
+		b := regexp.MustCompile(l.re).FindSubmatch(src)
+		if b == nil {
+			t.Fatalf("the signer's list %s isn't where it was", l.re)
+		}
+		var theirs []string
+		for _, m := range regexp.MustCompile(`"([^"]+)"`).FindAllSubmatch(b[1], -1) {
+			theirs = append(theirs, string(m[1]))
+		}
+		sort.Strings(theirs)
+		mine := append([]string(nil), l.ours...)
+		sort.Strings(mine)
+		if strings.Join(theirs, ",") != strings.Join(mine, ",") {
+			t.Errorf("the signer has %v, this has %v", theirs, mine)
+		}
+	}
+}
+
+func keys(m map[string]bool) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

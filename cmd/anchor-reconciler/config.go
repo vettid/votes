@@ -19,6 +19,10 @@ import (
 var (
 	compiledRegion         string // the signer account's region
 	compiledKeyAlias       string // the anchor key's alias ARN
+	compiledKeyARN         string // the anchor key's own ARN: the alias must resolve to it
+	compiledKeySPKISHA256  string // hex SHA-256 of the anchor key's public key (DER SPKI)
+	compiledClaimsTable    string
+	compiledTrailName      string // the signer account's trail
 	compiledJournalGroup   string
 	compiledJournalStream  string
 	compiledTrailGroup     string // the trail's log group in the signer account
@@ -32,12 +36,14 @@ var (
 )
 
 type cfg struct {
-	region, keyAlias, journalGroup, journalStream, trailGroup, bucket, instance, function, role string
-	codeSha256, policy                                                                          string
-	acks                                                                                        []reconcile.Acknowledgement
+	region, keyAlias, keyARN, keySPKISHA256, claimsTable, trailName           string
+	journalGroup, journalStream, trailGroup, bucket, instance, function, role string
+	codeSha256, policy                                                        string
+	acks                                                                      []reconcile.Acknowledgement
 }
 
 var (
+	hexSHA256 = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	roleARN   = regexp.MustCompile(`^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$`)
 	sha256B64 = regexp.MustCompile(`^[A-Za-z0-9+/]{43}=$`)
 )
@@ -45,10 +51,12 @@ var (
 // compiled checks the compiled configuration: every value present and
 // well formed, or the function doesn't start.
 func compiled() (*cfg, error) {
-	c := &cfg{region: compiledRegion, keyAlias: compiledKeyAlias, journalGroup: compiledJournalGroup, journalStream: compiledJournalStream,
+	c := &cfg{region: compiledRegion, keyAlias: compiledKeyAlias, keyARN: compiledKeyARN, keySPKISHA256: compiledKeySPKISHA256,
+		claimsTable: compiledClaimsTable, trailName: compiledTrailName, journalGroup: compiledJournalGroup, journalStream: compiledJournalStream,
 		trailGroup: compiledTrailGroup, bucket: compiledVotesBucket, instance: compiledSigstore, function: compiledSignerFunction,
 		role: compiledSignerRole, codeSha256: compiledCodeSha256}
-	for name, v := range map[string]string{"region": c.region, "key alias": c.keyAlias, "journal group": c.journalGroup,
+	for name, v := range map[string]string{"region": c.region, "key alias": c.keyAlias, "key ARN": c.keyARN,
+		"key SPKI SHA-256": c.keySPKISHA256, "claims table": c.claimsTable, "trail name": c.trailName, "journal group": c.journalGroup,
 		"journal stream": c.journalStream, "trail group": c.trailGroup, "votes bucket": c.bucket, "sigstore": c.instance,
 		"signer function": c.function, "signer role": c.role, "code SHA-256": c.codeSha256, "policy": compiledPolicy,
 		"acknowledged": compiledAcknowledged} {
@@ -59,6 +67,10 @@ func compiled() (*cfg, error) {
 	switch {
 	case !strings.HasPrefix(c.keyAlias, "arn:aws") || !strings.Contains(c.keyAlias, ":alias/"):
 		return nil, errors.New("the key must be compiled as its alias ARN")
+	case !strings.HasPrefix(c.keyARN, "arn:aws") || !strings.Contains(c.keyARN, ":key/"):
+		return nil, errors.New("the key's own ARN must be compiled too")
+	case !hexSHA256.MatchString(c.keySPKISHA256):
+		return nil, errors.New("the key's SPKI SHA-256 must be 64 lowercase hex digits")
 	case c.instance != anchor.Staging && c.instance != anchor.Production:
 		return nil, errors.New("sigstore must be staging or production")
 	case !roleARN.MatchString(c.role):
@@ -94,10 +106,10 @@ func ParseAcknowledged(b []byte) ([]reconcile.Acknowledgement, error) {
 	if dec.More() {
 		return nil, errors.New("acknowledged signs: something after the array")
 	}
-	hexDigest := regexp.MustCompile(`^[0-9a-f]{64}$`)
+	hexR := regexp.MustCompile(`^([0-9a-f]{2}){1,33}$`)
 	for i, a := range acks {
-		if a.Rule == "" || a.Reason == "" || !strings.Contains(a.Slot, "/") || !hexDigest.MatchString(a.Digest) {
-			return nil, fmt.Errorf("acknowledged signs: entry %d needs a rule, a slot, a hex SHA-256 digest and a reason", i)
+		if a.Rule == "" || a.Reason == "" || !strings.Contains(a.Slot, "/") || !hexSHA256.MatchString(a.Digest) || (a.R != "" && !hexR.MatchString(a.R)) {
+			return nil, fmt.Errorf("acknowledged signs: entry %d needs a rule, a slot, a hex SHA-256 digest, a hex r if any, and a reason", i)
 		}
 	}
 	return acks, nil
@@ -105,7 +117,8 @@ func ParseAcknowledged(b []byte) ([]reconcile.Acknowledgement, error) {
 
 // log writes the compiled configuration at start (all of it public).
 func (c *cfg) log(log *slog.Logger) {
-	log.Info("compiled configuration", "region", c.region, "key_alias", c.keyAlias, "journal_group", c.journalGroup,
+	log.Info("compiled configuration", "region", c.region, "key_alias", c.keyAlias, "key_arn", c.keyARN, "key_spki_sha256", c.keySPKISHA256,
+		"claims_table", c.claimsTable, "trail", c.trailName, "journal_group", c.journalGroup,
 		"journal_stream", c.journalStream, "trail_group", c.trailGroup, "votes_bucket", c.bucket, "sigstore", c.instance,
 		"signer_function", c.function, "signer_role", c.role, "code_sha256", c.codeSha256, "acknowledged", len(c.acks))
 }

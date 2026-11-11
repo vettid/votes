@@ -15,7 +15,10 @@ import (
 	"github.com/vettid/votes/signer"
 )
 
-const role = "arn:aws:iam::444455556666:role/vettid-anchor-signer-staging"
+const (
+	role   = "arn:aws:iam::444455556666:role/vettid-anchor-signer-staging"
+	keyARN = "arn:aws:kms:us-east-1:444455556666:key/abc"
+)
 
 // testKey is the anchor key, from a fixed public test seed.
 func testKey(t *testing.T) (*ecdsa.PrivateKey, []byte) {
@@ -45,7 +48,7 @@ func newFixture(t *testing.T) *fixture {
 }
 
 // sign makes a journal sign entry for doc in slot id/name, at.
-func (f *fixture) sign(id, name, doc, reqID string, at time.Time) signer.SignEntry {
+func (f *fixture) sign(id, name, doc, reqID, attempt string, at time.Time) signer.SignEntry {
 	d := sha256.Sum256([]byte(doc))
 	sig, err := ecdsa.SignASN1(rand.Reader, f.key, d[:])
 	if err != nil {
@@ -55,21 +58,26 @@ func (f *fixture) sign(id, name, doc, reqID string, at time.Time) signer.SignEnt
 	if _, err := asn1.Unmarshal(sig, &rs); err != nil {
 		f.t.Fatal(err)
 	}
-	return signer.SignEntry{KMSRequestID: reqID, At: at, ProposalID: id, Name: name, Digest: d[:], Signature: sig, R: rs.R.Bytes()}
+	return signer.SignEntry{KMSRequestID: reqID, AttemptID: attempt, At: at, ProposalID: id, Name: name, Digest: d[:], Signature: sig, R: rs.R.Bytes()}
 }
 
 func (f *fixture) kms(reqID string, at time.Time) KMSSign {
-	return KMSSign{RequestID: reqID, At: at, Principal: role, Algorithm: "ECDSA_SHA_256", MessageType: "DIGEST"}
+	return KMSSign{RequestID: reqID, At: at, KeyARN: keyARN, Principal: role, Algorithm: "ECDSA_SHA_256", MessageType: "DIGEST"}
+}
+
+func claimOf(s signer.SignEntry) Claim {
+	return Claim{Exists: true, Digest: s.Digest, Sig: s.Signature, R: s.R, RequestID: s.KMSRequestID}
 }
 
 // clean is a pass with one sign, accounted for on every side.
 func (f *fixture) clean() Input {
-	s := f.sign("p1", "proposal", "doc one", "req-1", f.now.Add(-90*time.Minute))
+	s := f.sign("p1", "proposal", "doc one", "req-1", "a1", f.now.Add(-90*time.Minute))
 	return Input{
 		Now: f.now, From: f.now.Add(-3 * time.Hour), To: f.now, TrailLag: 20 * time.Minute,
-		Signs:      []signer.SignEntry{s},
-		KMSSigns:   []KMSSign{f.kms("req-1", s.At.Add(-time.Second))},
-		SignerRole: role, AnchorSPKI: f.spki,
+		Signs:    []signer.SignEntry{s},
+		KMSSigns: []KMSSign{f.kms("req-1", s.At.Add(-time.Second))},
+		KeyARN:   keyARN, SignerRole: role, AnchorSPKI: f.spki,
+		Claims:    map[string]Claim{"p1/proposal": claimOf(s)},
 		Published: map[string]Published{"p1/proposal": {Held: true, Signature: s.Signature}},
 		Release:   &Release{WantCodeSha256: "abc", GotCodeSha256: "abc", WantPolicy: "{}", GotPolicy: "{}"},
 	}
@@ -85,10 +93,88 @@ func rules(fs []Finding) map[string]Severity {
 	return m
 }
 
+func count(fs []Finding, rule string) int {
+	n := 0
+	for _, f := range fs {
+		if f.Rule == rule {
+			n++
+		}
+	}
+	return n
+}
+
 func TestClean(t *testing.T) {
 	f := newFixture(t)
 	if fs := Run(f.clean()); len(fs) != 0 {
 		t.Fatalf("findings on a clean pass: %+v", fs)
+	}
+	// An old document the site holds, signed long before the period: its
+	// claim accounts for it, with nothing in this period's journal.
+	in := f.clean()
+	old := f.sign("p0", "proposal", "old doc", "req-0", "a0", f.now.Add(-30*24*time.Hour))
+	in.Claims["p0/proposal"] = claimOf(old)
+	in.Published["p0/proposal"] = Published{Held: true, Signature: old.Signature}
+	if fs := Run(in); len(fs) != 0 {
+		t.Fatalf("an old document: %+v", fs)
+	}
+}
+
+// A stolen-credential Sign hidden behind a copy of a real, published sign
+// entry under the attacker's request id (review H1): the claim holds the
+// kept signature's own request id.
+func TestCopiedEntryUnderAnotherRequestID(t *testing.T) {
+	f := newFixture(t)
+	in := f.clean()
+	copied := in.Signs[0]
+	copied.KMSRequestID = "req-attacker"
+	copied.At = f.now.Add(-time.Hour)
+	in.Signs = append(in.Signs, copied)
+	in.KMSSigns = append(in.KMSSigns, f.kms("req-attacker", copied.At))
+	if r := rules(Run(in)); r[RuleJournalConflict] != Alarm {
+		t.Fatalf("a copied entry: %v", r)
+	}
+	// The copy alone, the original outside the period: the claim still
+	// says whose request id the kept signature is.
+	in.Signs = []signer.SignEntry{copied}
+	in.KMSSigns = []KMSSign{f.kms("req-attacker", copied.At)}
+	if r := rules(Run(in)); r[RuleJournalConflict] != Alarm {
+		t.Fatalf("a copied entry alone: %v", r)
+	}
+	// One request id journaled for two signatures.
+	in = f.clean()
+	other := f.sign("p2", "proposal", "doc two", "req-1", "a2", in.Signs[0].At)
+	in.Signs = append(in.Signs, other)
+	in.Claims["p2/proposal"] = claimOf(other)
+	in.Published["p2/proposal"] = Published{Held: true, Signature: other.Signature}
+	if fs := Run(in); count(fs, RuleJournalConflict) == 0 {
+		t.Fatalf("one request id for two signatures: %+v", fs)
+	}
+	// An entry with no request id.
+	in = f.clean()
+	in.Signs[0].KMSRequestID = ""
+	in.Claims["p1/proposal"] = Claim{Exists: true, Digest: in.Signs[0].Digest, Sig: in.Signs[0].Signature, R: in.Signs[0].R}
+	if r := rules(Run(in)); r[RuleJournalConflict] != Alarm {
+		t.Fatalf("no request id: %v", r)
+	}
+}
+
+func TestClaims(t *testing.T) {
+	f := newFixture(t)
+	in := f.clean()
+	in.Claims["p1/proposal"] = Claim{}
+	if r := rules(Run(in)); r[RuleUnclaimed] != Alarm {
+		t.Fatalf("no claim: %v", r)
+	}
+	in = f.clean()
+	other := sha256.Sum256([]byte("another doc"))
+	in.Claims["p1/proposal"] = Claim{Exists: true, Digest: other[:], Sig: in.Signs[0].Signature, R: in.Signs[0].R, RequestID: "req-1"}
+	if r := rules(Run(in)); r[RuleJournalConflict] != Alarm {
+		t.Fatalf("another digest's claim: %v", r)
+	}
+	in = f.clean()
+	delete(in.Claims, "p1/proposal")
+	if r := rules(Run(in)); r[RuleIncomplete] != Alarm {
+		t.Fatalf("a claim not read: %v", r)
 	}
 }
 
@@ -102,23 +188,58 @@ func TestUnattributed(t *testing.T) {
 		t.Fatalf("a Sign with no entry: %v", r)
 	}
 
-	// Inside a sign_intent's lease, with no sign entry: a notice.
+	// Inside a lone intent's lease (its attempt has no sign entry): a
+	// notice, once. A second Sign in the same lease alarms (review H2).
+	intent := signer.NoteEntry{Kind: signer.NoteIntent, At: at.Add(-5 * time.Second), LeaseUntil: at.Add(30 * time.Second),
+		ProposalID: "p2", Name: "proposal", AttemptID: "a-lost"}
 	in = f.clean()
 	in.KMSSigns = append(in.KMSSigns, f.kms("req-x", at))
-	in.Notes = []signer.NoteEntry{{Kind: signer.NoteIntent, At: at.Add(-5 * time.Second), LeaseUntil: at.Add(30 * time.Second), ProposalID: "p2", Name: "proposal"}}
-	fs := Run(in)
-	if r := rules(fs); r[RuleUnattributed] != Notice {
-		t.Fatalf("a Sign inside an intent's lease: %v", r)
+	in.Notes = []signer.NoteEntry{intent}
+	if fs := Run(in); count(fs, RuleUnattributed) != 1 || rules(fs)[RuleUnattributed] != Notice {
+		t.Fatalf("a Sign in a lone intent's lease: %+v", fs)
+	}
+	in.KMSSigns = append(in.KMSSigns, f.kms("req-y", at.Add(time.Second)))
+	if r := rules(Run(in)); r[RuleUnattributed] != Alarm {
+		t.Fatalf("two Signs on one intent: %v", r)
+	}
+	// An intent whose attempt has its own sign entry excuses nothing.
+	in = f.clean()
+	in.KMSSigns = append(in.KMSSigns, f.kms("req-x", at))
+	signedIntent := intent
+	signedIntent.AttemptID = "a1"
+	in.Notes = []signer.NoteEntry{signedIntent}
+	if r := rules(Run(in)); r[RuleUnattributed] != Alarm {
+		t.Fatalf("an intent whose attempt signed: %v", r)
 	}
 	// Another kind of note doesn't excuse it.
-	in.Notes[0].Kind = signer.NoteRetimestamp
+	in.Notes[0].Kind, in.Notes[0].AttemptID = signer.NoteRetimestamp, "a-lost"
 	if r := rules(Run(in)); r[RuleUnattributed] != Alarm {
 		t.Fatalf("a Sign inside a non-intent note: %v", r)
 	}
 
-	// Another principal, or another algorithm or message type: an alarm,
-	// even with a sign entry of its request id.
+	// A note naming the request id (outcome unknown, or not kept): a
+	// notice; a not-kept signature that doesn't verify alarms.
+	in = f.clean()
+	in.KMSSigns = append(in.KMSSigns, f.kms("req-x", at))
+	in.Notes = []signer.NoteEntry{{Kind: signer.NoteOutcomeUnknown, At: at, KMSRequestID: "req-x", ProposalID: "p2", Name: "proposal"}}
+	if r := rules(Run(in)); r[RuleUnattributed] != Notice {
+		t.Fatalf("an outcome-unknown Sign: %v", r)
+	}
+	unkept := f.sign("p2", "proposal", "doc two", "req-x", "a3", at)
+	in.Notes = []signer.NoteEntry{{Kind: signer.NoteUnkept, At: at, KMSRequestID: "req-x", ProposalID: "p2", Name: "proposal",
+		Digest: unkept.Digest, Signature: unkept.Signature, R: unkept.R}}
+	if r := rules(Run(in)); r[RuleUnattributed] != Notice {
+		t.Fatalf("an unkept Sign: %v", r)
+	}
+	in.Notes[0].Signature = in.Signs[0].Signature // over another digest
+	if r := rules(Run(in)); r[RuleSignatureMismatch] != Alarm {
+		t.Fatalf("an unkept signature that doesn't verify: %v", r)
+	}
+
+	// Another key, principal, algorithm or message type: an alarm, even
+	// with a sign entry of its request id.
 	for _, mod := range []func(*KMSSign){
+		func(k *KMSSign) { k.KeyARN = "arn:aws:kms:us-east-1:444455556666:key/other" },
 		func(k *KMSSign) { k.Principal = "arn:aws:iam::444455556666:role/break-glass" },
 		func(k *KMSSign) { k.Algorithm = "ECDSA_SHA_384" },
 		func(k *KMSSign) { k.MessageType = "RAW" },
@@ -130,25 +251,30 @@ func TestUnattributed(t *testing.T) {
 		}
 	}
 
-	// A failed Sign signed nothing; a Sign too recent for the journal's
-	// side is left for the next pass.
+	// A failed Sign by the signer signed nothing; by anyone else it's a
+	// probe. A Sign too recent for the journal is left for the next pass.
 	in = f.clean()
 	failed := f.kms("req-f", at)
-	failed.ErrorCode = "AccessDeniedException"
+	failed.ErrorCode = "KMSInternalException"
 	in.KMSSigns = append(in.KMSSigns, failed, f.kms("req-new", f.now.Add(-5*time.Minute)))
 	if fs := Run(in); len(fs) != 0 {
 		t.Fatalf("a failed or too recent Sign: %+v", fs)
 	}
+	probe := f.kms("req-p", at)
+	probe.ErrorCode, probe.Principal = "AccessDeniedException", "arn:aws:iam::444455556666:role/someone"
+	in.KMSSigns = append(in.KMSSigns, probe)
+	if r := rules(Run(in)); r[RuleSignRefused] != Notice {
+		t.Fatalf("a refused Sign by another principal: %v", r)
+	}
 }
 
-func TestTrailMissing(t *testing.T) {
+func TestTrail(t *testing.T) {
 	f := newFixture(t)
 	in := f.clean()
 	in.KMSSigns = nil
 	if r := rules(Run(in)); r[RuleTrailMissing] != Alarm {
 		t.Fatalf("a journaled sign the trail doesn't show: %v", r)
 	}
-	// A failed call of the same id isn't the sign.
 	in.KMSSigns = []KMSSign{f.kms("req-1", in.Signs[0].At)}
 	in.KMSSigns[0].ErrorCode = "KMSInternalException"
 	if r := rules(Run(in)); r[RuleTrailMissing] != Alarm {
@@ -158,7 +284,6 @@ func TestTrailMissing(t *testing.T) {
 	in = f.clean()
 	in.KMSSigns = nil
 	in.Signs[0].At = f.now.Add(-10 * time.Minute)
-	in.Published["p1/proposal"] = Published{Held: true, Signature: in.Signs[0].Signature}
 	if r := rules(Run(in)); r[RuleTrailMissing] != "" {
 		t.Fatalf("a sign too recent for the trail: %v", r)
 	}
@@ -166,31 +291,38 @@ func TestTrailMissing(t *testing.T) {
 	if r := rules(Run(in)); r[RuleTrailMissing] != "" {
 		t.Fatalf("a sign at the period's start: %v", r)
 	}
+	// The trail's own status.
+	in = f.clean()
+	in.TrailProblem = "the trail isn't logging"
+	if r := rules(Run(in)); r[RuleTrailDelivery] != Alarm {
+		t.Fatalf("the trail's status: %v", r)
+	}
 }
 
 func TestSignatureMismatch(t *testing.T) {
 	f := newFixture(t)
-	// A journaled r that isn't the signature's.
 	in := f.clean()
 	in.Signs[0].R = append([]byte{1}, in.Signs[0].R...)
+	in.Claims["p1/proposal"] = claimOf(in.Signs[0])
 	if r := rules(Run(in)); r[RuleSignatureMismatch] != Alarm {
 		t.Fatalf("a wrong r: %v", r)
 	}
-	// A signature over another digest.
+	// A site bundle whose signature isn't its slot's claim's, however old.
 	in = f.clean()
-	other := sha256.Sum256([]byte("another doc"))
-	in.Signs[0].Digest = other[:]
-	if r := rules(Run(in)); r[RuleSignatureMismatch] != Alarm {
-		t.Fatalf("a signature over another digest: %v", r)
-	}
-	// A site bundle whose signature is no journaled sign.
-	in = f.clean()
-	stray := f.sign("p9", "proposal", "stray", "req-9", f.now)
+	stray := f.sign("p9", "proposal", "stray", "req-9", "a9", f.now.Add(-48*time.Hour))
+	in.Claims["p9/proposal"] = Claim{Exists: true, Digest: stray.Digest, R: []byte{7}, Sig: []byte{7}, RequestID: "req-old"}
 	in.Published["p9/proposal"] = Published{Held: true, Signature: stray.Signature}
 	if r := rules(Run(in)); r[RuleSignatureMismatch] != Alarm {
-		t.Fatalf("a bundle no sign accounts for: %v", r)
+		t.Fatalf("a bundle its claim doesn't hold: %v", r)
 	}
-	// A bundle that doesn't verify.
+	in.Claims["p9/proposal"] = Claim{}
+	if r := rules(Run(in)); r[RuleSignatureMismatch] != Alarm {
+		t.Fatalf("a bundle with no claim: %v", r)
+	}
+	delete(in.Claims, "p9/proposal")
+	if r := rules(Run(in)); r[RuleIncomplete] != Alarm {
+		t.Fatalf("a bundle whose claim wasn't read: %v", r)
+	}
 	in = f.clean()
 	in.Published["p1/proposal"] = Published{Held: true, Signature: in.Signs[0].Signature, VerifyErr: "bad bundle"}
 	if r := rules(Run(in)); r[RuleSignatureMismatch] != Alarm {
@@ -205,15 +337,6 @@ func TestUnpublished(t *testing.T) {
 	if r := rules(Run(in)); r[RuleUnpublished] != Alarm {
 		t.Fatalf("an hour on, not published: %v", r)
 	}
-	// Another signature held in the slot.
-	in = f.clean()
-	other := f.sign("p1", "proposal", "doc one", "req-2", f.now)
-	in.Published["p1/proposal"] = Published{Held: true, Signature: other.Signature}
-	fs := Run(in)
-	if r := rules(fs); r[RuleUnpublished] != Alarm || r[RuleSignatureMismatch] != Alarm {
-		t.Fatalf("another signature in the slot: %v", r)
-	}
-	// Within the hour: not yet.
 	in = f.clean()
 	in.Signs[0].At = f.now.Add(-30 * time.Minute)
 	in.KMSSigns[0].At = in.Signs[0].At
@@ -221,7 +344,6 @@ func TestUnpublished(t *testing.T) {
 	if r := rules(Run(in)); r[RuleUnpublished] != "" {
 		t.Fatalf("within the hour: %v", r)
 	}
-	// too_late: a notice only once the adapter verified its lateness.
 	in = f.clean()
 	in.Published["p1/proposal"] = Published{}
 	s := in.Signs[0]
@@ -233,7 +355,6 @@ func TestUnpublished(t *testing.T) {
 	if r := rules(Run(in)); r[RuleUnpublished] != Notice {
 		t.Fatalf("too_late, verified: %v", r)
 	}
-	// A too_late completion of another r doesn't excuse this one.
 	in.Completions[0].R = []byte{9}
 	if r := rules(Run(in)); r[RuleUnpublished] != Alarm {
 		t.Fatalf("too_late of another signature: %v", r)
@@ -243,27 +364,31 @@ func TestUnpublished(t *testing.T) {
 func TestSecondSign(t *testing.T) {
 	f := newFixture(t)
 	in := f.clean()
-	// The same sign journaled twice (a retry after a lost mark): counted once.
-	in.Signs = append(in.Signs, in.Signs[0])
+	in.Signs = append(in.Signs, in.Signs[0]) // journaled twice, identically
 	if fs := Run(in); len(fs) != 0 {
 		t.Fatalf("a sign journaled twice: %+v", fs)
 	}
-	// Another signature for the same digest: a notice (and unpublished,
-	// since the slot holds the first).
-	again := f.sign("p1", "proposal", "doc one", "req-2", in.Signs[0].At.Add(time.Minute))
-	in.Signs = append(in.Signs, again)
-	in.KMSSigns = append(in.KMSSigns, f.kms("req-2", again.At))
-	if r := rules(Run(in)); r[RuleSecondSign] != Notice || r[RuleUnpublished] != Alarm {
-		t.Fatalf("a second signature: %v", r)
+	// Signatures 2 and 3 for the digest, not kept: a notice each.
+	for i, id := range []string{"req-2", "req-3"} {
+		again := f.sign("p1", "proposal", "doc one", id, "b"+id, in.Signs[0].At.Add(time.Duration(i+1)*time.Minute))
+		in.Signs = append(in.Signs, again)
+		in.KMSSigns = append(in.KMSSigns, f.kms(id, again.At))
+	}
+	fs := Run(in)
+	if n := count(fs, RuleSecondSign); n != 2 {
+		t.Fatalf("%d second-sign notices, want 2: %+v", n, fs)
+	}
+	if r := rules(fs); r[RuleSecondSign] != Notice || r[RuleJournalConflict] != "" || r[RuleUnpublished] != "" {
+		t.Fatalf("unkept signatures: %v", r)
 	}
 }
 
-func TestIncompleteAndRelease(t *testing.T) {
+func TestKeyAndRelease(t *testing.T) {
 	f := newFixture(t)
 	in := f.clean()
-	delete(in.Published, "p1/proposal")
-	if r := rules(Run(in)); r[RuleIncomplete] != Alarm {
-		t.Fatalf("a journaled slot not read on the site: %v", r)
+	in.KeyProblem = "the alias resolves elsewhere"
+	if r := rules(Run(in)); r[RuleKeyDrift] != Alarm {
+		t.Fatalf("key drift: %v", r)
 	}
 	in = f.clean()
 	in.AnchorSPKI = nil
@@ -281,12 +406,20 @@ func TestIncompleteAndRelease(t *testing.T) {
 		t.Fatalf("the release not read: %v", r)
 	}
 	in = f.clean()
-	in.Release.GotCodeSha256 = "def"
-	in.Release.GotPolicy = `{"x":1}`
+	in.Release.GotCodeSha256, in.Release.GotPolicy = "def", `{"x":1}`
 	if r := rules(Run(in)); r[RuleCodeDrift] != Alarm || r[RulePolicyDrift] != Alarm {
 		t.Fatalf("drift: %v", r)
 	}
-	// A release record with nothing in it isn't a match.
+	in = f.clean()
+	in.Release.Versions = []string{"1"}
+	if r := rules(Run(in)); r[RuleCodeDrift] != Alarm {
+		t.Fatalf("a published version: %v", r)
+	}
+	in = f.clean()
+	in.Release.Aliases = []string{"live"}
+	if r := rules(Run(in)); r[RuleCodeDrift] != Alarm {
+		t.Fatalf("an alias: %v", r)
+	}
 	in = f.clean()
 	in.Release = &Release{}
 	if r := rules(Run(in)); r[RuleCodeDrift] != Alarm || r[RulePolicyDrift] != Alarm {
@@ -298,15 +431,23 @@ func TestAcknowledged(t *testing.T) {
 	f := newFixture(t)
 	in := f.clean()
 	in.Published["p1/proposal"] = Published{}
-	d := hex.EncodeToString(in.Signs[0].Digest)
-	in.Acks = []Acknowledgement{{Rule: RuleUnpublished, Slot: "p1/proposal", Digest: d, Reason: "a test"}}
+	s := in.Signs[0]
+	in.Acks = []Acknowledgement{{Rule: RuleUnpublished, Slot: "p1/proposal", Digest: hex.EncodeToString(s.Digest), R: hex.EncodeToString(s.R), Reason: "a test"}}
 	fs := Run(in)
 	if len(fs) != 1 || !fs[0].Acknowledged || fs[0].Severity != Notice {
 		t.Fatalf("an acknowledged finding: %+v", fs)
 	}
-	// Another digest in the same slot is not acknowledged.
-	in.Acks[0].Digest = "00"
+	// Another r of the same digest is not acknowledged (review L2).
+	in.Acks[0].R = "00"
 	if r := rules(Run(in)); r[RuleUnpublished] != Alarm {
-		t.Fatalf("an acknowledgement of another digest: %v", r)
+		t.Fatalf("an acknowledgement of another r: %v", r)
+	}
+}
+
+func TestAnchorKeyP256(t *testing.T) {
+	k, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	spki, _ := x509.MarshalPKIXPublicKey(&k.PublicKey)
+	if _, err := anchorKey(spki); err == nil {
+		t.Fatal("a P-384 key accepted")
 	}
 }

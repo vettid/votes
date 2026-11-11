@@ -29,9 +29,12 @@ get() {
 	printf '%s' "$v"
 }
 ld="-s -w -buildid="
-for k in Region KeyAlias JournalGroup JournalStream TrailGroup VotesBucket Sigstore SignerFunction SignerRole CodeSha256; do
+for k in Region KeyAlias KeyARN KeySPKISHA256 ClaimsTable TrailName JournalGroup JournalStream TrailGroup VotesBucket Sigstore SignerFunction SignerRole CodeSha256; do
 	ld="$ld -X main.compiled$k=$(get "$k")"
 done
-ld="$ld -X main.compiledPolicy=$(base64 -w0 < "$policy") -X main.compiledAcknowledged=$(base64 -w0 < "$acks")"
+# base64 without line breaks, on GNU and BSD alike; the files are checked
+# out byte for byte (.gitattributes: -text), so the hash reproduces.
+b64() { base64 < "$1" | tr -d '\n'; }
+ld="$ld -X main.compiledPolicy=$(b64 "$policy") -X main.compiledAcknowledged=$(b64 "$acks")"
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="$ld" -o "$out/bootstrap" ./cmd/anchor-reconciler
 sha256sum "$out/bootstrap"

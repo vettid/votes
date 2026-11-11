@@ -1,18 +1,21 @@
 // Command anchor-reconciler is the AnchorSigner's reconciler (key
 // protection, the design of record's §6), in its signer mode: an hourly,
 // read-only Lambda in the signer account, deployed only as code the owner
-// signed (the signer's CodeSigningConfig). Each run reads the last
-// Period of the signer's journal and of KMS's Sign calls (the trail's log
-// group), what the votes site holds, the anchor key and the signer
-// function, and logs each finding as one JSON line: "alarm": <rule> for an
-// alarm, "notice": <rule> for a notice. The account's metric filters alarm
-// on them; a run that ends is the heartbeat ("reconciled").
+// signed (the signer's CodeSigningConfig). Each run reads the last Period
+// of the signer's journal and of KMS's Sign calls (the trail's log group),
+// the trail's status, the claim table, what the votes site holds, the
+// anchor key and the signer function, and logs each finding as one JSON
+// line: "alarm": <rule> for an alarm, "notice": <rule> for a notice. The
+// account's metric filters alarm on them; a run that ends is the heartbeat
+// ("reconciled").
 //
 // What it can't read it reports (reconcile_incomplete), never skips.
 package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -24,7 +27,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -33,6 +38,7 @@ import (
 	"github.com/vettid/votes/lambdahttp"
 	"github.com/vettid/votes/reconcile"
 	"github.com/vettid/votes/reconcile/awsread"
+	"github.com/vettid/votes/signer/awsio"
 	"github.com/vettid/votes/site"
 	"github.com/vettid/votes/site/s3store"
 )
@@ -53,19 +59,25 @@ func main() {
 	}
 }
 
+// FunctionAPI is the read-only Lambda calls a run makes.
+type FunctionAPI interface {
+	awsread.LambdaAPI
+	awsread.VersionLister
+}
+
 // sources is what a run reads from.
 type sources struct {
-	logs    awsread.LogsAPI
-	kms     KMSAPI
-	lambda  awsread.LambdaAPI
-	store   site.Storage
-	list    awsread.ListAPI
-	verify  awsread.Verifier
-	c       *cfg
-	now     func() time.Time
-	log     *slog.Logger
-	keyARN  string
-	keySPKI []byte
+	logs   awsread.LogsAPI
+	kms    KMSAPI
+	lambda FunctionAPI
+	trail  awsread.TrailAPI
+	claims awsread.ClaimsAPI
+	store  site.Storage
+	list   awsread.ListAPI
+	verify awsread.Verifier
+	c      *cfg
+	now    func() time.Time
+	log    *slog.Logger
 }
 
 // KMSAPI is the read-only KMS calls a run makes.
@@ -105,7 +117,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 		logs:   cloudwatchlogs.NewFromConfig(ac, func(o *cloudwatchlogs.Options) { o.BaseEndpoint = endpoint("logs") }),
 		kms:    kms.NewFromConfig(ac, func(o *kms.Options) { o.BaseEndpoint = endpoint("kms") }),
 		lambda: lambda.NewFromConfig(ac, func(o *lambda.Options) { o.BaseEndpoint = endpoint("lambda") }),
-		store:  &s3store.Store{Client: s3c, Bucket: c.bucket}, list: s3c, verify: anchors,
+		trail:  cloudtrail.NewFromConfig(ac, func(o *cloudtrail.Options) { o.BaseEndpoint = endpoint("cloudtrail") }),
+		claims: &awsio.Claims{Table: c.claimsTable,
+			Client: dynamodb.NewFromConfig(ac, func(o *dynamodb.Options) { o.BaseEndpoint = endpoint("dynamodb") })},
+		store: &s3store.Store{Client: s3c, Bucket: c.bucket}, list: s3c, verify: anchors,
 		c: c, now: time.Now, log: log,
 	}
 	return lambdahttp.ServeFunc(ctx, api, func(ctx context.Context, _ []byte) ([]byte, error) {
@@ -114,46 +129,65 @@ func run(ctx context.Context, log *slog.Logger) error {
 	})
 }
 
+// anchorKey reads the anchor key, every run, and checks it against the
+// compiled ARN and public key: the alias resolving elsewhere, or another
+// key behind the ARN, is key drift. It returns the compiled key's SPKI
+// only once it matches.
+func (s *sources) anchorKey(ctx context.Context) (spki []byte, problem string, err error) {
+	d, err := s.kms.DescribeKey(ctx, &kms.DescribeKeyInput{KeyId: aws.String(s.c.keyAlias)})
+	if err != nil || d.KeyMetadata == nil {
+		return nil, "", fmt.Errorf("the alias: %w", err)
+	}
+	if got := aws.ToString(d.KeyMetadata.Arn); got != s.c.keyARN {
+		problem = "the alias resolves to " + got + ", not the compiled key"
+	}
+	pk, err := s.kms.GetPublicKey(ctx, &kms.GetPublicKeyInput{KeyId: aws.String(s.c.keyARN)})
+	if err != nil {
+		return nil, problem, fmt.Errorf("the public key: %w", err)
+	}
+	sum := sha256.Sum256(pk.PublicKey)
+	if hex.EncodeToString(sum[:]) != s.c.keySPKISHA256 {
+		if problem != "" {
+			problem += "; "
+		}
+		return nil, problem + "the key's public key isn't the compiled one", nil
+	}
+	return pk.PublicKey, problem, nil
+}
+
 // pass reads one period and checks it.
 func (s *sources) pass(ctx context.Context) []reconcile.Finding {
 	now := s.now()
-	in := reconcile.Input{Now: now, From: now.Add(-Period), To: now, TrailLag: TrailLag, SignerRole: s.c.role, Acks: s.c.acks,
-		Published: map[string]reconcile.Published{}}
+	in := reconcile.Input{Now: now, From: now.Add(-Period), To: now, TrailLag: TrailLag, KeyARN: s.c.keyARN, SignerRole: s.c.role,
+		Acks: s.c.acks, Claims: map[string]reconcile.Claim{}, Published: map[string]reconcile.Published{}}
 	miss := func(what string, err error) { in.Incomplete = append(in.Incomplete, what+": "+err.Error()) }
 
-	if s.keyARN == "" {
-		d, err := s.kms.DescribeKey(ctx, &kms.DescribeKeyInput{KeyId: aws.String(s.c.keyAlias)})
-		if err == nil && d.KeyMetadata != nil {
-			pk, perr := s.kms.GetPublicKey(ctx, &kms.GetPublicKeyInput{KeyId: aws.String(s.c.keyAlias)})
-			if perr == nil {
-				s.keyARN, s.keySPKI = aws.ToString(d.KeyMetadata.Arn), pk.PublicKey
-			} else {
-				err = perr
-			}
-		}
-		if err != nil {
-			miss("the anchor key", err)
-		}
-	}
-	in.AnchorSPKI = s.keySPKI
-
 	var err error
+	if in.AnchorSPKI, in.KeyProblem, err = s.anchorKey(ctx); err != nil {
+		miss("the anchor key", err)
+	}
+	if in.TrailProblem, err = awsread.TrailProblem(ctx, s.trail, s.c.trailName, now); err != nil {
+		miss("the trail's status", err)
+	}
 	if in.Signs, in.Completions, in.Notes, err = awsread.Journal(ctx, s.logs, s.c.journalGroup, s.c.journalStream, in.From, in.To); err != nil {
 		miss("the journal", err)
 	}
-	if s.keyARN != "" {
-		if in.KMSSigns, err = awsread.KMSSigns(ctx, s.logs, s.c.trailGroup, s.keyARN, in.From, in.To); err != nil {
-			miss("the trail", err)
-		}
+	if in.KMSSigns, err = awsread.KMSSigns(ctx, s.logs, s.c.trailGroup, in.From, in.To); err != nil {
+		miss("the trail", err)
 	}
 
+	// Every slot in the journal and every slot the site holds: its claim
+	// and its holding.
 	slots := map[string]bool{}
 	for _, e := range in.Signs {
 		slots[e.ProposalID+"/"+e.Name] = true
 	}
-	held, err := awsread.Slots(ctx, s.store, s.list, s.c.bucket)
+	held, odd, err := awsread.Slots(ctx, s.list, s.c.bucket)
 	if err != nil {
-		miss("the site's index", err)
+		miss("the site's listing", err)
+	}
+	for _, k := range odd {
+		in.Incomplete = append(in.Incomplete, "a bundle at "+k+", which isn't a slot")
 	}
 	for _, slot := range held {
 		slots[slot] = true
@@ -164,19 +198,26 @@ func (s *sources) pass(ctx context.Context) []reconcile.Finding {
 	}
 	sort.Strings(names)
 	for _, slot := range names {
-		p, err := awsread.Holding(ctx, s.store, s.verify, s.keySPKI, slot)
-		if err != nil {
-			miss("the site's "+slot, err) // left out of Published: Run reports it for a journaled slot
-			continue
+		// A slot not read is left out of Claims or Published: Run reports it.
+		if c, err := awsread.Claim(ctx, s.claims, slot); err != nil {
+			miss("the claim of "+slot, err)
+		} else {
+			in.Claims[slot] = c
 		}
-		in.Published[slot] = p
+		if p, err := awsread.Holding(ctx, s.store, s.verify, in.AnchorSPKI, slot); err != nil {
+			miss("the site's "+slot, err)
+		} else {
+			in.Published[slot] = p
+		}
 	}
 
 	if code, policy, err := awsread.Function(ctx, s.lambda, s.c.function); err != nil {
 		miss("the signer function", err)
+	} else if versions, aliases, err := awsread.VersionsAndAliases(ctx, s.lambda, s.c.function); err != nil {
+		miss("the signer function's versions", err)
 	} else {
 		in.Release = &reconcile.Release{WantCodeSha256: s.c.codeSha256, GotCodeSha256: code,
-			WantPolicy: awsread.Canonical(s.c.policy), GotPolicy: policy}
+			WantPolicy: awsread.Canonical(s.c.policy), GotPolicy: policy, Versions: versions, Aliases: aliases}
 	}
 	return reconcile.Run(in)
 }
@@ -192,9 +233,9 @@ func report(log *slog.Logger, fs []reconcile.Finding) {
 			notices++
 		}
 		attrs := []any{key, f.Rule, "detail", f.Detail}
-		for k, v := range map[string]string{"slot": f.Slot, "digest": f.Digest, "kms_request_id": f.RequestID} {
-			if v != "" {
-				attrs = append(attrs, k, v)
+		for _, kv := range [][2]string{{"slot", f.Slot}, {"digest", f.Digest}, {"r", f.R}, {"kms_request_id", f.RequestID}} {
+			if kv[1] != "" {
+				attrs = append(attrs, kv[0], kv[1])
 			}
 		}
 		if f.Acknowledged {

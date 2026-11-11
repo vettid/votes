@@ -1,6 +1,7 @@
 package awsread
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -9,11 +10,15 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
+	"github.com/aws/aws-sdk-go-v2/service/lambda"
+	lambdatypes "github.com/aws/aws-sdk-go-v2/service/lambda/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
+	"github.com/vettid/votes/signer"
 	"github.com/vettid/votes/site"
 )
 
@@ -89,11 +94,15 @@ func TestKMSSigns(t *testing.T) {
 		rec("r2", "", key, "AccessDeniedException"),
 		rec("r3", "arn:aws:iam::444455556666:role/signer", "arn:aws:kms:us-east-1:444455556666:key/other", ""),
 	}}}
-	got, err := KMSSigns(context.Background(), f, "/trail", key, from, to)
+	got, err := KMSSigns(context.Background(), f, "/trail", from, to)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].RequestID != "r1" || got[0].Principal != "arn:aws:iam::444455556666:role/signer" ||
+	// Every Sign, on any key: one on another key is a finding, never dropped.
+	if len(got) != 3 || got[2].KeyARN != "arn:aws:kms:us-east-1:444455556666:key/other" || got[0].KeyARN != key {
+		t.Fatalf("signs %+v", got)
+	}
+	if got[0].RequestID != "r1" || got[0].Principal != "arn:aws:iam::444455556666:role/signer" ||
 		got[0].Algorithm != "ECDSA_SHA_256" || got[0].MessageType != "DIGEST" ||
 		got[1].ErrorCode != "AccessDeniedException" || got[1].Principal != "arn:aws:sts::444455556666:assumed-role/x/s" {
 		t.Fatalf("signs %+v", got)
@@ -114,23 +123,21 @@ func (f fakeList) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ 
 }
 
 func TestSlots(t *testing.T) {
-	store := &site.MemStorage{}
-	if err := store.PutOnce(context.Background(), "v1/index.json", []byte(`[{"proposal_id":"p1"},{"proposal_id":"p2"}]`), "application/json"); err != nil {
-		t.Fatal(err)
-	}
-	list := fakeList{
-		"v1/p/p1/": {"v1/p/p1/proposal.json", "v1/p/p1/proposal.json.sig", "v1/p/p1/proposal.json.sigstore.json", "v1/p/p1/extension-1.json.sigstore.json"},
-		"v1/p/p2/": {"v1/p/p2/rows.json", "v1/p/p2/x/y.json.sigstore.json"},
-	}
-	got, err := Slots(context.Background(), store, list, "b")
+	list := fakeList{"v1/p/": {"v1/p/p1/proposal.json", "v1/p/p1/proposal.json.sig", "v1/p/p1/proposal.json.sigstore.json",
+		"v1/p/p1/extension-1.json.sigstore.json", "v1/p/p2/rows.json", "v1/p/p2/x/y.json.sigstore.json", "v1/p/p3/results.json.sigstore.json"}}
+	slots, odd, err := Slots(context.Background(), list, "b")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(got, ",") != "p1/proposal,p1/extension-1" {
-		t.Fatalf("slots %v", got)
+	// Every bundle under v1/p/, indexed or not; one that isn't a slot is
+	// returned, never dropped.
+	if strings.Join(slots, ",") != "p1/proposal,p1/extension-1,p3/results" || strings.Join(odd, ",") != "v1/p/p2/x/y.json.sigstore.json" {
+		t.Fatalf("slots %v, odd %v", slots, odd)
 	}
-	if _, err := Slots(context.Background(), &site.MemStorage{}, list, "b"); err == nil {
-		t.Fatal("no index, no error")
+	for _, bad := range []string{"../x/proposal", "p1/other", "p1/proposal/x", "", "p1/extension-0"} {
+		if ValidSlot(bad) {
+			t.Fatalf("%q is a slot", bad)
+		}
 	}
 }
 
@@ -173,5 +180,92 @@ func TestHolding(t *testing.T) {
 func TestCanonical(t *testing.T) {
 	if Canonical("{ \"a\" : [1, 2] }") != `{"a":[1,2]}` || Canonical("not json") != "not json" {
 		t.Fatal("canonical")
+	}
+}
+
+type fakeClaims map[string]*signer.Claim
+
+func (f fakeClaims) Get(_ context.Context, slot string) (*signer.Claim, error) {
+	if slot == "err/proposal" {
+		return nil, errors.New("throttled")
+	}
+	return f[slot], nil
+}
+
+func TestClaim(t *testing.T) {
+	f := fakeClaims{"p1/proposal": {Digest: []byte{1}, Sig: []byte{2}, R: []byte{3}, RequestID: "r1"}}
+	c, err := Claim(context.Background(), f, "p1/proposal")
+	if err != nil || !c.Exists || c.RequestID != "r1" || !bytes.Equal(c.Sig, []byte{2}) {
+		t.Fatalf("%+v %v", c, err)
+	}
+	if c, err := Claim(context.Background(), f, "p2/proposal"); err != nil || c.Exists {
+		t.Fatalf("no claim: %+v %v", c, err)
+	}
+	if _, err := Claim(context.Background(), f, "err/proposal"); err == nil {
+		t.Fatal("an error read as no claim")
+	}
+	if _, err := Claim(context.Background(), f, "../p1/proposal"); err == nil {
+		t.Fatal("not a slot")
+	}
+}
+
+type fakeTrail struct {
+	out *cloudtrail.GetTrailStatusOutput
+}
+
+func (f fakeTrail) GetTrailStatus(context.Context, *cloudtrail.GetTrailStatusInput, ...func(*cloudtrail.Options)) (*cloudtrail.GetTrailStatusOutput, error) {
+	return f.out, nil
+}
+
+func TestTrailProblem(t *testing.T) {
+	now := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+	fresh := now.Add(-5 * time.Minute)
+	stale := now.Add(-time.Hour)
+	for _, c := range []struct {
+		out  cloudtrail.GetTrailStatusOutput
+		want bool
+	}{
+		{cloudtrail.GetTrailStatusOutput{IsLogging: aws.Bool(true), LatestCloudWatchLogsDeliveryTime: &fresh}, false},
+		{cloudtrail.GetTrailStatusOutput{IsLogging: aws.Bool(false), LatestCloudWatchLogsDeliveryTime: &fresh}, true},
+		{cloudtrail.GetTrailStatusOutput{IsLogging: aws.Bool(true), LatestCloudWatchLogsDeliveryTime: &stale}, true},
+		{cloudtrail.GetTrailStatusOutput{IsLogging: aws.Bool(true)}, true},
+		{cloudtrail.GetTrailStatusOutput{IsLogging: aws.Bool(true), LatestCloudWatchLogsDeliveryTime: &fresh, LatestCloudWatchLogsDeliveryError: aws.String("AccessDenied")}, true},
+	} {
+		got, err := TrailProblem(context.Background(), fakeTrail{&c.out}, "t", now)
+		if err != nil || (got != "") != c.want {
+			t.Fatalf("%+v: %q %v", c.out, got, err)
+		}
+	}
+}
+
+type fakeVersions struct {
+	versions []string
+	aliases  []string
+}
+
+func (f fakeVersions) ListVersionsByFunction(context.Context, *lambda.ListVersionsByFunctionInput, ...func(*lambda.Options)) (*lambda.ListVersionsByFunctionOutput, error) {
+	out := &lambda.ListVersionsByFunctionOutput{}
+	for _, v := range f.versions {
+		out.Versions = append(out.Versions, lambdatypes.FunctionConfiguration{Version: aws.String(v)})
+	}
+	return out, nil
+}
+
+func (f fakeVersions) ListAliases(context.Context, *lambda.ListAliasesInput, ...func(*lambda.Options)) (*lambda.ListAliasesOutput, error) {
+	out := &lambda.ListAliasesOutput{}
+	for _, a := range f.aliases {
+		out.Aliases = append(out.Aliases, lambdatypes.AliasConfiguration{Name: aws.String(a)})
+	}
+	return out, nil
+}
+
+func TestVersionsAndAliases(t *testing.T) {
+	v, a, err := VersionsAndAliases(context.Background(), fakeVersions{versions: []string{"$LATEST"}}, "fn")
+	if err != nil || len(v) != 0 || len(a) != 0 {
+		t.Fatalf("only $LATEST: %v %v %v", v, a, err)
+	}
+	v, a, err = VersionsAndAliases(context.Background(), fakeVersions{versions: []string{"$LATEST", "1"}, aliases: []string{"live"}}, "fn")
+	if err != nil || strings.Join(v, ",") != "1" || strings.Join(a, ",") != "live" {
+		t.Fatalf("%v %v %v", v, a, err)
 	}
 }
