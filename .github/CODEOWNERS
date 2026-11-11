@@ -1,6 +1,7 @@
 # The owner reviews a change to the monitor's exceptions, its workflow,
 # its embedded trusted root, the AnchorSigner (its code, its build and
-# each environment's compiled configuration, which the owner signs) and
+# each environment's compiled configuration, which the owner signs), its
+# reconciler (the same) and
 # this file (main is protected: a pull
 # request, one approving review, and code-owner review are required).
 /monitor/                        @mesmerverse
@@ -11,3 +12,7 @@
 /scripts/build-signer.sh         @mesmerverse
 /cmd/anchor-signer/              @mesmerverse
 /signer/                         @mesmerverse
+/scripts/build-reconciler.sh     @mesmerverse
+/cmd/anchor-reconciler/          @mesmerverse
+/reconcile/                      @mesmerverse
+/lambdaenv/                      @mesmerverse

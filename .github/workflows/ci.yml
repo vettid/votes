@@ -41,6 +41,13 @@ jobs:
             e=${f#deploy/signer-}; e=${e%.conf}
             ./scripts/build-signer.sh "$e" "$RUNNER_TEMP/signer-$e"
           done
+          CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/anchor-reconciler
+          # Each environment's reconciler, the same way (scripts/build-reconciler.sh).
+          for f in deploy/reconciler-*.conf; do
+            [ -e "$f" ] || continue
+            e=${f#deploy/reconciler-}; e=${e%.conf}
+            ./scripts/build-reconciler.sh "$e" "$RUNNER_TEMP/reconciler-$e"
+          done
 
   cdk:
     runs-on: ubuntu-26.04

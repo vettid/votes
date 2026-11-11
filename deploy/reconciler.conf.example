@@ -1,0 +1,42 @@
+# The AnchorSigner reconciler's configuration for one environment,
+# compiled into its binary by scripts/build-reconciler.sh <env> (copy this
+# file to deploy/reconciler-<env>.conf; the owner reviews every change,
+# CODEOWNERS). One KEY=VALUE per line; every key is required. The values
+# are public: names, ARNs and hashes, never a secret.
+#
+# Two more files go into the same build:
+# - deploy/signer-policy-<env>.json: the signer function's resource policy
+#   as released (Lambda GetPolicy's Policy, as JSON). A difference alarms
+#   (policy_drift).
+# - monitor/acknowledged-signs-<env>.json: the acknowledged signs, a JSON
+#   array of {rule, slot, digest, r, reason} (r "" for a finding with
+#   none); [] for none. A change is a new
+#   signed release.
+#
+# Region: the signer account's region.
+Region=us-east-1
+# KeyAlias: the anchor key's alias ARN; KeyARN: the key's own ARN, which
+# the alias must resolve to; KeySPKISHA256: the hex SHA-256 of its public
+# key (DER). Either changing alarms (key_drift).
+KeyAlias=arn:aws:kms:us-east-1:000000000000:alias/vettid-anchor-staging
+KeyARN=arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000
+KeySPKISHA256=0000000000000000000000000000000000000000000000000000000000000000
+# ClaimsTable and TrailName: AnchorSigner-<env>'s fixed names.
+ClaimsTable=vettid-anchor-claims-staging
+TrailName=vettid-anchor-staging
+# JournalGroup, JournalStream: AnchorSigner-<env>'s fixed names.
+JournalGroup=/vettid/anchor/staging/journal
+JournalStream=signs
+# TrailGroup: the signer account's trail log group (AnchorSigner-<env>).
+TrailGroup=/vettid/anchor/staging/trail
+# VotesBucket: the votes site's bucket (read only).
+VotesBucket=votes-staging-site
+# Sigstore: staging or production.
+Sigstore=staging
+# SignerFunction and SignerRole: the signer function's name, and its role's ARN.
+SignerFunction=vettid-anchor-signer-staging
+SignerRole=arn:aws:iam::000000000000:role/vettid-anchor-signer-staging
+# CodeSha256: the signer release's CodeSha256, base64 as Lambda reports it
+# (the release record). A difference alarms (code_drift). Each signer
+# release is followed by a reconciler release that names it.
+CodeSha256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
