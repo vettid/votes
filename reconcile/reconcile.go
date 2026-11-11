@@ -53,6 +53,9 @@ const (
 	RuleJournalConflict = "journal_conflict"
 	// RuleUnclaimed: a journaled sign for a slot with no claim.
 	RuleUnclaimed = "unclaimed_sign"
+	// RuleUnkept: a journaled sign for a claim that holds no signature, an
+	// hour on: a live anchor signature that will never be published.
+	RuleUnkept = "unkept_sign"
 	// RuleSignatureMismatch: a journaled signature that doesn't verify
 	// under the anchor key, or whose r isn't the journaled r; a site bundle
 	// that doesn't verify, or whose signature isn't its slot's claim's.
@@ -186,6 +189,14 @@ type Input struct {
 // (the design of record, §6).
 const UnpublishedAfter = time.Hour
 
+// LostAnswerSeverity is how a KMS Sign with no journal sign entry is
+// reported when a note of its attempt explains it and its slot's claim
+// bears the note out (an answer lost): the trail doesn't record what was
+// signed, and the note is written by the role the pass watches, so it
+// stays an alarm until the owner acknowledges it (pending the owner's
+// answer on GC #8202; fail secure meanwhile).
+const LostAnswerSeverity = Alarm
+
 // Run checks one pass's input and returns its findings, sorted.
 func Run(in Input) []Finding {
 	var out []Finding
@@ -220,6 +231,7 @@ func Run(in Input) []Finding {
 	byID := map[string][]signer.SignEntry{}
 	byDR := map[string][]signer.SignEntry{}
 	rsByDigest := map[string][]string{}
+	secondNoted := map[string]bool{} // digest/r already reported as a second sign
 	for _, s := range signs {
 		slot := s.ProposalID + "/" + s.Name
 		byID[s.KMSRequestID] = append(byID[s.KMSRequestID], s)
@@ -227,6 +239,7 @@ func Run(in Input) []Finding {
 		byDR[dr] = append(byDR[dr], s)
 		if len(byDR[dr]) == 1 {
 			if n := len(rsByDigest[h(s.Digest)]); n > 0 {
+				secondNoted[dr] = true
 				add(Finding{Rule: RuleSecondSign, Severity: Notice, Slot: slot, Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID,
 					Detail: fmt.Sprintf("signature %d for a digest already signed", n+1)})
 			}
@@ -272,10 +285,23 @@ func Run(in Input) []Finding {
 			f.Rule, f.Severity, f.Detail = RuleJournalConflict, Alarm, "a sign for another digest than the slot's claim"
 		case bytes.Equal(c.R, s.R) && (c.RequestID != s.KMSRequestID || !bytes.Equal(c.Sig, s.Signature)):
 			f.Rule, f.Severity, f.Detail = RuleJournalConflict, Alarm, "the kept signature journaled under another request id or signature than the claim's"
-		default:
-			if bytes.Equal(c.R, s.R) {
-				kept[h(s.Signature)] = true
+		case bytes.Equal(c.R, s.R):
+			kept[h(s.Signature)] = true
+			continue
+		case len(c.Sig) > 0:
+			// The slot kept another signature of this digest: this one is a
+			// second sign, reported from the claim (whatever the period).
+			if !secondNoted[h(s.Digest)+"/"+h(s.R)] {
+				f.Rule, f.Severity, f.Detail = RuleSecondSign, Notice, "a signature of the slot's digest other than the one its claim kept"
+				break
 			}
+			continue
+		case in.Now.Sub(s.At) >= UnpublishedAfter:
+			// A claim holding no signature an hour after a sign: the sign was
+			// never kept, and never will be published. It's a live anchor
+			// signature nobody accounts for.
+			f.Rule, f.Severity, f.Detail = RuleUnkept, Alarm, "a sign for a claim that holds no signature, an hour on"
+		default:
 			continue
 		}
 		add(f)
@@ -311,24 +337,35 @@ func Run(in Input) []Finding {
 		case len(byID[k.RequestID]) > 0:
 			continue
 		default:
-			if i, ok := noteNaming(in.Notes, k.RequestID, usedNote); ok {
-				n := in.Notes[i]
-				usedNote[i] = true
-				f.Severity, f.Slot, f.Digest = Notice, n.ProposalID+"/"+n.Name, h(n.Digest)
-				f.Detail = "a Sign its call journaled as " + n.Kind
-				if n.Kind == signer.NoteUnkept && pub != nil && len(n.Signature) > 0 {
-					if !ecdsa.VerifyASN1(pub, n.Digest, n.Signature) {
-						f.Severity, f.Rule = Alarm, RuleSignatureMismatch
-						f.Detail = "a signature journaled as not kept that doesn't verify under the anchor key"
-					}
-				}
-			} else if i, ok := loneIntent(in.Notes, k.At, attemptSigned, usedNote); ok {
-				n := in.Notes[i]
-				usedNote[i] = true
-				f.Severity, f.Slot, f.Digest = Notice, n.ProposalID+"/"+n.Name, h(n.Digest)
-				f.Detail = "a Sign inside a sign_intent's lease whose attempt has no sign entry (an answer lost)"
-			} else {
+			i, ok := noteNaming(in.Notes, k.RequestID, usedNote)
+			how := ""
+			if ok {
+				how = "its call journaled it as " + in.Notes[i].Kind
+			} else if i, ok = loneIntent(in.Notes, k.At, attemptSigned, usedNote); ok {
+				how = "inside a sign_intent's lease whose attempt has no sign entry"
+			}
+			if !ok {
 				f.Detail = "a Sign with no journal entry"
+				break
+			}
+			n := in.Notes[i]
+			useAttempt(in.Notes, n, usedNote, i)
+			f.Slot, f.Digest = n.ProposalID+"/"+n.Name, h(n.Digest)
+			// A note is written by the role the pass watches, so it's taken
+			// only as far as the claim bears it out: the note's slot has a
+			// claim, for the note's digest. Even then the trail doesn't say
+			// what was signed, so the Sign is reported at LostAnswerSeverity.
+			c, read := in.Claims[f.Slot]
+			switch {
+			case !read:
+				f.Rule, f.Detail = RuleIncomplete, "the claim of a note's slot was not read"
+			case !c.Exists || !bytes.Equal(c.Digest, n.Digest):
+				f.Detail = "a Sign a note explains, for a slot whose claim doesn't bear the note out (" + how + ")"
+			case n.Kind == signer.NoteUnkept && (pub == nil || len(n.Signature) == 0 || !ecdsa.VerifyASN1(pub, c.Digest, n.Signature)):
+				f.Rule, f.Detail = RuleSignatureMismatch, "a signature journaled as not kept that doesn't verify over its slot's digest"
+			default:
+				f.Severity = LostAnswerSeverity
+				f.Detail = "a Sign the journal has no entry for, " + how + " (an answer lost): what it signed isn't known"
 			}
 		}
 		add(f)
@@ -444,6 +481,20 @@ func noteNaming(notes []signer.NoteEntry, id string, used map[int]bool) (int, bo
 		}
 	}
 	return 0, false
+}
+
+// useAttempt marks a note used, and every note of its attempt: one
+// attempt excuses one Sign.
+func useAttempt(notes []signer.NoteEntry, n signer.NoteEntry, used map[int]bool, i int) {
+	used[i] = true
+	if n.AttemptID == "" {
+		return
+	}
+	for j, o := range notes {
+		if o.AttemptID == n.AttemptID {
+			used[j] = true
+		}
+	}
 }
 
 // loneIntent finds an unused sign_intent whose lease window holds t and

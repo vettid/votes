@@ -354,9 +354,29 @@ func Claim(ctx context.Context, c ClaimsAPI, slot string) (reconcile.Claim, erro
 	return reconcile.Claim{Exists: true, Digest: cl.Digest, Sig: cl.Sig, R: cl.R, RequestID: cl.RequestID}, nil
 }
 
-// TrailAPI reads the trail's status.
+// TrailAPI reads the trail's status and its event selectors.
 type TrailAPI interface {
 	GetTrailStatus(ctx context.Context, in *cloudtrail.GetTrailStatusInput, opts ...func(*cloudtrail.Options)) (*cloudtrail.GetTrailStatusOutput, error)
+	GetEventSelectors(ctx context.Context, in *cloudtrail.GetEventSelectorsInput, opts ...func(*cloudtrail.Options)) (*cloudtrail.GetEventSelectorsOutput, error)
+}
+
+// recordsAllManagement reports whether the trail's selectors record every
+// management event, read and write: one advanced selector whose only
+// field is eventCategory = Management (as AnchorSigner-<env> sets it).
+// Anything narrower (write only, KMS excluded) and the pass's view of the
+// Signs is partial.
+func recordsAllManagement(out *cloudtrail.GetEventSelectorsOutput) bool {
+	for _, sel := range out.AdvancedEventSelectors {
+		if len(sel.FieldSelectors) != 1 {
+			continue
+		}
+		f := sel.FieldSelectors[0]
+		if aws.ToString(f.Field) == "eventCategory" && len(f.Equals) == 1 && f.Equals[0] == "Management" &&
+			len(f.NotEquals) == 0 && len(f.StartsWith) == 0 && len(f.NotStartsWith) == 0 && len(f.EndsWith) == 0 && len(f.NotEndsWith) == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // TrailDeliveryLimit is how long the trail's log group may go without a
@@ -377,6 +397,13 @@ func TrailProblem(ctx context.Context, c TrailAPI, trail string, now time.Time) 
 		return "the trail's delivery to its log group fails: " + aws.ToString(st.LatestCloudWatchLogsDeliveryError), nil
 	case st.LatestCloudWatchLogsDeliveryTime == nil || now.Sub(*st.LatestCloudWatchLogsDeliveryTime) > TrailDeliveryLimit:
 		return "the trail hasn't delivered to its log group in " + TrailDeliveryLimit.String(), nil
+	}
+	sel, err := c.GetEventSelectors(ctx, &cloudtrail.GetEventSelectorsInput{TrailName: aws.String(trail)})
+	if err != nil {
+		return "", fmt.Errorf("the trail's selectors: %w", err)
+	}
+	if !recordsAllManagement(sel) {
+		return "the trail doesn't record every management event (its selectors were narrowed)", nil
 	}
 	return "", nil
 }

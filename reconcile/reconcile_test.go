@@ -9,6 +9,7 @@ import (
 	"encoding/asn1"
 	"encoding/hex"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,52 +189,104 @@ func TestUnattributed(t *testing.T) {
 		t.Fatalf("a Sign with no entry: %v", r)
 	}
 
-	// Inside a lone intent's lease (its attempt has no sign entry): a
-	// notice, once. A second Sign in the same lease alarms (review H2).
+	// A Sign a note explains, its slot's claim bearing the note out (an
+	// answer lost): reported at LostAnswerSeverity (an alarm: the trail
+	// doesn't say what was signed). One attempt excuses one Sign.
+	d2 := sha256.Sum256([]byte("doc two"))
 	intent := signer.NoteEntry{Kind: signer.NoteIntent, At: at.Add(-5 * time.Second), LeaseUntil: at.Add(30 * time.Second),
-		ProposalID: "p2", Name: "proposal", AttemptID: "a-lost"}
-	in = f.clean()
+		ProposalID: "p2", Name: "proposal", AttemptID: "a-lost", Digest: d2[:]}
+	withClaim := func() Input {
+		in := f.clean()
+		in.Claims["p2/proposal"] = Claim{Exists: true, Digest: d2[:]}
+		return in
+	}
+	lost := func(fs []Finding) *Finding {
+		for i := range fs {
+			if fs[i].Rule == RuleUnattributed && strings.Contains(fs[i].Detail, "an answer lost") {
+				return &fs[i]
+			}
+		}
+		return nil
+	}
+	in = withClaim()
 	in.KMSSigns = append(in.KMSSigns, f.kms("req-x", at))
 	in.Notes = []signer.NoteEntry{intent}
-	if fs := Run(in); count(fs, RuleUnattributed) != 1 || rules(fs)[RuleUnattributed] != Notice {
+	fs := Run(in)
+	if l := lost(fs); l == nil || l.Severity != LostAnswerSeverity || count(fs, RuleUnattributed) != 1 {
 		t.Fatalf("a Sign in a lone intent's lease: %+v", fs)
 	}
+	if LostAnswerSeverity != Alarm {
+		t.Fatal("a lost answer must stay an alarm until the owner acknowledges it")
+	}
+	// A second Sign in the same lease isn't excused.
 	in.KMSSigns = append(in.KMSSigns, f.kms("req-y", at.Add(time.Second)))
-	if r := rules(Run(in)); r[RuleUnattributed] != Alarm {
-		t.Fatalf("two Signs on one intent: %v", r)
+	if fs := Run(in); count(fs, RuleUnattributed) != 2 || lost(fs) == nil {
+		t.Fatalf("two Signs on one intent: %+v", fs)
+	}
+	for _, x := range Run(in) {
+		if x.RequestID == "req-y" && strings.Contains(x.Detail, "an answer lost") {
+			t.Fatalf("the second Sign excused too: %+v", x)
+		}
+	}
+	// The intent and the outcome note of one attempt excuse one Sign, not two.
+	in = withClaim()
+	in.KMSSigns = append(in.KMSSigns, f.kms("req-x", at), f.kms("req-y", at.Add(time.Second)))
+	in.Notes = []signer.NoteEntry{intent, {Kind: signer.NoteOutcomeUnknown, At: at, KMSRequestID: "req-x", ProposalID: "p2", Name: "proposal",
+		AttemptID: "a-lost", Digest: d2[:]}}
+	excused := 0
+	for _, x := range Run(in) {
+		if strings.Contains(x.Detail, "an answer lost") {
+			excused++
+		}
+	}
+	if excused != 1 {
+		t.Fatalf("one attempt excused %d Signs", excused)
 	}
 	// An intent whose attempt has its own sign entry excuses nothing.
-	in = f.clean()
+	in = withClaim()
 	in.KMSSigns = append(in.KMSSigns, f.kms("req-x", at))
 	signedIntent := intent
 	signedIntent.AttemptID = "a1"
 	in.Notes = []signer.NoteEntry{signedIntent}
-	if r := rules(Run(in)); r[RuleUnattributed] != Alarm {
-		t.Fatalf("an intent whose attempt signed: %v", r)
+	if fs := Run(in); lost(fs) != nil || count(fs, RuleUnattributed) != 1 {
+		t.Fatalf("an intent whose attempt signed: %+v", fs)
 	}
 	// Another kind of note doesn't excuse it.
 	in.Notes[0].Kind, in.Notes[0].AttemptID = signer.NoteRetimestamp, "a-lost"
-	if r := rules(Run(in)); r[RuleUnattributed] != Alarm {
-		t.Fatalf("a Sign inside a non-intent note: %v", r)
+	if fs := Run(in); lost(fs) != nil {
+		t.Fatalf("a Sign inside a non-intent note: %+v", fs)
 	}
-
-	// A note naming the request id (outcome unknown, or not kept): a
-	// notice; a not-kept signature that doesn't verify alarms.
+	// A note whose slot has no claim, or whose digest isn't the claim's
+	// (a note forged by the role the pass watches): not borne out.
+	for _, c := range []Claim{{}, {Exists: true, Digest: []byte("another")}} {
+		in = withClaim()
+		in.Claims["p2/proposal"] = c
+		in.KMSSigns = append(in.KMSSigns, f.kms("req-x", at))
+		in.Notes = []signer.NoteEntry{intent}
+		if fs := Run(in); lost(fs) != nil || rules(fs)[RuleUnattributed] != Alarm {
+			t.Fatalf("a note its claim doesn't bear out (%+v): %+v", c, fs)
+		}
+	}
+	// The note's claim not read: incomplete.
 	in = f.clean()
 	in.KMSSigns = append(in.KMSSigns, f.kms("req-x", at))
-	in.Notes = []signer.NoteEntry{{Kind: signer.NoteOutcomeUnknown, At: at, KMSRequestID: "req-x", ProposalID: "p2", Name: "proposal"}}
-	if r := rules(Run(in)); r[RuleUnattributed] != Notice {
-		t.Fatalf("an outcome-unknown Sign: %v", r)
+	in.Notes = []signer.NoteEntry{intent}
+	if r := rules(Run(in)); r[RuleIncomplete] != Alarm {
+		t.Fatalf("a note's claim not read: %v", r)
 	}
+	// A not-kept signature over another digest than its slot's: an alarm.
+	in = withClaim()
+	in.KMSSigns = append(in.KMSSigns, f.kms("req-x", at))
 	unkept := f.sign("p2", "proposal", "doc two", "req-x", "a3", at)
 	in.Notes = []signer.NoteEntry{{Kind: signer.NoteUnkept, At: at, KMSRequestID: "req-x", ProposalID: "p2", Name: "proposal",
-		Digest: unkept.Digest, Signature: unkept.Signature, R: unkept.R}}
-	if r := rules(Run(in)); r[RuleUnattributed] != Notice {
-		t.Fatalf("an unkept Sign: %v", r)
+		Digest: d2[:], Signature: unkept.Signature, R: unkept.R}}
+	if fs := Run(in); lost(fs) == nil {
+		t.Fatalf("an unkept Sign over its slot's digest: %+v", fs)
 	}
-	in.Notes[0].Signature = in.Signs[0].Signature // over another digest
+	attacker := f.sign("p2", "proposal", "the attacker's digest", "req-x", "a3", at)
+	in.Notes[0].Signature = attacker.Signature
 	if r := rules(Run(in)); r[RuleSignatureMismatch] != Alarm {
-		t.Fatalf("an unkept signature that doesn't verify: %v", r)
+		t.Fatalf("an unkept signature over another digest: %v", r)
 	}
 
 	// Another key, principal, algorithm or message type: an alarm, even
@@ -449,5 +502,37 @@ func TestAnchorKeyP256(t *testing.T) {
 	spki, _ := x509.MarshalPKIXPublicKey(&k.PublicKey)
 	if _, err := anchorKey(spki); err == nil {
 		t.Fatal("a P-384 key accepted")
+	}
+}
+
+// A sign that isn't its slot's kept one (review N1): the attacker makes
+// a claim for their own digest with the signer's own Create, signs it and
+// journals it. It never passes silently.
+func TestNotKeptSigns(t *testing.T) {
+	f := newFixture(t)
+	in := f.clean()
+	evil := f.sign("pQ", "proposal", "the attacker's digest", "req-e", "ae", f.now.Add(-90*time.Minute))
+	in.Signs = append(in.Signs, evil)
+	in.KMSSigns = append(in.KMSSigns, f.kms("req-e", evil.At))
+	in.Claims["pQ/proposal"] = Claim{Exists: true, Digest: evil.Digest} // no signature kept
+	in.Published["pQ/proposal"] = Published{}
+	if r := rules(Run(in)); r[RuleUnkept] != Alarm {
+		t.Fatalf("a sign for a claim holding no signature, an hour on: %v", r)
+	}
+	// Within the hour: not yet (the call may still be keeping it).
+	in.Signs[1].At, in.KMSSigns[1].At = f.now.Add(-30*time.Minute), f.now.Add(-30*time.Minute)
+	if r := rules(Run(in)); r[RuleUnkept] != "" {
+		t.Fatalf("within the hour: %v", r)
+	}
+	// The claim kept another signature of the digest: a second sign,
+	// reported from the claim even with the kept one outside the period.
+	in = f.clean()
+	kept := in.Signs[0]
+	again := f.sign("p1", "proposal", "doc one", "req-2", "a2", kept.At.Add(time.Minute))
+	in.Signs = []signer.SignEntry{again}
+	in.KMSSigns = []KMSSign{f.kms("req-2", again.At)}
+	fs := Run(in)
+	if r := rules(fs); r[RuleSecondSign] != Notice || count(fs, RuleSecondSign) != 1 {
+		t.Fatalf("a second sign, the kept one outside the period: %+v", fs)
 	}
 }

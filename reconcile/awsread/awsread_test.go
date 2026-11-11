@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
+	cttypes "github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
@@ -211,11 +214,18 @@ func TestClaim(t *testing.T) {
 
 type fakeTrail struct {
 	out *cloudtrail.GetTrailStatusOutput
+	sel []cttypes.AdvancedEventSelector
 }
 
 func (f fakeTrail) GetTrailStatus(context.Context, *cloudtrail.GetTrailStatusInput, ...func(*cloudtrail.Options)) (*cloudtrail.GetTrailStatusOutput, error) {
 	return f.out, nil
 }
+
+func (f fakeTrail) GetEventSelectors(context.Context, *cloudtrail.GetEventSelectorsInput, ...func(*cloudtrail.Options)) (*cloudtrail.GetEventSelectorsOutput, error) {
+	return &cloudtrail.GetEventSelectorsOutput{AdvancedEventSelectors: f.sel}, nil
+}
+
+var allManagement = []cttypes.AdvancedEventSelector{{FieldSelectors: []cttypes.AdvancedFieldSelector{{Field: aws.String("eventCategory"), Equals: []string{"Management"}}}}}
 
 func TestTrailProblem(t *testing.T) {
 	now := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
@@ -231,9 +241,18 @@ func TestTrailProblem(t *testing.T) {
 		{cloudtrail.GetTrailStatusOutput{IsLogging: aws.Bool(true)}, true},
 		{cloudtrail.GetTrailStatusOutput{IsLogging: aws.Bool(true), LatestCloudWatchLogsDeliveryTime: &fresh, LatestCloudWatchLogsDeliveryError: aws.String("AccessDenied")}, true},
 	} {
-		got, err := TrailProblem(context.Background(), fakeTrail{&c.out}, "t", now)
+		got, err := TrailProblem(context.Background(), fakeTrail{&c.out, allManagement}, "t", now)
 		if err != nil || (got != "") != c.want {
 			t.Fatalf("%+v: %q %v", c.out, got, err)
+		}
+	}
+	// Selectors narrowed (write only, or none): a problem.
+	ok := cloudtrail.GetTrailStatusOutput{IsLogging: aws.Bool(true), LatestCloudWatchLogsDeliveryTime: &fresh}
+	writeOnly := []cttypes.AdvancedEventSelector{{FieldSelectors: []cttypes.AdvancedFieldSelector{
+		{Field: aws.String("eventCategory"), Equals: []string{"Management"}}, {Field: aws.String("readOnly"), Equals: []string{"false"}}}}}
+	for _, sel := range [][]cttypes.AdvancedEventSelector{nil, writeOnly} {
+		if got, err := TrailProblem(context.Background(), fakeTrail{&ok, sel}, "t", now); err != nil || got == "" {
+			t.Fatalf("selectors %+v: %q %v", sel, got, err)
 		}
 	}
 }
@@ -267,5 +286,22 @@ func TestVersionsAndAliases(t *testing.T) {
 	v, a, err = VersionsAndAliases(context.Background(), fakeVersions{versions: []string{"$LATEST", "1"}, aliases: []string{"live"}}, "fn")
 	if err != nil || strings.Join(v, ",") != "1" || strings.Join(a, ",") != "live" {
 		t.Fatalf("%v %v %v", v, a, err)
+	}
+}
+
+// The slot pattern's names are the site's own (site/site.go nameRe): a
+// name the site adds and this doesn't fails here, not silently in a pass.
+func TestSlotNamesAreTheSite(t *testing.T) {
+	src, err := os.ReadFile("../../site/site.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`var nameRe = regexp\.MustCompile\(` + "`" + `\^\(([^` + "`" + `]*)\)\$` + "`" + `\)`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("the site's nameRe isn't where it was")
+	}
+	site := strings.ReplaceAll(string(m[1]), "extension-([1-9][0-9]?)", "extension-[1-9][0-9]?")
+	if !strings.Contains(slotRe.String(), "/("+site+")$") {
+		t.Fatalf("slot names %s, the site's %s", slotRe, site)
 	}
 }

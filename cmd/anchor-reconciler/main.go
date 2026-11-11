@@ -182,6 +182,13 @@ func (s *sources) pass(ctx context.Context) []reconcile.Finding {
 	for _, e := range in.Signs {
 		slots[e.ProposalID+"/"+e.Name] = true
 	}
+	// Notes' slots too: a note excuses a Sign only as far as its slot's
+	// claim bears it out.
+	for _, n := range in.Notes {
+		if n.ProposalID != "" {
+			slots[n.ProposalID+"/"+n.Name] = true
+		}
+	}
 	held, odd, err := awsread.Slots(ctx, s.list, s.c.bucket)
 	if err != nil {
 		miss("the site's listing", err)
