@@ -9,6 +9,14 @@
 // Run is pure: the reading is the adapters' (cmd/anchor-reconciler).
 // What it can't confirm it reports: an input it wasn't given is never
 // taken as fine.
+//
+// Times: nothing the signer role writes gates a check. A sign's age is
+// KMS's own time for its request id, else the entry's ingestion time;
+// the entry's At is only compared with them. The one role-set time left is
+// a log event's timestamp, which decides which runs read an entry at all:
+// moving it can only shift findings between runs (a KMS Sign seen without
+// its entry is unattributed_sign), never remove them. Don't start trusting
+// it.
 package reconcile
 
 import (
@@ -423,12 +431,12 @@ func Run(in Input) []Finding {
 	}
 	trailFrom := in.From.Add(in.TrailLag)
 	for _, s := range signs {
-		// The window by the entry's ingestion (the writer can't set it).
-		t, ok := in.Ingested[SignKey(s)]
-		if !ok {
-			t = s.At
+		// The window by the entry's ingestion (the writer can't set it); an
+		// entry without one is checked, never skipped on its own At.
+		if kmsByID[s.KMSRequestID] {
+			continue
 		}
-		if t.Before(trailFrom) || t.After(settled) || kmsByID[s.KMSRequestID] {
+		if t, ok := in.Ingested[SignKey(s)]; ok && (t.Before(trailFrom) || t.After(settled)) {
 			continue
 		}
 		add(Finding{Rule: RuleTrailMissing, Severity: Alarm, Slot: s.ProposalID + "/" + s.Name,
