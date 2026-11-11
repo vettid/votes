@@ -159,7 +159,11 @@ type Input struct {
 	// TrailLag is how long the trail may take to show a call.
 	TrailLag time.Duration
 
-	Signs       []signer.SignEntry
+	Signs []signer.SignEntry
+	// Ingested is each sign entry's ingestion time (by SignKey), set by
+	// CloudWatch Logs: the entry's own At is the writer's, and the writer
+	// is the role the pass watches.
+	Ingested    map[string]time.Time
 	Completions []signer.CompletionEntry
 	Notes       []signer.NoteEntry
 	KMSSigns    []KMSSign
@@ -185,6 +189,15 @@ type Input struct {
 	Incomplete []string
 }
 
+// SignKey names one sign entry: its request id and signature.
+func SignKey(s signer.SignEntry) string {
+	return s.KMSRequestID + "/" + hex.EncodeToString(s.Signature)
+}
+
+// ClockSkew is how far a sign entry's At may be from KMS's own time for
+// its request id (or from now, ahead of it) before it's a conflict.
+const ClockSkew = 5 * time.Minute
+
 // UnpublishedAfter is how long a kept sign may wait for its publication
 // (the design of record, §6).
 const UnpublishedAfter = time.Hour
@@ -193,8 +206,8 @@ const UnpublishedAfter = time.Hour
 // reported when a note of its attempt explains it and its slot's claim
 // bears the note out (an answer lost): the trail doesn't record what was
 // signed, and the note is written by the role the pass watches, so it
-// stays an alarm until the owner acknowledges it (pending the owner's
-// answer on GC #8202; fail secure meanwhile).
+// stays an alarm until the owner acknowledges it (the owner's decision,
+// GC #8202).
 const LostAnswerSeverity = Alarm
 
 // Run checks one pass's input and returns its findings, sorted.
@@ -230,21 +243,11 @@ func Run(in Input) []Finding {
 	}
 	byID := map[string][]signer.SignEntry{}
 	byDR := map[string][]signer.SignEntry{}
-	rsByDigest := map[string][]string{}
-	secondNoted := map[string]bool{} // digest/r already reported as a second sign
 	for _, s := range signs {
 		slot := s.ProposalID + "/" + s.Name
 		byID[s.KMSRequestID] = append(byID[s.KMSRequestID], s)
 		dr := h(s.Digest) + "/" + h(s.R)
 		byDR[dr] = append(byDR[dr], s)
-		if len(byDR[dr]) == 1 {
-			if n := len(rsByDigest[h(s.Digest)]); n > 0 {
-				secondNoted[dr] = true
-				add(Finding{Rule: RuleSecondSign, Severity: Notice, Slot: slot, Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID,
-					Detail: fmt.Sprintf("signature %d for a digest already signed", n+1)})
-			}
-			rsByDigest[h(s.Digest)] = append(rsByDigest[h(s.Digest)], h(s.R))
-		}
 		if s.KMSRequestID == "" {
 			add(Finding{Rule: RuleJournalConflict, Severity: Alarm, Slot: slot, Digest: h(s.Digest), R: h(s.R), Detail: "a sign entry with no request id"})
 		}
@@ -268,10 +271,48 @@ func Run(in Input) []Finding {
 		}
 	}
 
+	// Each sign's time, from what the signer role can't write: KMS's own
+	// time for its request id, else the entry's ingestion time. Its At must
+	// agree, and isn't ahead of now: a forward-dated entry would otherwise
+	// put off every age check.
+	kmsAt := map[string]time.Time{}
+	for _, k := range in.KMSSigns {
+		if k.ErrorCode == "" {
+			kmsAt[k.RequestID] = k.At
+		}
+	}
+	signedAt := func(s signer.SignEntry) (time.Time, bool) {
+		if t, ok := kmsAt[s.KMSRequestID]; ok {
+			return t, true
+		}
+		t, ok := in.Ingested[SignKey(s)]
+		return t, ok && !t.IsZero()
+	}
+	for _, s := range signs {
+		f := Finding{Rule: RuleJournalConflict, Severity: Alarm, Slot: s.ProposalID + "/" + s.Name, Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID}
+		if t, ok := kmsAt[s.KMSRequestID]; ok && (s.At.Sub(t) > ClockSkew || t.Sub(s.At) > ClockSkew) {
+			f.Detail = fmt.Sprintf("a sign entry dated %s, its KMS Sign at %s", s.At.UTC().Format(time.RFC3339), t.UTC().Format(time.RFC3339))
+			add(f)
+		} else if s.At.Sub(in.Now) > ClockSkew {
+			f.Detail = "a sign entry dated ahead of now"
+			add(f)
+		}
+		if _, ok := signedAt(s); !ok {
+			add(Finding{Rule: RuleIncomplete, Severity: Alarm, Slot: f.Slot, RequestID: s.KMSRequestID, Detail: "no trusted time for a sign entry (neither KMS's nor its ingestion's)"})
+		}
+	}
+	age := func(s signer.SignEntry) time.Duration {
+		if t, ok := signedAt(s); ok {
+			return in.Now.Sub(t)
+		}
+		return in.Now.Sub(s.At) // reported incomplete above
+	}
+
 	// Each sign against its slot's claim, the long-term record: the kept
 	// signature must be journaled under the claim's request id; any sign
 	// is for the claim's digest.
-	kept := map[string]bool{} // h(signature) of journaled signs that are their slot's kept one
+	kept := map[string]bool{}        // h(signature) of journaled signs that are their slot's kept one
+	secondNoted := map[string]bool{} // slot/r already reported as a second sign
 	for _, s := range signs {
 		slot := s.ProposalID + "/" + s.Name
 		f := Finding{Slot: slot, Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID}
@@ -290,13 +331,15 @@ func Run(in Input) []Finding {
 			continue
 		case len(c.Sig) > 0:
 			// The slot kept another signature of this digest: this one is a
-			// second sign, reported from the claim (whatever the period).
-			if !secondNoted[h(s.Digest)+"/"+h(s.R)] {
+			// second sign, reported from the claim (whatever the period),
+			// once per slot and r.
+			if k := slot + "/" + h(s.R); !secondNoted[k] {
+				secondNoted[k] = true
 				f.Rule, f.Severity, f.Detail = RuleSecondSign, Notice, "a signature of the slot's digest other than the one its claim kept"
 				break
 			}
 			continue
-		case in.Now.Sub(s.At) >= UnpublishedAfter:
+		case age(s) >= UnpublishedAfter:
 			// A claim holding no signature an hour after a sign: the sign was
 			// never kept, and never will be published. It's a live anchor
 			// signature nobody accounts for.
@@ -380,7 +423,12 @@ func Run(in Input) []Finding {
 	}
 	trailFrom := in.From.Add(in.TrailLag)
 	for _, s := range signs {
-		if s.At.Before(trailFrom) || s.At.After(settled) || kmsByID[s.KMSRequestID] {
+		// The window by the entry's ingestion (the writer can't set it).
+		t, ok := in.Ingested[SignKey(s)]
+		if !ok {
+			t = s.At
+		}
+		if t.Before(trailFrom) || t.After(settled) || kmsByID[s.KMSRequestID] {
 			continue
 		}
 		add(Finding{Rule: RuleTrailMissing, Severity: Alarm, Slot: s.ProposalID + "/" + s.Name,
@@ -390,7 +438,7 @@ func Run(in Input) []Finding {
 	// unpublished_sign: each kept sign, an hour on, held by the site.
 	for _, s := range signs {
 		slot := s.ProposalID + "/" + s.Name
-		if !kept[h(s.Signature)] || in.Now.Sub(s.At) < UnpublishedAfter {
+		if !kept[h(s.Signature)] || age(s) < UnpublishedAfter {
 			continue
 		}
 		p, read := in.Published[slot]

@@ -536,3 +536,48 @@ func TestNotKeptSigns(t *testing.T) {
 		t.Fatalf("a second sign, the kept one outside the period: %+v", fs)
 	}
 }
+
+// Every age check by a time the signer role can't write (review T1): a
+// forward-dated entry for a self-made claim is a conflict, and still ages
+// by KMS's own time.
+func TestTrustedTime(t *testing.T) {
+	f := newFixture(t)
+	in := f.clean()
+	evil := f.sign("pQ", "proposal", "the attacker's digest", "req-e", "ae", time.Date(2036, 1, 1, 0, 0, 0, 0, time.UTC))
+	signedAt := f.now.Add(-90 * time.Minute)
+	in.Signs = append(in.Signs, evil)
+	in.KMSSigns = append(in.KMSSigns, f.kms("req-e", signedAt))
+	in.Claims["pQ/proposal"] = Claim{Exists: true, Digest: evil.Digest}
+	in.Published["pQ/proposal"] = Published{}
+	r := rules(Run(in))
+	if r[RuleJournalConflict] != Alarm || r[RuleUnkept] != Alarm {
+		t.Fatalf("a forward-dated entry: %v", r)
+	}
+	// With no KMS time (the trail not read), the ingestion time.
+	in.KMSSigns = in.KMSSigns[:1]
+	in.Ingested = map[string]time.Time{SignKey(in.Signs[0]): in.Signs[0].At, SignKey(evil): signedAt}
+	r = rules(Run(in))
+	if r[RuleJournalConflict] != Alarm || r[RuleUnkept] != Alarm {
+		t.Fatalf("a forward-dated entry, by ingestion: %v", r)
+	}
+	// A kept sign, forward-dated: unpublished still fires by KMS's time.
+	in = f.clean()
+	in.Signs[0].At = time.Date(2036, 1, 1, 0, 0, 0, 0, time.UTC)
+	in.Claims["p1/proposal"] = claimOf(in.Signs[0])
+	in.Published["p1/proposal"] = Published{}
+	if r := rules(Run(in)); r[RuleUnpublished] != Alarm || r[RuleJournalConflict] != Alarm {
+		t.Fatalf("a kept sign forward-dated: %v", r)
+	}
+	// An entry dated far from its KMS Sign.
+	in = f.clean()
+	in.KMSSigns[0].At = in.Signs[0].At.Add(-20 * time.Minute)
+	if r := rules(Run(in)); r[RuleJournalConflict] != Alarm {
+		t.Fatalf("an entry 20 minutes from its KMS Sign: %v", r)
+	}
+	// No trusted time at all: incomplete.
+	in = f.clean()
+	in.KMSSigns = nil
+	if fs := Run(in); count(fs, RuleIncomplete) != 1 {
+		t.Fatalf("no trusted time: %+v", fs)
+	}
+}

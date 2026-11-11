@@ -60,8 +60,10 @@ func (f fakeLogs) FilterLogEvents(_ context.Context, in *cloudwatchlogs.FilterLo
 		return nil, errors.New("ResourceNotFoundException")
 	}
 	out := &cloudwatchlogs.FilterLogEventsOutput{}
+	// Ingested as CloudWatch Logs would: just after the sign.
+	ingested := time.Date(2026, 11, 11, 10, 30, 2, 0, time.UTC).UnixMilli()
 	for _, m := range msgs {
-		out.Events = append(out.Events, cwltypes.FilteredLogEvent{Message: aws.String(m)})
+		out.Events = append(out.Events, cwltypes.FilteredLogEvent{Message: aws.String(m), IngestionTime: aws.Int64(ingested)})
 	}
 	return out, nil
 }

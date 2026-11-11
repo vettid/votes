@@ -39,7 +39,7 @@ func (f *fakeLogs) FilterLogEvents(_ context.Context, in *cloudwatchlogs.FilterL
 	}
 	out := &cloudwatchlogs.FilterLogEventsOutput{}
 	for _, m := range f.pages[i] {
-		out.Events = append(out.Events, cwltypes.FilteredLogEvent{Message: aws.String(m)})
+		out.Events = append(out.Events, cwltypes.FilteredLogEvent{Message: aws.String(m), IngestionTime: aws.Int64(1794394800000)})
 	}
 	if i+1 < len(f.pages) {
 		out.NextToken = aws.String(string(rune('0' + i + 1)))
@@ -58,13 +58,16 @@ func TestJournal(t *testing.T) {
 			`{"kind":"sign","kms_request_id":"r1","at":"2026-11-11T10:00:01Z","proposal_id":"p1","name":"proposal","digest":"AQI=","signature":"AwQ=","r":"BQ=="}`},
 		{`{"kind":"complete","at":"2026-11-11T10:00:09Z","proposal_id":"p1","name":"proposal","digest":"AQI=","r":"BQ==","site_status":201}`},
 	}}
-	signs, done, notes, err := Journal(context.Background(), f, "/j", "signs", from, to)
+	signs, done, notes, ingested, err := Journal(context.Background(), f, "/j", "signs", from, to)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(signs) != 1 || signs[0].KMSRequestID != "r1" || string(signs[0].R) != "\x05" || len(done) != 1 || done[0].SiteStatus != 201 ||
 		len(notes) != 1 || notes[0].Kind != "sign_intent" || !notes[0].LeaseUntil.Equal(from.Add(time.Hour+40*time.Second)) {
 		t.Fatalf("read %+v %+v %+v", signs, done, notes)
+	}
+	if len(ingested) != 1 {
+		t.Fatalf("ingested %v", ingested)
 	}
 	if len(f.got) != 2 || aws.ToString(f.got[0].LogGroupName) != "/j" || f.got[0].LogStreamNames[0] != "signs" ||
 		aws.ToInt64(f.got[0].StartTime) != from.UnixMilli() || aws.ToInt64(f.got[0].EndTime) != to.UnixMilli() {
@@ -73,7 +76,7 @@ func TestJournal(t *testing.T) {
 	// An entry it can't read stops the read: never a partial journal.
 	for _, bad := range []string{`not json`, `{"kind":"other"}`, `{"kind":"sign","digest":"not base64!"}`} {
 		f := &fakeLogs{pages: [][]string{{bad}}}
-		if _, _, _, err := Journal(context.Background(), f, "/j", "signs", from, to); err == nil {
+		if _, _, _, _, err := Journal(context.Background(), f, "/j", "signs", from, to); err == nil {
 			t.Fatalf("read %s", bad)
 		}
 	}

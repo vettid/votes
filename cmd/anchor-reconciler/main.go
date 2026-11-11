@@ -169,7 +169,7 @@ func (s *sources) pass(ctx context.Context) []reconcile.Finding {
 	if in.TrailProblem, err = awsread.TrailProblem(ctx, s.trail, s.c.trailName, now); err != nil {
 		miss("the trail's status", err)
 	}
-	if in.Signs, in.Completions, in.Notes, err = awsread.Journal(ctx, s.logs, s.c.journalGroup, s.c.journalStream, in.From, in.To); err != nil {
+	if in.Signs, in.Completions, in.Notes, in.Ingested, err = awsread.Journal(ctx, s.logs, s.c.journalGroup, s.c.journalStream, in.From, in.To); err != nil {
 		miss("the journal", err)
 	}
 	if in.KMSSigns, err = awsread.KMSSigns(ctx, s.logs, s.c.trailGroup, in.From, in.To); err != nil {

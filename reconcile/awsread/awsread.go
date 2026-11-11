@@ -35,7 +35,7 @@ type LogsAPI interface {
 // rather than check part of a period.
 const maxEvents = 100000
 
-func filter(ctx context.Context, c LogsAPI, group string, streams []string, pattern string, from, to time.Time, each func(msg string) error) error {
+func filter(ctx context.Context, c LogsAPI, group string, streams []string, pattern string, from, to time.Time, each func(msg string, ingested time.Time) error) error {
 	in := &cloudwatchlogs.FilterLogEventsInput{
 		LogGroupName: aws.String(group), StartTime: aws.Int64(from.UnixMilli()), EndTime: aws.Int64(to.UnixMilli()),
 	}
@@ -55,7 +55,11 @@ func filter(ctx context.Context, c LogsAPI, group string, streams []string, patt
 			if n++; n > maxEvents {
 				return fmt.Errorf("more than %d events in the period", maxEvents)
 			}
-			if err := each(aws.ToString(e.Message)); err != nil {
+			var ingested time.Time // zero when the service didn't say
+			if e.IngestionTime != nil {
+				ingested = time.UnixMilli(*e.IngestionTime)
+			}
+			if err := each(aws.ToString(e.Message), ingested); err != nil {
 				return err
 			}
 		}
@@ -69,8 +73,11 @@ func filter(ctx context.Context, c LogsAPI, group string, streams []string, patt
 // Journal reads the signer's journal for the period: one JSON event per
 // entry, {"kind": "sign" | "note" | "complete", ...}. An entry it can't
 // read stops the read: a journal the pass can't read whole is incomplete.
-func Journal(ctx context.Context, c LogsAPI, group, stream string, from, to time.Time) (signs []signer.SignEntry, done []signer.CompletionEntry, notes []signer.NoteEntry, err error) {
-	err = filter(ctx, c, group, []string{stream}, "", from, to, func(msg string) error {
+// ingested holds each sign entry's ingestion time (set by CloudWatch Logs,
+// not by the writer), by reconcile.SignKey.
+func Journal(ctx context.Context, c LogsAPI, group, stream string, from, to time.Time) (signs []signer.SignEntry, done []signer.CompletionEntry, notes []signer.NoteEntry, ingested map[string]time.Time, err error) {
+	ingested = map[string]time.Time{}
+	err = filter(ctx, c, group, []string{stream}, "", from, to, func(msg string, at time.Time) error {
 		var k struct {
 			Kind string `json:"kind"`
 		}
@@ -88,6 +95,9 @@ func Journal(ctx context.Context, c LogsAPI, group, stream string, from, to time
 				return fmt.Errorf("journal: a sign entry: %w", err)
 			}
 			signs = append(signs, e.SignEntry)
+			if k := reconcile.SignKey(e.SignEntry); !at.IsZero() && (ingested[k].IsZero() || at.Before(ingested[k])) {
+				ingested[k] = at
+			}
 		case "complete":
 			var e struct {
 				Kind string `json:"kind"`
@@ -111,7 +121,7 @@ func Journal(ctx context.Context, c LogsAPI, group, stream string, from, to time
 		}
 		return nil
 	})
-	return signs, done, notes, err
+	return signs, done, notes, ingested, err
 }
 
 // SignPattern selects KMS Sign calls in the trail's log group.
@@ -145,7 +155,7 @@ type cloudTrailRecord struct {
 // is itself a finding.
 func KMSSigns(ctx context.Context, c LogsAPI, trailGroup string, from, to time.Time) ([]reconcile.KMSSign, error) {
 	var out []reconcile.KMSSign
-	err := filter(ctx, c, trailGroup, nil, SignPattern, from, to, func(msg string) error {
+	err := filter(ctx, c, trailGroup, nil, SignPattern, from, to, func(msg string, _ time.Time) error {
 		var r cloudTrailRecord
 		if err := json.Unmarshal([]byte(msg), &r); err != nil {
 			return errors.New("trail: a record isn't JSON")
