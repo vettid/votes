@@ -333,16 +333,25 @@ func TestTrail(t *testing.T) {
 	if r := rules(Run(in)); r[RuleTrailMissing] != Alarm {
 		t.Fatalf("only a failed call in the trail: %v", r)
 	}
-	// Too recent, or at the start of the period: the next or last pass's.
+	// Ingested too recently, or at the start of the period: the next or
+	// last pass's (by the ingestion time, which the writer can't set).
 	in = f.clean()
 	in.KMSSigns = nil
 	in.Signs[0].At = f.now.Add(-10 * time.Minute)
+	in.Ingested = map[string]time.Time{SignKey(in.Signs[0]): in.Signs[0].At}
 	if r := rules(Run(in)); r[RuleTrailMissing] != "" {
 		t.Fatalf("a sign too recent for the trail: %v", r)
 	}
 	in.Signs[0].At = in.From.Add(5 * time.Minute)
+	in.Ingested = map[string]time.Time{SignKey(in.Signs[0]): in.Signs[0].At}
 	if r := rules(Run(in)); r[RuleTrailMissing] != "" {
 		t.Fatalf("a sign at the period's start: %v", r)
+	}
+	// Its own At saying "too recent" is no reason to skip it.
+	in.Ingested = nil
+	in.Signs[0].At = f.now.Add(-10 * time.Minute)
+	if r := rules(Run(in)); r[RuleTrailMissing] != Alarm {
+		t.Fatalf("skipped on the entry's own At: %v", r)
 	}
 	// The trail's own status.
 	in = f.clean()
