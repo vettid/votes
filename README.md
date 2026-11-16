@@ -194,45 +194,65 @@ a missing copy is a 404; every document is public), and nothing else.
 
 **The watch.** Two EventBridge rules with one pattern and the same
 targets (each sees a change to the other) send every event they match
-both to the log group `/vettid/votes/<env>/key-use`, kept for good, and
-**directly to the topic `vettid-votes-<env>-key-watch`**, which emails
-`keyWatchEmail`, so that no alarm sits between an event and a person.
-They match:
+to the log group `/vettid/votes/<env>/key-use`, kept for good, and
+**directly to two topics, `vettid-votes-<env>-key-watch` and
+`vettid-votes-<env>-key-watch-b`**, each emailing `keyWatchEmail` on its
+own subscription, so that no alarm sits between an event and a person
+and a subscription removed from one is told on the other. Only the two
+rules may publish to them (and CloudWatch alarms of the account). The
+rules, topics and subscriptions are kept if removed from the stack, and
+the stack has termination protection. They match:
 
 - every signature with either key, and every grant, key policy change,
   alias change, deletion or disabling of either key or its alias;
 - every change to the publish role (its trust or permission policies, a
   boundary, its deletion);
 - every change to the watch: its rules and targets, its alarms (enabling
-  or disabling their actions too), its log group and metric filter, any
-  log group resource policy, its dead letters, the alarm topic and the
-  watch topic and their subscriptions;
-- every change to any CloudTrail trail (stopping it, deleting it, or
-  changing what it records): the watch gets every event from CloudTrail.
+  or disabling their actions too), any alarm mute rule, its log group,
+  streams, metric filter and key, any log group resource policy, its dead
+  letters, the alarm topic and the two watch topics and their
+  subscriptions (a data protection policy too);
+- every update, change set, stack policy, termination protection change
+  or deletion of this stack, since one update can change all of the
+  watch (so a deploy is emailed too);
+- every change to any CloudTrail trail (stopping or starting it,
+  deleting it, or changing what it records): the watch gets every event
+  from CloudTrail.
 
-Each event has the operation, the key or role, the caller's identity
+Each event has the operation, what it acted on (the key, role, rule,
+alarm, topic, subscription, log group, stack or queue), the caller's identity
 type, role and temporary key id (traceable to its `AssumeRole` in
 CloudTrail) and the CloudTrail event id: never the session name, which
 is an email address. Any logged line also raises the alarm
 `vettid-votes-<env>-key-use` (counted by samples, so a value anyone puts
 in its namespace can only raise it), and a delivery that fails after
 EventBridge's retries goes to the queue `vettid-votes-<env>-key-use-dlq`
-and raises `vettid-votes-<env>-key-use-feed`; both alarms notify both
-topics, so silencing one path is told on the other.
+and raises `vettid-votes-<env>-key-use-feed`; both alarms notify the
+alarm topic and both watch topics, so silencing one path is told on
+another.
 
-- **Confirm the watch topic's subscription** from the email AWS sends
-  after the first deploy; until then the watch emails no one.
+- **Confirm both watch subscriptions** after the first deploy, from the
+  token in each email AWS sends, so that unsubscribing needs a signed-in
+  call (which is watched), not a link in the email:
+  `aws sns confirm-subscription --topic-arn <KeyWatchTopicArn or KeyWatchTopicBArn> --token <token> --authenticate-on-unsubscribe true`.
+  Until then the watch emails no one. Keep `keyWatchEmail` in
+  `~/.cdk.json`, not the tracked `cdk.json`, and out of shell history.
 - **A publish is two signatures, each sent twice** (four lines and four
   emails) and raises the key-use alarm; **a deploy of this stack does
   too** (it updates the watch). **A publish that does not means the feed
   is broken: stop publishing and find out why.**
 - The feed needs CloudTrail's management events (read and write) for
-  `us-east-1` in the account, from a trail that is logging.
+  `us-east-1` in the account, from a trail that is logging: one homed in
+  `us-east-1`, a multi-region trail, or an organization trail.
 - EventBridge retries a failed delivery for up to 24 hours before it
-  goes to the dead letters, so the feed alarm can come that late.
-- The watch topic accepts publishes from any EventBridge rule of the
-  account (CDK's statement for its targets has no source condition): at
-  worst noise, never silence.
+  goes to the dead letters, so the feed alarm can come that late. While
+  any dead letter remains, the feed alarm stays in ALARM: read them, then
+  purge the queue (a watched call).
+- **What is not covered:** an administrator of the account who cuts
+  every path in one CloudFormation update, or in calls quicker than the
+  watch reports, can sign unseen until the change is noticed (the
+  owner's question, GC #12690). A heartbeat that proves the feed is alive
+  comes with the monitor (GC #12646, task 4).
 - The trust names one Identity Center role, which every user assigned
   its permission set shares (the owner's choice of set is pending, GC
   #12678). If the set is reprovisioned, the trust no longer matches (the

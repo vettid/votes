@@ -287,10 +287,22 @@ describe('monitor alerts', () => {
 describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
   const keys = t.findResources('AWS::KMS::Key');
   const byUse = (spec: string): any => Object.values(keys).find((k: any) => k.Properties.KeySpec === spec) as any;
+  const logical = (type: string, re: RegExp): string => {
+    const ks = Object.keys(t.findResources(type)).filter((k) => re.test(k));
+    expect(ks).toHaveLength(1);
+    return ks[0];
+  };
   const publishLogical = Object.keys(t.findResources('AWS::IAM::Role', { Properties: { RoleName: 'vettid-votes-staging-publish' } }))[0];
   const bucketLogical = Object.keys(t.findResources('AWS::S3::Bucket'))[0];
+  const ruleA = logical('AWS::Events::Rule', /^KeyUseRule(?!B)/);
+  const ruleB = logical('AWS::Events::Rule', /^KeyUseRuleB/);
+  const topicA = logical('AWS::SNS::Topic', /^KeyWatchTopic(?!B)/);
+  const topicB = logical('AWS::SNS::Topic', /^KeyWatchTopicB/);
+  const queue = logical('AWS::SQS::Queue', /^KeyUseDeadLetters/);
+  const logGroup = logical('AWS::Logs::LogGroup', /^KeyUseLogs/);
   const roleArn = { 'Fn::GetAtt': [publishLogical, 'Arn'] };
   const rootArn = { 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, ':iam::123456789012:root']] };
+  const fromRules = { ArnEquals: { 'aws:SourceArn': [{ 'Fn::GetAtt': [ruleA, 'Arn'] }, { 'Fn::GetAtt': [ruleB, 'Arn'] }] } };
   const keyPolicy = (algorithm: string): any => ({
     Version: '2012-10-17',
     Statement: [
@@ -309,7 +321,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     ],
   });
 
-  test('two signing keys made in KMS, never deleted with the stack', () => {
+  test('two signing keys made in KMS, never deleted with the stack; the stack refuses deletion', () => {
     expect(Object.keys(keys)).toHaveLength(2);
     for (const spec of ['ECC_NIST_EDWARDS25519', 'ECC_NIST_P256']) {
       const k = byUse(spec);
@@ -321,6 +333,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     }
     t.hasResourceProperties('AWS::KMS::Alias', { AliasName: 'alias/vettid-votes-staging-site' });
     t.hasResourceProperties('AWS::KMS::Alias', { AliasName: 'alias/vettid-votes-staging-list-anchor' });
+    expect(stack('staging', 'staging').terminationProtection).toBe(true);
   });
 
   test('each key policy, whole: only the publish role signs, with its algorithm; no grants; only the root deletes', () => {
@@ -328,7 +341,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     expect(byUse('ECC_NIST_P256').Properties.KeyPolicy).toEqual(keyPolicy('ECDSA_SHA_256'));
   });
 
-  test('the publish role, whole: assumed only by the operator, for an hour; the service list and nothing else', () => {
+  test('the publish role, whole: assumed only by the operator, for an hour; the service list, and reading the watch subscriptions', () => {
     const role = t.findResources('AWS::IAM::Role')[publishLogical] as any;
     expect(role.Properties.MaxSessionDuration).toBe(3600);
     expect(role.Properties.ManagedPolicyArns).toBeUndefined();
@@ -343,6 +356,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
         Resource: [obj('v1/services.json'), obj('v1/services.json.sig'), obj('v1/services/*')] },
       // Unconditioned, so that a missing copy is a 404 (all documents are public).
       { Sid: 'ServiceListList', Effect: 'Allow', Action: 's3:ListBucket', Resource: { 'Fn::GetAtt': [bucketLogical, 'Arn'] } },
+      { Sid: 'KeyWatchSubscriptions', Effect: 'Allow', Action: 'sns:ListSubscriptionsByTopic', Resource: [{ Ref: topicA }, { Ref: topicB }] },
     ] });
   });
 
@@ -361,43 +375,46 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
   const alts = (): any[] => rules()[0].Properties.EventPattern.detail.$or;
   const alt = (src: string): any[] => alts().filter((x) => x.eventSource[0] === src);
 
-  test('two rules with one pattern and the same targets, each in the state that gets read-only events', () => {
+  test('two rules with one pattern and the same targets, each in the state that gets read-only events, retained', () => {
     const r = rules();
     expect(r.map((x) => x.Properties.Name).sort()).toEqual(['vettid-votes-staging-key-use', 'vettid-votes-staging-key-use-b']);
     expect(r[1].Properties.EventPattern).toEqual(r[0].Properties.EventPattern);
     expect(r[1].Properties.Targets).toEqual(r[0].Properties.Targets);
-    for (const x of r) expect(x.Properties.State).toBe('ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
+    for (const x of r) {
+      expect(x.Properties.State).toBe('ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
+      expect(x.DeletionPolicy).toBe('Retain');
+    }
     expect(r[0].Properties.EventPattern['detail-type']).toEqual(['AWS API Call via CloudTrail']);
-    expect(alts()).toHaveLength(12);
+    expect(alts()).toHaveLength(16);
   });
 
   test('watched, exactly: the keys and their aliases, the publish role', () => {
     expect([...KEY_USE_EVENTS]).toEqual(['Sign', 'CreateGrant', 'PutKeyPolicy', 'ScheduleKeyDeletion', 'DisableKey',
       'CreateAlias', 'UpdateAlias', 'DeleteAlias']);
-    const k = alt('kms.amazonaws.com');
-    expect(k).toHaveLength(1);
-    expect(k[0].eventName).toEqual([...KEY_USE_EVENTS]);
-    expect(k[0].resources.ARN).toHaveLength(4);
-    const arns = JSON.stringify(k[0].resources.ARN);
-    expect(arns).toContain(':alias/vettid-votes-staging-site');
-    expect(arns).toContain(':alias/vettid-votes-staging-list-anchor');
+    const kmsArn = (resource: string): any => ({ 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, `:kms:us-east-1:123456789012:${resource}`]] });
+    expect(alt('kms.amazonaws.com')).toEqual([{ eventSource: ['kms.amazonaws.com'], eventName: [...KEY_USE_EVENTS], resources: { ARN: [
+      { 'Fn::GetAtt': [logical('AWS::KMS::Key', /^SiteSigningKey/), 'Arn'] }, { 'Fn::GetAtt': [logical('AWS::KMS::Key', /^ListAnchorKey/), 'Arn'] },
+      kmsArn('alias/vettid-votes-staging-site'), kmsArn('alias/vettid-votes-staging-list-anchor')] } }]);
     expect([...PUBLISH_ROLE_EVENTS]).toEqual(['UpdateAssumeRolePolicy', 'PutRolePolicy', 'DeleteRolePolicy', 'AttachRolePolicy',
       'DetachRolePolicy', 'PutRolePermissionsBoundary', 'DeleteRolePermissionsBoundary', 'UpdateRole', 'DeleteRole']);
     expect(alt('iam.amazonaws.com')).toEqual([{ eventSource: ['iam.amazonaws.com'], eventName: [...PUBLISH_ROLE_EVENTS],
       requestParameters: { roleName: [{ Ref: publishLogical }] } }]);
   });
 
-  test('watched, exactly: the watch itself, the trail, the topics and the dead letters', () => {
+  test('watched, exactly: the watch itself, the trail, the topics, the dead letters, mute rules and this stack', () => {
     expect(WATCH_EVENTS).toEqual({
       rules: ['DisableRule', 'DeleteRule', 'PutRule', 'RemoveTargets', 'PutTargets'],
       alarms: ['DisableAlarmActions', 'EnableAlarmActions', 'DeleteAlarms', 'PutMetricAlarm', 'SetAlarmState'],
       logGroup: ['DeleteLogGroup', 'PutRetentionPolicy', 'DeleteRetentionPolicy', 'DeleteMetricFilter', 'PutMetricFilter',
         'DeleteLogStream', 'AssociateKmsKey', 'DisassociateKmsKey'],
       logPolicies: ['PutResourcePolicy', 'DeleteResourcePolicy'],
-      trails: ['StopLogging', 'DeleteTrail', 'UpdateTrail', 'PutEventSelectors', 'PutAdvancedEventSelectors'],
-      topics: ['Subscribe', 'Unsubscribe', 'SetSubscriptionAttributes', 'SetTopicAttributes', 'DeleteTopic',
+      trails: ['StopLogging', 'StartLogging', 'DeleteTrail', 'UpdateTrail', 'PutEventSelectors', 'PutAdvancedEventSelectors'],
+      topics: ['Subscribe', 'ConfirmSubscription', 'Unsubscribe', 'SetSubscriptionAttributes', 'SetTopicAttributes', 'DeleteTopic',
         'AddPermission', 'RemovePermission', 'PutDataProtectionPolicy'],
       queue: ['PurgeQueue', 'DeleteQueue', 'SetQueueAttributes', 'AddPermission', 'RemovePermission'],
+      muteRules: ['PutAlarmMuteRule', 'DeleteAlarmMuteRule'],
+      stack: ['UpdateStack', 'DeleteStack', 'CreateChangeSet', 'ExecuteChangeSet', 'SetStackPolicy',
+        'UpdateTerminationProtection', 'ContinueUpdateRollback', 'CancelUpdateStack'],
     });
     const names = ['vettid-votes-staging-key-use', 'vettid-votes-staging-key-use-b'];
     expect(alt('events.amazonaws.com')).toEqual([
@@ -408,69 +425,98 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     expect(alt('monitoring.amazonaws.com')).toEqual([
       { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms], requestParameters: { alarmNames: alarms } },
       { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms], requestParameters: { alarmName: alarms } },
+      { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.muteRules] }, // any mute rule
     ]);
-    const lg = alt('logs.amazonaws.com');
-    expect(lg).toHaveLength(2);
-    expect(lg[0]).toMatchObject({ eventName: [...WATCH_EVENTS.logGroup], requestParameters: { logGroupName: [expect.anything()] } });
-    expect(lg[1]).toEqual({ eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logPolicies] }); // any name
+    expect(alt('logs.amazonaws.com')).toEqual([
+      { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logGroup], requestParameters: { logGroupName: [{ Ref: logGroup }] } },
+      { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logPolicies] }, // any name
+    ]);
     expect(alt('cloudtrail.amazonaws.com')).toEqual([{ eventSource: ['cloudtrail.amazonaws.com'], eventName: [...WATCH_EVENTS.trails] }]); // any trail
-    const sn = alt('sns.amazonaws.com');
-    expect(sn).toHaveLength(2);
-    expect(sn[0].requestParameters.topicArn).toEqual([TOPIC, { Ref: expect.stringMatching(/^KeyWatchTopic/) }]);
-    expect(JSON.stringify(sn[1].requestParameters.subscriptionArn)).toContain(`"prefix":"${TOPIC}:"`);
-    expect(sn[1].requestParameters.subscriptionArn).toHaveLength(2);
+    const topics = [TOPIC, { Ref: topicA }, { Ref: topicB }];
+    const sns = { eventSource: ['sns.amazonaws.com'], eventName: [...WATCH_EVENTS.topics] };
+    expect(alt('sns.amazonaws.com')).toEqual([
+      { ...sns, requestParameters: { topicArn: topics } },
+      { ...sns, requestParameters: { resourceArn: topics } }, // PutDataProtectionPolicy
+      { ...sns, requestParameters: { subscriptionArn: [{ prefix: `${TOPIC}:` },
+        { prefix: { 'Fn::Join': ['', [{ Ref: topicA }, ':']] } }, { prefix: { 'Fn::Join': ['', [{ Ref: topicB }, ':']] } }] } },
+    ]);
     expect(alt('sqs.amazonaws.com')).toEqual([{ eventSource: ['sqs.amazonaws.com'], eventName: [...WATCH_EVENTS.queue],
-      requestParameters: { queueUrl: [{ Ref: expect.stringMatching(/^KeyUseDeadLetters/) }] } }]);
+      requestParameters: { queueUrl: [{ Ref: queue }] } }]);
+    const cfn = { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stack] };
+    expect(alt('cloudformation.amazonaws.com')).toEqual([
+      { ...cfn, requestParameters: { stackName: ['VotesSite-staging'] } },
+      { ...cfn, requestParameters: { stackName: [{ prefix: { 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' },
+        ':cloudformation:us-east-1:123456789012:stack/VotesSite-staging/']] } }] } },
+    ]);
   });
 
-  test('every event goes to the log group and, directly, to the watch topic; failures to the dead letters; never the session name', () => {
+  test('every event goes to the log group and, directly, to both watch topics; failures to the dead letters; never the session name', () => {
     for (const r of rules()) {
-      const [log, topic] = r.Properties.Targets;
-      expect(r.Properties.Targets).toHaveLength(2);
-      expect(JSON.stringify(log.Arn)).toContain(':log-group:');
-      expect(topic.Arn).toEqual({ Ref: expect.stringMatching(/^KeyWatchTopic/) });
-      for (const tg of [log, topic]) {
-        expect(tg.DeadLetterConfig.Arn).toEqual({ 'Fn::GetAtt': [expect.stringMatching(/^KeyUseDeadLetters/), 'Arn'] });
-        const paths = Object.values(tg.InputTransformer.InputPathsMap) as string[];
+      const tg = r.Properties.Targets;
+      expect(tg.map((x: any) => x.Arn)).toEqual([
+        { 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, ':logs:us-east-1:123456789012:log-group:', { Ref: logGroup }]] },
+        { Ref: topicA }, { Ref: topicB }]);
+      for (const x of tg) {
+        expect(x.DeadLetterConfig).toEqual({ Arn: { 'Fn::GetAtt': [queue, 'Arn'] } });
+        expect(x.RetryPolicy).toEqual({ MaximumRetryAttempts: 185, MaximumEventAgeInSeconds: 86400 });
+        const paths = Object.values(x.InputTransformer.InputPathsMap) as string[];
         expect(paths).toEqual(expect.arrayContaining(['$.detail.eventName', '$.detail.userIdentity.sessionContext.sessionIssuer.arn',
-          '$.detail.userIdentity.type', '$.detail.userIdentity.accessKeyId', '$.detail.eventID']));
+          '$.detail.userIdentity.type', '$.detail.userIdentity.accessKeyId', '$.detail.eventID',
+          '$.detail.requestParameters.name', '$.detail.requestParameters.topicArn', '$.detail.requestParameters.subscriptionArn',
+          '$.detail.requestParameters.alarmName', '$.detail.requestParameters.stackName']));
         for (const pth of paths) expect(pth).not.toMatch(/userIdentity\.(arn|principalId|userName)$|sessionName|email/i);
       }
       // The shape a log group target needs: {"timestamp": <time>, "message": "..."}.
-      expect(log.InputTransformer.InputTemplate).toMatch(/^\{"timestamp":<time>,"message":"[^"]*"\}$/);
+      expect(tg[0].InputTransformer.InputTemplate).toMatch(/^\{"timestamp":<time>,"message":"[^"]*"\}$/);
     }
     t.hasResource('AWS::Logs::LogGroup', { DeletionPolicy: 'Retain', Properties: { LogGroupName: '/vettid/votes/staging/key-use' } });
-    t.hasResourceProperties('AWS::SNS::Subscription', { Protocol: 'email', Endpoint: EMAIL, TopicArn: { Ref: Match.stringLikeRegexp('^KeyWatchTopic') } });
-  });
-
-  test('only the two rules write the log group and the dead letters; CloudWatch of this account may publish to the watch topic', () => {
-    const lp = Object.values(t.findResources('AWS::Logs::ResourcePolicy'))[0] as any;
-    const text = JSON.stringify(lp.Properties.PolicyDocument);
-    expect(text).toContain('events.amazonaws.com');
-    expect(text).not.toContain('delivery.logs.amazonaws.com');
-    expect(text).toContain('aws:SourceArn');
-    expect(text).toContain('logs:CreateLogStream');
-    const qp = Object.values(t.findResources('AWS::SQS::QueuePolicy'))[0] as any;
-    const send = qp.Properties.PolicyDocument.Statement.filter((x: any) => x.Action === 'sqs:SendMessage');
-    for (const s of send) {
-      expect(s.Principal).toEqual({ Service: 'events.amazonaws.com' });
+    for (const topic of [topicA, topicB]) {
+      expect((t.findResources('AWS::SNS::Topic')[topic] as any).DeletionPolicy).toBe('Retain');
+      const subs = Object.values(t.findResources('AWS::SNS::Subscription')).filter((s: any) => s.Properties.TopicArn.Ref === topic) as any[];
+      expect(subs).toHaveLength(1);
+      expect(subs[0].Properties).toEqual({ Protocol: 'email', Endpoint: EMAIL, TopicArn: { Ref: topic } });
+      expect(subs[0].DeletionPolicy).toBe('Retain');
     }
-    expect(send.some((s: any) => s.Condition?.ArnEquals?.['aws:SourceArn']?.length === 2)).toBe(true);
-    const tp = Object.values(t.findResources('AWS::SNS::TopicPolicy'))[0] as any;
-    const cw = tp.Properties.PolicyDocument.Statement.find((x: any) => x.Sid === 'Alarms');
-    expect(cw).toMatchObject({ Effect: 'Allow', Principal: { Service: 'cloudwatch.amazonaws.com' }, Action: 'sns:Publish',
-      Condition: { StringEquals: { 'aws:SourceAccount': '123456789012' } } });
   });
 
-  test('alarms, to both topics: any watched event (SampleCount, outside the monitor\'s namespace), and a failed delivery', () => {
-    const watch = { Ref: Match.stringLikeRegexp('^KeyWatchTopic') };
-    t.hasResourceProperties('AWS::CloudWatch::Alarm', {
-      AlarmName: 'vettid-votes-staging-key-use', Namespace: 'VettID/VotesKeys/staging', MetricName: 'KeyUse', Statistic: 'SampleCount',
-      Threshold: 1, ComparisonOperator: 'GreaterThanOrEqualToThreshold', EvaluationPeriods: 1, Period: 60,
-      AlarmActions: [TOPIC, watch], TreatMissingData: 'notBreaching',
-    });
+  test('each watch policy, whole: only the two rules write the log group, the dead letters and the topics; CloudWatch of this account the topics', () => {
+    const lp = Object.values(t.findResources('AWS::Logs::ResourcePolicy')) as any[];
+    expect(lp).toHaveLength(1);
+    expect(lp[0].Properties).toEqual({ PolicyName: 'vettid-votes-staging-key-use', PolicyDocument: { 'Fn::Join': ['', [
+      '{"Statement":[{"Action":["logs:CreateLogStream","logs:PutLogEvents"],"Condition":{"ArnEquals":{"aws:SourceArn":["',
+      { 'Fn::GetAtt': [ruleA, 'Arn'] }, '","', { 'Fn::GetAtt': [ruleB, 'Arn'] },
+      '"]}},"Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},"Resource":"', { 'Fn::GetAtt': [logGroup, 'Arn'] },
+      '"}],"Version":"2012-10-17"}']] } });
+    const qp = Object.values(t.findResources('AWS::SQS::QueuePolicy')) as any[];
+    expect(qp).toHaveLength(1);
+    const q = { 'Fn::GetAtt': [queue, 'Arn'] };
+    expect(qp[0].Properties.PolicyDocument).toEqual({ Version: '2012-10-17', Statement: [
+      { Action: 'sqs:*', Condition: { Bool: { 'aws:SecureTransport': 'false' } }, Effect: 'Deny', Principal: { AWS: '*' }, Resource: q },
+      { Action: 'sqs:SendMessage', Condition: fromRules, Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Resource: q },
+    ] });
+    const tps = t.findResources('AWS::SNS::TopicPolicy');
+    expect(Object.keys(tps)).toHaveLength(2);
+    for (const topic of [topicA, topicB]) {
+      const tp = Object.values(tps).find((p: any) => p.Properties.Topics[0].Ref === topic) as any;
+      const r = { Ref: topic };
+      expect(tp.Properties.PolicyDocument).toEqual({ Version: '2012-10-17', Statement: [
+        { Action: 'sns:Publish', Condition: { Bool: { 'aws:SecureTransport': 'false' } }, Effect: 'Deny', Principal: '*', Resource: r, Sid: 'AllowPublishThroughSSLOnly' },
+        { Action: 'sns:Publish', Condition: { StringEquals: { 'aws:SourceAccount': '123456789012' } }, Effect: 'Allow',
+          Principal: { Service: 'cloudwatch.amazonaws.com' }, Resource: r, Sid: 'Alarms' },
+        { Action: 'sns:Publish', Condition: fromRules, Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Resource: r, Sid: 'Rules' },
+      ] });
+    }
+  });
+
+  test('alarms, to every topic: any watched event (SampleCount, outside the monitor\'s namespace), and a failed delivery', () => {
+    const actions = [TOPIC, { Ref: topicA }, { Ref: topicB }];
+    const use = Object.values(t.findResources('AWS::CloudWatch::Alarm', { Properties: { AlarmName: 'vettid-votes-staging-key-use' } }))[0] as any;
+    expect(use.Properties).toMatchObject({ Namespace: 'VettID/VotesKeys/staging', MetricName: 'KeyUse', Statistic: 'SampleCount',
+      Threshold: 1, ComparisonOperator: 'GreaterThanOrEqualToThreshold', EvaluationPeriods: 1, Period: 60, TreatMissingData: 'notBreaching' });
+    expect(use.Properties.AlarmActions).toEqual(actions);
     const feed = Object.values(t.findResources('AWS::CloudWatch::Alarm', { Properties: { AlarmName: 'vettid-votes-staging-key-use-feed' } }))[0] as any;
-    expect(feed.Properties.AlarmActions).toEqual([TOPIC, { Ref: expect.stringMatching(/^KeyWatchTopic/) }]);
+    expect(feed.Properties.AlarmActions).toEqual(actions);
+    expect(JSON.stringify(feed.Properties.AlarmDescription)).toMatch(/then purge them/);
     const exprs = feed.Properties.Metrics.filter((m: any) => m.Expression).map((m: any) => m.Expression);
     expect(exprs).toEqual(['FILL(f0, 0) + FILL(f1, 0) + FILL(d, 0)']);
     const text = JSON.stringify(feed.Properties.Metrics);
@@ -482,9 +528,6 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
   });
 
   test('outputs', () => {
-    t.hasOutput('SiteSigningKeyArn', {});
-    t.hasOutput('ListAnchorKeyArn', {});
-    t.hasOutput('PublishRoleArn', {});
-    t.hasOutput('KeyWatchTopicArn', {});
+    for (const o of ['SiteSigningKeyArn', 'ListAnchorKeyArn', 'PublishRoleArn', 'KeyWatchTopicArn', 'KeyWatchTopicBArn']) t.hasOutput(o, {});
   });
 });

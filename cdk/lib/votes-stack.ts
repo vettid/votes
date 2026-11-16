@@ -9,7 +9,6 @@ import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cwactions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as events from 'aws-cdk-lib/aws-events';
-import * as eventsTargets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -19,7 +18,6 @@ import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as sns from 'aws-cdk-lib/aws-sns';
-import * as snsSubscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import { Construct } from 'constructs';
@@ -81,11 +79,11 @@ export interface VotesStackProps extends cdk.StackProps {
    * still need If-None-Match. The next deploy, without it, closes it. */
   readonly servicesRepair?: boolean;
   /** The SNS topic the monitor's alerts go to (docs/VOTES-SITE.md §7),
-   * in the stack's region. With it, the stack makes the monitor's role,
+   * in the stack's region, required: the stack makes the monitor's role,
    * which the workflow assumes through GitHub's OIDC provider to publish
    * a failed run there and to put its heartbeat, and the heartbeat's
-   * alarm, which notifies the topic. Required: the site keys' alarms go
-   * there too. */
+   * alarm, which notifies the topic; and the site keys' alarms go there
+   * too. */
   readonly alarmTopicArn?: string;
   /** The account's existing OIDC provider for
    * token.actions.githubusercontent.com (an account has at most one, so
@@ -153,12 +151,17 @@ export const WATCH_EVENTS = {
   // per account, by name.
   logPolicies: ['PutResourcePolicy', 'DeleteResourcePolicy'],
   // Any trail: the watch gets every event from CloudTrail.
-  trails: ['StopLogging', 'DeleteTrail', 'UpdateTrail', 'PutEventSelectors', 'PutAdvancedEventSelectors'],
+  trails: ['StopLogging', 'StartLogging', 'DeleteTrail', 'UpdateTrail', 'PutEventSelectors', 'PutAdvancedEventSelectors'],
   // Its topics (the alarm topic and its own), and their subscriptions.
-  topics: ['Subscribe', 'Unsubscribe', 'SetSubscriptionAttributes', 'SetTopicAttributes', 'DeleteTopic',
+  topics: ['Subscribe', 'ConfirmSubscription', 'Unsubscribe', 'SetSubscriptionAttributes', 'SetTopicAttributes', 'DeleteTopic',
     'AddPermission', 'RemovePermission', 'PutDataProtectionPolicy'],
   // Its dead letters.
   queue: ['PurgeQueue', 'DeleteQueue', 'SetQueueAttributes', 'AddPermission', 'RemovePermission'],
+  // Any alarm mute rule (one can name the watch's alarms).
+  muteRules: ['PutAlarmMuteRule', 'DeleteAlarmMuteRule'],
+  // This stack, by name or ARN: one update can change all of the watch.
+  stack: ['UpdateStack', 'DeleteStack', 'CreateChangeSet', 'ExecuteChangeSet', 'SetStackPolicy',
+    'UpdateTerminationProtection', 'ContinueUpdateRollback', 'CancelUpdateStack'],
 } as const;
 
 /** An IAM role ARN, as publisherPrincipalArn must be. */
@@ -203,6 +206,9 @@ export class VotesStack extends cdk.Stack {
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(props.keyWatchEmail ?? '')) {
       throw new Error('keyWatchEmail must be an email address: the key watch notifies it directly');
     }
+    // The watch is in this stack, so deleting it is refused until this
+    // is turned off (a watched call).
+    this.terminationProtection = true;
     if (!cdk.Token.isUnresolved(this.region) && this.region !== 'us-east-1') {
       throw new Error('the stack must be in us-east-1: CloudFront takes its certificate from there');
     }
@@ -433,8 +439,9 @@ export class VotesStack extends cdk.Stack {
    * (Ed25519) that signs the service list, and the list anchor key
    * (ECDSA P-256) that logs each list in Rekor. Only the publish role may
    * sign with them, and only publisherPrincipalArn may assume it. Every
-   * signature, and every change that could let anyone else sign, is
-   * recorded in a log group, and, with alarmTopicArn, raises an alarm.
+   * signature, and every change that could let anyone else sign or
+   * silence the watch, goes directly to two watch topics (emailed) and to
+   * a log group, and raises an alarm on the alarm topic and both.
    */
   private siteKeys(prefix: string, props: VotesStackProps): void {
     const publish = new iam.Role(this, 'PublishRole', {
@@ -527,17 +534,31 @@ export class VotesStack extends cdk.Stack {
       retention: logs.RetentionDays.INFINITE,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
-    const watchTopic = new sns.Topic(this, 'KeyWatchTopic', {
-      topicName: `${prefix}-key-watch`,
-      displayName: `VettID votes key watch (${props.envName})`,
-      enforceSSL: true,
+    // Two watch topics, each with its own subscription, so that a
+    // subscription removed or a topic changed on one is told on the other
+    // directly, whatever state the alarms are in.
+    const watchTopics = ['', '-b'].map((suffix, i) => {
+      const topic = new sns.Topic(this, i === 0 ? 'KeyWatchTopic' : 'KeyWatchTopicB', {
+        topicName: `${prefix}-key-watch${suffix}`,
+        displayName: `VettID votes key watch${suffix} (${props.envName})`,
+        enforceSSL: true,
+      });
+      topic.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+      const sub = new sns.Subscription(this, i === 0 ? 'KeyWatchEmail' : 'KeyWatchEmailB', {
+        topic, protocol: sns.SubscriptionProtocol.EMAIL, endpoint: props.keyWatchEmail,
+      });
+      sub.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+      // The alarms below publish here too.
+      topic.addToResourcePolicy(new iam.PolicyStatement({
+        sid: 'Alarms', principals: [new iam.ServicePrincipal('cloudwatch.amazonaws.com')], actions: ['sns:Publish'],
+        resources: [topic.topicArn], conditions: { StringEquals: { 'aws:SourceAccount': this.account } },
+      }));
+      return topic;
     });
-    watchTopic.addSubscription(new snsSubscriptions.EmailSubscription(props.keyWatchEmail));
-    // Its alarms below publish here too: with a topic policy in place (the
-    // SnsTopic targets add one), CloudWatch needs its own statement.
-    watchTopic.addToResourcePolicy(new iam.PolicyStatement({
-      sid: 'Alarms', principals: [new iam.ServicePrincipal('cloudwatch.amazonaws.com')], actions: ['sns:Publish'],
-      resources: [watchTopic.topicArn], conditions: { StringEquals: { 'aws:SourceAccount': this.account } },
+    // votesctl checks before a publish that both subscriptions are
+    // confirmed (it reads them; it can't change them).
+    publish.addToPolicy(new iam.PolicyStatement({
+      sid: 'KeyWatchSubscriptions', actions: ['sns:ListSubscriptionsByTopic'], resources: watchTopics.map((t) => t.topicArn),
     }));
     const alarmTopicArn = props.alarmTopicArn as string;
     const alarmTopic = sns.Topic.fromTopicArn(this, 'KeyUseTopic', alarmTopicArn);
@@ -552,7 +573,8 @@ export class VotesStack extends cdk.Stack {
     const ruleNames = [`${prefix}-key-use`, `${prefix}-key-use-b`];
     const alarmNames = [`${prefix}-key-use`, `${prefix}-key-use-feed`];
     const policyName = `${prefix}-key-use`;
-    const topicArns = [alarmTopicArn, watchTopic.topicArn];
+    const topicArns = [alarmTopicArn, ...watchTopics.map((t) => t.topicArn)];
+    const stackArnPrefix = `arn:${this.partition}:cloudformation:${this.region}:${this.account}:stack/${this.stackName}/`;
     const pattern = {
       detailType: ['AWS API Call via CloudTrail'],
       detail: {
@@ -568,15 +590,27 @@ export class VotesStack extends cdk.Stack {
           { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logPolicies] },
           { eventSource: ['cloudtrail.amazonaws.com'], eventName: [...WATCH_EVENTS.trails] },
           { eventSource: ['sns.amazonaws.com'], eventName: [...WATCH_EVENTS.topics], requestParameters: { topicArn: topicArns } },
+          // PutDataProtectionPolicy names its topic as resourceArn.
+          { eventSource: ['sns.amazonaws.com'], eventName: [...WATCH_EVENTS.topics], requestParameters: { resourceArn: topicArns } },
           { eventSource: ['sns.amazonaws.com'], eventName: [...WATCH_EVENTS.topics],
             requestParameters: { subscriptionArn: topicArns.map((t) => ({ prefix: `${t}:` })) } },
           { eventSource: ['sqs.amazonaws.com'], eventName: [...WATCH_EVENTS.queue], requestParameters: { queueUrl: [deadLetters.queueUrl] } },
+          // Any alarm mute rule: one can name the watch's alarms.
+          { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.muteRules] },
+          // This stack: one update can change every part of the watch.
+          { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stack], requestParameters: { stackName: [this.stackName] } },
+          { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stack], requestParameters: { stackName: [{ prefix: stackArnPrefix }] } },
         ],
       },
     };
     const f = (path: string): string => events.EventField.fromPath(path);
+    // What it acted on: the key, or the name its API gives (only one is
+    // present for any event).
     const line = f('$.detail.eventSource') + ' ' + f('$.detail.eventName') + ' ' + f('$.detail.resources[0].ARN') +
-      f('$.detail.requestParameters.roleName') + ' by ' + f('$.detail.userIdentity.type') + ' ' +
+      f('$.detail.requestParameters.roleName') + f('$.detail.requestParameters.name') + f('$.detail.requestParameters.rule') +
+      f('$.detail.requestParameters.alarmName') + f('$.detail.requestParameters.topicArn') + f('$.detail.requestParameters.subscriptionArn') +
+      f('$.detail.requestParameters.resourceArn') + f('$.detail.requestParameters.logGroupName') + f('$.detail.requestParameters.stackName') +
+      f('$.detail.requestParameters.queueUrl') + ' by ' + f('$.detail.userIdentity.type') + ' ' +
       f('$.detail.userIdentity.sessionContext.sessionIssuer.arn') + ' key ' + f('$.detail.userIdentity.accessKeyId') +
       ' error ' + f('$.detail.errorCode') + ' event ' + f('$.detail.eventID');
     const logTarget = this.formatArn({ service: 'logs', resource: 'log-group', arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME, resourceName: keyUse.logGroupName });
@@ -598,12 +632,19 @@ export class VotesStack extends cdk.Stack {
           input: events.RuleTargetInput.fromObject({ timestamp: events.EventField.time, message: line }),
         }),
       });
-      rule.addTarget(new eventsTargets.SnsTopic(watchTopic, {
-        deadLetterQueue: deadLetters,
-        retryAttempts: retry.maximumRetryAttempts,
-        maxEventAge: cdk.Duration.seconds(retry.maximumEventAgeInSeconds),
-        message: events.RuleTargetInput.fromText(`VettID votes key watch (${props.envName}): ` + line),
-      }));
+      // Bound by hand (not the SnsTopic target), so that the topic policy
+      // lets only these rules publish (below).
+      for (const topic of watchTopics) {
+        rule.addTarget({
+          bind: () => ({
+            arn: topic.topicArn,
+            deadLetterConfig: { arn: deadLetters.queueArn },
+            retryPolicy: retry,
+            input: events.RuleTargetInput.fromText(`VettID votes key watch (${props.envName}): ` + line),
+          }),
+        });
+      }
+      rule.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
       // Sign may count as a read-only management event, which a rule gets
       // only in this state (not settable through the Rule construct).
       (rule.node.defaultChild as events.CfnRule).addPropertyOverride('State', 'ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
@@ -611,9 +652,14 @@ export class VotesStack extends cdk.Stack {
     });
     const fromRules = { ArnEquals: { 'aws:SourceArn': rules.map((r) => r.ruleArn) } };
     // Only these rules may write to the log group, the dead letters or the
-    // watch topic (the SnsTopic target adds its own statement for the
-    // topic). Set here rather than by the CloudWatchLogGroup target, which
-    // would add a Lambda to set it.
+    // watch topics. The log group's is set here rather than by the
+    // CloudWatchLogGroup target, which would add a Lambda to set it.
+    for (const topic of watchTopics) {
+      topic.addToResourcePolicy(new iam.PolicyStatement({
+        sid: 'Rules', principals: [new iam.ServicePrincipal('events.amazonaws.com')], actions: ['sns:Publish'],
+        resources: [topic.topicArn], conditions: fromRules,
+      }));
+    }
     new logs.ResourcePolicy(this, 'KeyUseLogsPolicy', {
       resourcePolicyName: policyName,
       policyStatements: [new iam.PolicyStatement({
@@ -628,8 +674,8 @@ export class VotesStack extends cdk.Stack {
       conditions: fromRules,
     }));
 
-    // The alarms, to both topics: the alarm topic, and the watch's own
-    // (so silencing one path is told on the other).
+    // The alarms, to every topic: the alarm topic and the watch's two (so
+    // silencing one path is told on another).
     // Not the heartbeat's namespace, which the monitor's role may put
     // metrics in; and SampleCount, not Sum, so that a value anyone puts
     // there can only raise the alarm, never hide a use.
@@ -662,7 +708,8 @@ export class VotesStack extends cdk.Stack {
     });
     const feed = new cloudwatch.Alarm(this, 'KeyUseFeedAlarm', {
       alarmName: alarmNames[1],
-      alarmDescription: `The key watch of ${props.envName} failed to deliver: uses of the votes site keys may be missing from ${keyUse.logGroupName} and its email; see ${deadLetters.queueName}`,
+      alarmDescription: `The key watch of ${props.envName} failed to deliver: uses of the votes site keys may be missing from ${keyUse.logGroupName} and its emails. ` +
+        `Read the dead letters in ${deadLetters.queueName}, then purge them: the alarm stays in ALARM while any remain.`,
       metric: failed,
       threshold: 1,
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
@@ -671,13 +718,14 @@ export class VotesStack extends cdk.Stack {
     });
     for (const a of [alarm, feed]) {
       a.addAlarmAction(new cwactions.SnsAction(alarmTopic));
-      a.addAlarmAction(new cwactions.SnsAction(watchTopic));
+      for (const topic of watchTopics) a.addAlarmAction(new cwactions.SnsAction(topic));
     }
 
     new cdk.CfnOutput(this, 'SiteSigningKeyArn', { value: site.keyArn });
     new cdk.CfnOutput(this, 'ListAnchorKeyArn', { value: listAnchor.keyArn });
     new cdk.CfnOutput(this, 'PublishRoleArn', { value: publish.roleArn });
-    new cdk.CfnOutput(this, 'KeyWatchTopicArn', { value: watchTopic.topicArn });
+    new cdk.CfnOutput(this, 'KeyWatchTopicArn', { value: watchTopics[0].topicArn });
+    new cdk.CfnOutput(this, 'KeyWatchTopicBArn', { value: watchTopics[1].topicArn });
   }
 
   /** The monitor's role and its heartbeat alarm (docs/VOTES-SITE.md §7). */
