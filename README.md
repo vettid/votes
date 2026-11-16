@@ -112,9 +112,12 @@ The deploying machine needs Node 22 and Go: the function is built at
 synth by `scripts/build-api.sh`, the build CI hashes.
 
 Every deploy passes, from `cdk/` after `npm ci`:
-`-c envName=<staging|prod> -c hostName=<name> -c hostedZoneId=<id> -c zoneName=vettid.org -c sigstore=<staging|production>`,
+`-c envName=<staging|prod> -c hostName=<name> -c hostedZoneId=<id> -c zoneName=vettid.org -c sigstore=<staging|production> -c publisherPrincipalArn=<role ARN>`,
 where `sigstore` matches the service vaults' `SV_SIGSTORE` for that
-environment. None has a default.
+environment, and `publisherPrincipalArn` is the IAM role the operator
+signs in as (their IAM Identity Center role, whose sign-in requires
+MFA): the only principal that may assume the publish role (below). None
+has a default.
 
 1. **Once per account:** `npx cdk bootstrap aws://<account>/us-east-1`.
 2. **First deploy:** `npx cdk deploy <context> -c firstDeploy=true`.
@@ -162,6 +165,31 @@ environment. None has a default.
    `VOTES_<STAGING|PROD>_MONITOR_ROLE_ARN` to that output and
    `VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN` to the topic. The alarm fires 3
    hours after the deploy until the first run that puts a heartbeat.
+
+### The site's signing keys
+
+The stack also makes two KMS keys, made inside KMS so that they can
+never be exported (VOTE-SITE-KEY-COMPROMISE §6, GC #12646), and the role
+`vettid-votes-<env>-publish` (output `PublishRoleArn`), which only
+`publisherPrincipalArn` may assume, for an hour at a time:
+
+- the **site key** `alias/vettid-votes-<env>-site` (Ed25519, output
+  `SiteSigningKeyArn`), which is to sign the service list, and
+- the **list anchor key** `alias/vettid-votes-<env>-list-anchor` (ECDSA
+  P-256, output `ListAnchorKeyArn`), which is to log each list in Rekor.
+
+Their key policies let the publish role alone sign (`kms:Sign` is denied
+to every other principal), allow no grants, and let only the account's
+root user schedule their deletion; the account keeps administering them
+(CloudFormation updates them). The publish role may read and write the
+service list (`v1/services.json`, `.sig` and `v1/services/*`) and
+nothing else. Every signature, grant, key policy change, deletion or
+disabling of either key is written to the log group
+`/vettid/votes/<env>/key-use` (kept for good; the role, not the session,
+whose name is an email address) and, with `alarmTopicArn`, raises the
+alarm `vettid-votes-<env>-key-use`: a publish raises it once, so any
+other is a use to explain. Until the staging flag day, `votesctl` still
+signs with the secret's key (GC #12646, tasks 2 to 5).
 
 ### Clearing a stray version copy
 

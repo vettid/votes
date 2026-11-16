@@ -2,12 +2,15 @@ import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import { API_RATE_LIMIT, API_RATE_WINDOW_SECONDS, HEARTBEAT, heartbeatNamespace, LAMBDA_TIMEOUT_SECONDS, MONITOR_OIDC, VotesStack, validSiteKey } from '../lib/votes-stack';
+import { API_RATE_LIMIT, API_RATE_WINDOW_SECONDS, HEARTBEAT, heartbeatNamespace, KEY_USE_EVENTS, LAMBDA_TIMEOUT_SECONDS, MONITOR_OIDC, VotesStack, validRoleArn, validSiteKey } from '../lib/votes-stack';
 
 // A fixed public test value, not a real key: 32 bytes of 0x07.
 const SITE_KEY = Buffer.alloc(32, 7).toString('base64');
 
-type Extra = { siteKey?: string; region?: string; servicesRepair?: boolean; alarmTopicArn?: string; githubOidcProviderArn?: string };
+// The operator's role, as an IAM Identity Center role ARN looks (a test value).
+const PUBLISHER = 'arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Operator_0123456789abcdef';
+
+type Extra = { siteKey?: string; region?: string; servicesRepair?: boolean; alarmTopicArn?: string; githubOidcProviderArn?: string; publisherPrincipalArn?: string };
 function stack(envName: string, sigstore: 'staging' | 'production', extra: Extra = {}): VotesStack {
   const app = new cdk.App();
   return new VotesStack(app, `VotesSite-${envName}`, {
@@ -16,6 +19,7 @@ function stack(envName: string, sigstore: 'staging' | 'production', extra: Extra
     servicesRepair: extra.servicesRepair,
     alarmTopicArn: extra.alarmTopicArn,
     githubOidcProviderArn: extra.githubOidcProviderArn,
+    publisherPrincipalArn: extra.publisherPrincipalArn ?? PUBLISHER,
     lambdaCode: lambda.Code.fromAsset(path.join(__dirname, 'fake-api')),
     env: { account: '123456789012', region: extra.region ?? 'us-east-1' },
   });
@@ -27,7 +31,8 @@ const t = synth('staging', 'staging');
 const asList = (v: unknown): any[] => (Array.isArray(v) ? v : [v]);
 function fnStatements(): any[] {
   const roles = t.findResources('AWS::IAM::Policy');
-  return Object.values(roles).flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+  return Object.values(roles).filter((p: any) => JSON.stringify(p.Properties.Roles).includes('ApiRole'))
+    .flatMap((p: any) => p.Properties.PolicyDocument.Statement);
 }
 
 describe('bucket', () => {
@@ -105,9 +110,12 @@ describe('upload function', () => {
   });
 
   test('its own role: no managed policy, logs only to its log group', () => {
+    // The function's, and the publish role (site keys, below); no other,
+    // and none with a managed policy (no helper Lambda either).
     const roles = Object.values(t.findResources('AWS::IAM::Role')) as any[];
-    expect(roles).toHaveLength(1);
-    expect(roles[0].Properties.ManagedPolicyArns).toBeUndefined();
+    expect(roles.map((r) => r.Properties.RoleName).sort()).toEqual(['vettid-votes-staging-api', 'vettid-votes-staging-publish']);
+    for (const r of roles) expect(r.Properties.ManagedPolicyArns).toBeUndefined();
+    t.resourceCountIs('AWS::Lambda::Function', 1);
     const res = fnStatements().flatMap((s) => asList(s.Resource));
     expect(res).not.toContain('*');
     const logs = fnStatements().filter((s) => asList(s.Action).some((a: string) => a.startsWith('logs:')));
@@ -223,7 +231,8 @@ describe('monitor alerts', () => {
   };
 
   test('without a topic: no monitor role and no alarm', () => {
-    expect((Object.values(t.findResources('AWS::IAM::Role')) as any[]).map((r) => r.Properties.RoleName)).toEqual(['vettid-votes-staging-api']);
+    expect((Object.values(t.findResources('AWS::IAM::Role')) as any[]).map((r) => r.Properties.RoleName).sort())
+      .toEqual(['vettid-votes-staging-api', 'vettid-votes-staging-publish']);
     t.resourceCountIs('AWS::CloudWatch::Alarm', 0);
   });
 
@@ -253,7 +262,7 @@ describe('monitor alerts', () => {
   });
 
   test('the heartbeat alarm: three hours without a successful run, missing data breaching, to the topic', () => {
-    m.resourceCountIs('AWS::CloudWatch::Alarm', 1);
+    m.resourceCountIs('AWS::CloudWatch::Alarm', 2); // and the key-use alarm (site keys, below)
     m.hasResourceProperties('AWS::CloudWatch::Alarm', {
       AlarmName: 'vettid-votes-staging-monitor-heartbeat',
       Namespace: heartbeatNamespace('staging'), MetricName: 'MonitorHeartbeat', Dimensions: [{ Name: 'env', Value: 'staging' }],
@@ -270,5 +279,106 @@ describe('monitor alerts', () => {
     expect(() => stack('x', 'staging', { alarmTopicArn: 'vettid-alarms', githubOidcProviderArn: PROVIDER })).toThrow(/SNS topic ARN/);
     expect(() => stack('x', 'staging', { alarmTopicArn: TOPIC,
       githubOidcProviderArn: 'arn:aws:iam::123456789012:oidc-provider/accounts.google.com' })).toThrow(/githubOidcProviderArn/);
+  });
+});
+
+describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
+  const TOPIC = 'arn:aws:sns:us-east-1:123456789012:vettid-alarms';
+  const PROVIDER = 'arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com';
+  const keys = t.findResources('AWS::KMS::Key');
+  const byUse = (spec: string): any => Object.values(keys).find((k: any) => k.Properties.KeySpec === spec) as any;
+  const publishLogical = Object.keys(t.findResources('AWS::IAM::Role', { Properties: { RoleName: 'vettid-votes-staging-publish' } }))[0];
+
+  test('two signing keys made in KMS, never deleted with the stack', () => {
+    expect(Object.keys(keys)).toHaveLength(2);
+    for (const spec of ['ECC_NIST_EDWARDS25519', 'ECC_NIST_P256']) {
+      const k = byUse(spec);
+      expect(k).toBeDefined();
+      expect(k.Properties.KeyUsage).toBe('SIGN_VERIFY');
+      expect(k.Properties.Origin ?? 'AWS_KMS').toBe('AWS_KMS'); // made inside KMS: no import, so no copy outside it
+      expect(k.DeletionPolicy).toBe('Retain');
+      expect(k.Properties.PendingWindowInDays).toBe(30);
+    }
+    t.hasResourceProperties('AWS::KMS::Alias', { AliasName: 'alias/vettid-votes-staging-site' });
+    t.hasResourceProperties('AWS::KMS::Alias', { AliasName: 'alias/vettid-votes-staging-list-anchor' });
+  });
+
+  test('only the publish role signs; no grants; only the root deletes', () => {
+    for (const spec of ['ECC_NIST_EDWARDS25519', 'ECC_NIST_P256']) {
+      const st: any[] = byUse(spec).Properties.KeyPolicy.Statement;
+      const allowSign = st.filter((x) => x.Effect === 'Allow' && asList(x.Action).some((a: string) => a === 'kms:Sign' || a === 'kms:*' || a === 'kms:Sign*'));
+      expect(allowSign).toHaveLength(1);
+      expect(allowSign[0].Principal.AWS).toEqual({ 'Fn::GetAtt': [publishLogical, 'Arn'] });
+      const admin = st.find((x) => x.Sid === 'Administer');
+      for (const a of asList(admin.Action)) {
+        expect(a).not.toMatch(/^kms:(\*|Sign)/);
+      }
+      expect(st.find((x) => x.Sid === 'OnlyThePublishRoleSigns')).toMatchObject({ Effect: 'Deny', Principal: { AWS: '*' }, Action: 'kms:Sign',
+        Condition: { ArnNotEquals: { 'aws:PrincipalArn': { 'Fn::GetAtt': [publishLogical, 'Arn'] } } } });
+      expect(st.find((x) => x.Sid === 'NoGrants')).toMatchObject({ Effect: 'Deny', Principal: { AWS: '*' }, Action: 'kms:CreateGrant' });
+      const del = st.find((x) => x.Sid === 'OnlyRootDeletes');
+      expect(del).toMatchObject({ Effect: 'Deny', Principal: { AWS: '*' }, Action: 'kms:ScheduleKeyDeletion' });
+      expect(JSON.stringify(del.Condition.ArnNotEquals['aws:PrincipalArn'])).toContain(':root');
+    }
+  });
+
+  test('the publish role: assumed only by the operator, for an hour; the service list and nothing else', () => {
+    const role = t.findResources('AWS::IAM::Role')[publishLogical] as any;
+    expect(role.Properties.MaxSessionDuration).toBe(3600);
+    expect(role.Properties.AssumeRolePolicyDocument.Statement).toEqual([
+      { Action: 'sts:AssumeRole', Effect: 'Allow', Principal: { AWS: PUBLISHER } },
+    ]);
+    const pol = Object.values(t.findResources('AWS::IAM::Policy')).find((p: any) =>
+      asList(p.Properties.Roles).some((r: any) => r.Ref === publishLogical)) as any;
+    const st: any[] = pol.Properties.PolicyDocument.Statement;
+    expect(st.map((x) => x.Sid).sort()).toEqual(['ServiceList', 'ServiceListList']);
+    expect(JSON.stringify(st.find((x) => x.Sid === 'ServiceList').Resource)).toContain('/v1/services*');
+    expect(st.find((x) => x.Sid === 'ServiceListList').Condition).toEqual({ StringLike: { 's3:prefix': 'v1/services*' } });
+    // No KMS in the role's own policy: the key policies are what let it sign.
+    expect(JSON.stringify(st)).not.toContain('kms:');
+  });
+
+  test('the publisher must be a role ARN', () => {
+    expect(validRoleArn(PUBLISHER)).toBe(true);
+    expect(validRoleArn('arn:aws:iam::123456789012:user/alice')).toBe(false);
+    expect(validRoleArn('arn:aws:iam::123456789012:root')).toBe(false);
+    expect(() => stack('x', 'staging', { publisherPrincipalArn: '*' })).toThrow(/publisherPrincipalArn/);
+  });
+
+  test('every use is logged, without the session name', () => {
+    const rule = Object.values(t.findResources('AWS::Events::Rule'))[0] as any;
+    expect(rule.Properties.State).toBe('ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
+    const pat = rule.Properties.EventPattern;
+    expect(pat.source).toEqual(['aws.kms']);
+    expect(pat.detail.eventName).toEqual([...KEY_USE_EVENTS]);
+    expect(pat.detail.resources.ARN).toHaveLength(2);
+    const target = JSON.stringify(rule.Properties.Targets);
+    expect(rule.Properties.Targets).toHaveLength(1);
+    expect(target).toContain(':log-group:');
+    t.hasResourceProperties('AWS::Logs::ResourcePolicy', { PolicyName: 'vettid-votes-staging-key-use' });
+    expect(target).toContain('sessionIssuer.arn');
+    expect(target).not.toContain('userIdentity.arn');
+    expect(target).not.toContain('principalId');
+    t.hasResource('AWS::Logs::LogGroup', { DeletionPolicy: 'Retain', Properties: { LogGroupName: '/vettid/votes/staging/key-use' } });
+    // Without a topic, no alarm.
+    expect(Object.keys(t.findResources('AWS::CloudWatch::Alarm', { Properties: { AlarmName: 'vettid-votes-staging-key-use' } }))).toHaveLength(0);
+  });
+
+  test('with the alert topic: any use raises the key-use alarm, outside the monitor\'s namespace', () => {
+    const a = Template.fromStack(stack('staging', 'staging', { alarmTopicArn: TOPIC, githubOidcProviderArn: PROVIDER }));
+    a.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      AlarmName: 'vettid-votes-staging-key-use', Namespace: 'VettID/VotesKeys/staging', MetricName: 'KeyUse',
+      Threshold: 1, ComparisonOperator: 'GreaterThanOrEqualToThreshold', EvaluationPeriods: 1, Period: 60,
+      AlarmActions: [TOPIC], TreatMissingData: 'notBreaching',
+    });
+    a.hasResourceProperties('AWS::Logs::MetricFilter', { MetricTransformations: [Match.objectLike({ MetricNamespace: 'VettID/VotesKeys/staging' })] });
+    expect('VettID/VotesKeys/staging').not.toBe(heartbeatNamespace('staging'));
+    expect(heartbeatNamespace('staging').startsWith('VettID/VotesKeys')).toBe(false);
+  });
+
+  test('outputs', () => {
+    t.hasOutput('SiteSigningKeyArn', {});
+    t.hasOutput('ListAnchorKeyArn', {});
+    t.hasOutput('PublishRoleArn', {});
   });
 });

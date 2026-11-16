@@ -8,7 +8,9 @@ import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cwactions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
+import * as events from 'aws-cdk-lib/aws-events';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as route53 from 'aws-cdk-lib/aws-route53';
@@ -86,6 +88,11 @@ export interface VotesStackProps extends cdk.StackProps {
    * the stack takes it rather than making it). Required with
    * alarmTopicArn. */
   readonly githubOidcProviderArn?: string;
+  /** The IAM role the operator signs in as (the owner's IAM Identity
+   * Center role, whose sign-in requires MFA): the only principal that may
+   * assume the publish role, which alone may sign with the site's KMS keys
+   * (VOTE-SITE-KEY-COMPROMISE §6, GC #12646). */
+  readonly publisherPrincipalArn: string;
   /** The function's code; by default `cmd/votes-api` built for arm64. */
   readonly lambdaCode?: lambda.Code;
 }
@@ -110,6 +117,16 @@ function buildApi(): lambda.Code {
   });
 }
 
+/** The KMS operations on the site's keys that raise the key-use alarm:
+ * every signature, and every change that could let someone else sign
+ * (a grant, a new key policy) or end the key. */
+export const KEY_USE_EVENTS = ['Sign', 'CreateGrant', 'PutKeyPolicy', 'ScheduleKeyDeletion', 'DisableKey'] as const;
+
+/** An IAM role ARN, as publisherPrincipalArn must be. */
+export function validRoleArn(a: string): boolean {
+  return /^arn:aws[a-z-]*:iam::[0-9]{12}:role\/[\w+=,.@\/-]{1,512}$/.test(a);
+}
+
 /** A base64 Ed25519 public key: 32 bytes. */
 export function validSiteKey(k: string): boolean {
   return /^[A-Za-z0-9+/]{43}=$/.test(k) && Buffer.from(k, 'base64').length === 32;
@@ -131,6 +148,9 @@ export class VotesStack extends cdk.Stack {
     const prefix = `vettid-votes-${props.envName}`;
     if (props.siteKey !== undefined && !validSiteKey(props.siteKey)) {
       throw new Error('siteKey must be a base64 Ed25519 public key (votesctl site-key)');
+    }
+    if (!validRoleArn(props.publisherPrincipalArn)) {
+      throw new Error(`publisherPrincipalArn must be an IAM role ARN (got "${props.publisherPrincipalArn}")`);
     }
     if (!cdk.Token.isUnresolved(this.region) && this.region !== 'us-east-1') {
       throw new Error('the stack must be in us-east-1: CloudFront takes its certificate from there');
@@ -347,11 +367,157 @@ export class VotesStack extends cdk.Stack {
     if (props.alarmTopicArn !== undefined || props.githubOidcProviderArn !== undefined) {
       this.monitorAlerts(prefix, props);
     }
+    // After monitorAlerts, which checks alarmTopicArn.
+    this.siteKeys(prefix, props);
 
     new cdk.CfnOutput(this, 'BucketName', { value: this.bucket.bucketName });
     new cdk.CfnOutput(this, 'SiteKeySecret', { value: siteKeySecret.secretArn });
     new cdk.CfnOutput(this, 'DistributionId', { value: this.distribution.distributionId });
     new cdk.CfnOutput(this, 'Url', { value: `https://${props.hostName}` });
+  }
+
+  /**
+   * The site's signing keys, made inside KMS so that they can never be
+   * exported (VOTE-SITE-KEY-COMPROMISE §6, GC #12646): the site key
+   * (Ed25519) that signs the service list, and the list anchor key
+   * (ECDSA P-256) that logs each list in Rekor. Only the publish role may
+   * sign with them, and only publisherPrincipalArn may assume it. Every
+   * signature, and every change that could let anyone else sign, is
+   * recorded in a log group, and, with alarmTopicArn, raises an alarm.
+   */
+  private siteKeys(prefix: string, props: VotesStackProps): void {
+    const publish = new iam.Role(this, 'PublishRole', {
+      roleName: `${prefix}-publish`,
+      description: 'votesctl publish-services: signs the service list with the site keys and writes it',
+      maxSessionDuration: cdk.Duration.hours(1),
+      assumedBy: new iam.ArnPrincipal(props.publisherPrincipalArn),
+    });
+    // The list and its kept versions (v1/services.json and .sig,
+    // v1/services/*), and nothing else in the bucket. The bucket policy
+    // still makes the kept versions write-once.
+    publish.addToPolicy(new iam.PolicyStatement({
+      sid: 'ServiceList', actions: ['s3:GetObject', 's3:PutObject'], resources: [this.bucket.arnForObjects('v1/services*')],
+    }));
+    publish.addToPolicy(new iam.PolicyStatement({
+      sid: 'ServiceListList', actions: ['s3:ListBucket'], resources: [this.bucket.bucketArn], // a missing copy is a 404, not a 403
+      conditions: { StringLike: { 's3:prefix': 'v1/services*' } },
+    }));
+
+    const root = new iam.AccountRootPrincipal();
+    const policy = (): iam.PolicyDocument => new iam.PolicyDocument({
+      statements: [
+        // The account keeps the key manageable (CloudFormation updates
+        // it), but its policies alone never let anyone sign.
+        new iam.PolicyStatement({
+          sid: 'Administer', principals: [root], resources: ['*'],
+          actions: ['kms:Create*', 'kms:Describe*', 'kms:Enable*', 'kms:List*', 'kms:Put*', 'kms:Update*', 'kms:Revoke*',
+            'kms:Disable*', 'kms:Get*', 'kms:Delete*', 'kms:TagResource', 'kms:UntagResource',
+            'kms:ScheduleKeyDeletion', 'kms:CancelKeyDeletion', 'kms:Verify'],
+        }),
+        new iam.PolicyStatement({
+          sid: 'PublishRoleSigns', principals: [publish], resources: ['*'],
+          actions: ['kms:Sign', 'kms:GetPublicKey', 'kms:DescribeKey'],
+        }),
+        new iam.PolicyStatement({
+          sid: 'OnlyThePublishRoleSigns', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()], resources: ['*'],
+          actions: ['kms:Sign'], conditions: { ArnNotEquals: { 'aws:PrincipalArn': publish.roleArn } },
+        }),
+        // A grant would let another principal sign without a policy change.
+        new iam.PolicyStatement({
+          sid: 'NoGrants', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()], resources: ['*'],
+          actions: ['kms:CreateGrant'],
+        }),
+        new iam.PolicyStatement({
+          sid: 'OnlyRootDeletes', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()], resources: ['*'],
+          actions: ['kms:ScheduleKeyDeletion'], conditions: { ArnNotEquals: { 'aws:PrincipalArn': root.arn } },
+        }),
+      ],
+    });
+    const site = new kms.Key(this, 'SiteSigningKey', {
+      alias: `${prefix}-site`,
+      description: 'The votes site key (Ed25519): signs the service list (votesctl publish-services)',
+      keySpec: kms.KeySpec.ECC_NIST_EDWARDS25519,
+      keyUsage: kms.KeyUsage.SIGN_VERIFY,
+      policy: policy(),
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pendingWindow: cdk.Duration.days(30),
+    });
+    const listAnchor = new kms.Key(this, 'ListAnchorKey', {
+      alias: `${prefix}-list-anchor`,
+      description: 'The votes list anchor key (ECDSA P-256): logs each service list in Rekor (votesctl publish-services)',
+      keySpec: kms.KeySpec.ECC_NIST_P256,
+      keyUsage: kms.KeyUsage.SIGN_VERIFY,
+      policy: policy(),
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pendingWindow: cdk.Duration.days(30),
+    });
+
+    // Every use, from CloudTrail through EventBridge into a log group kept
+    // for good: the time, the operation, the key and the role, not the
+    // session (an Identity Center session is named by an email address).
+    const keyUse = new logs.LogGroup(this, 'KeyUseLogs', {
+      logGroupName: `/vettid/votes/${props.envName}/key-use`,
+      retention: logs.RetentionDays.INFINITE,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    // EventBridge may write to it. Set here rather than by the
+    // CloudWatchLogGroup target, which would add a Lambda to set it.
+    new logs.ResourcePolicy(this, 'KeyUseLogsPolicy', {
+      resourcePolicyName: `${prefix}-key-use`,
+      policyStatements: [new iam.PolicyStatement({
+        principals: [new iam.ServicePrincipal('events.amazonaws.com'), new iam.ServicePrincipal('delivery.logs.amazonaws.com')],
+        actions: ['logs:CreateLogStream', 'logs:PutLogEvents'], resources: [keyUse.logGroupArn],
+      })],
+    });
+    const rule = new events.Rule(this, 'KeyUseRule', {
+      ruleName: `${prefix}-key-use`,
+      description: 'Every signature with the votes site keys, and every grant, key policy change, deletion or disabling',
+      eventPattern: {
+        source: ['aws.kms'],
+        detailType: ['AWS API Call via CloudTrail'],
+        detail: {
+          eventSource: ['kms.amazonaws.com'],
+          eventName: [...KEY_USE_EVENTS],
+          resources: { ARN: [site.keyArn, listAnchor.keyArn] },
+        },
+      },
+    });
+    rule.addTarget({
+      bind: () => ({
+        arn: this.formatArn({ service: 'logs', resource: 'log-group', arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME, resourceName: keyUse.logGroupName }),
+        input: events.RuleTargetInput.fromObject({
+          timestamp: events.EventField.time,
+          message: events.EventField.fromPath('$.detail.eventName') + ' ' + events.EventField.fromPath('$.detail.resources[0].ARN') +
+            ' by ' + events.EventField.fromPath('$.detail.userIdentity.sessionContext.sessionIssuer.arn') +
+            ' error=' + events.EventField.fromPath('$.detail.errorCode'),
+        }),
+      }),
+    });
+    (rule.node.defaultChild as events.CfnRule).addPropertyOverride('State', 'ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
+
+    if (props.alarmTopicArn !== undefined) {
+      // Not the heartbeat's namespace: the monitor's role may put metrics
+      // there, and a negative value would hide a use.
+      const namespace = `VettID/VotesKeys/${props.envName}`;
+      new logs.MetricFilter(this, 'KeyUseMetric', {
+        logGroup: keyUse, filterPattern: logs.FilterPattern.allEvents(),
+        metricNamespace: namespace, metricName: 'KeyUse', metricValue: '1',
+      });
+      const alarm = new cloudwatch.Alarm(this, 'KeyUseAlarm', {
+        alarmName: `${prefix}-key-use`,
+        alarmDescription: `A votes site key of ${props.envName} was used or changed (a publish signs twice): see ${keyUse.logGroupName}`,
+        metric: new cloudwatch.Metric({ namespace, metricName: 'KeyUse', statistic: cloudwatch.Stats.SUM, period: cdk.Duration.minutes(1) }),
+        threshold: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      });
+      alarm.addAlarmAction(new cwactions.SnsAction(sns.Topic.fromTopicArn(this, 'KeyUseTopic', props.alarmTopicArn)));
+    }
+
+    new cdk.CfnOutput(this, 'SiteSigningKeyArn', { value: site.keyArn });
+    new cdk.CfnOutput(this, 'ListAnchorKeyArn', { value: listAnchor.keyArn });
+    new cdk.CfnOutput(this, 'PublishRoleArn', { value: publish.roleArn });
   }
 
   /** The monitor's role and its heartbeat alarm (docs/VOTES-SITE.md §7). */
