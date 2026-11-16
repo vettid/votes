@@ -182,14 +182,49 @@ Their key policies let the publish role alone sign (`kms:Sign` is denied
 to every other principal), allow no grants, and let only the account's
 root user schedule their deletion; the account keeps administering them
 (CloudFormation updates them). The publish role may read and write the
-service list (`v1/services.json`, `.sig` and `v1/services/*`) and
-nothing else. Every signature, grant, key policy change, deletion or
-disabling of either key is written to the log group
-`/vettid/votes/<env>/key-use` (kept for good; the role, not the session,
-whose name is an email address) and, with `alarmTopicArn`, raises the
-alarm `vettid-votes-<env>-key-use`: a publish raises it once, so any
-other is a use to explain. Until the staging flag day, `votesctl` still
-signs with the secret's key (GC #12646, tasks 2 to 5).
+service list (`v1/services.json`, `.sig` and `v1/services/*`) and list
+the bucket (so that a missing copy is a 404; every document is public),
+and nothing else.
+
+**The watch.** Two EventBridge rules with one pattern (each sees a change
+to the other, so every entry is logged twice) write to the log group
+`/vettid/votes/<env>/key-use`, kept for good:
+
+- every signature with either key, and every grant, key policy change,
+  alias change, deletion or disabling;
+- every change to the publish role (its trust or permission policies, a
+  boundary, its deletion);
+- every change to the watch itself: its rules and targets, its alarms,
+  its log group, metric filter and resource policy.
+
+Each line has the operation, the key or role, the caller's identity type,
+role and temporary key id (traceable to its `AssumeRole` in CloudTrail)
+and the CloudTrail event id: never the session name, which is an email
+address. With `alarmTopicArn`, any line raises the alarm
+`vettid-votes-<env>-key-use` (counted by samples, so a value anyone puts
+in its namespace can only raise it), and a delivery that fails after
+EventBridge's retries goes to the queue `vettid-votes-<env>-key-use-dlq`
+and raises `vettid-votes-<env>-key-use-feed`.
+
+- **A publish raises the key-use alarm, and so does a deploy of this
+  stack** (it updates the watch). **A publish that does not raise it means
+  the feed is broken: stop publishing and find out why.**
+- The feed needs CloudTrail's management events (read and write) for
+  `us-east-1` in the account: EventBridge gets them from CloudTrail.
+- The trust names one Identity Center role. If its permission set is
+  reprovisioned, the trust no longer matches (the publish role can't be
+  assumed, which fails closed): deploy again with the new role's ARN as
+  `publisherPrincipalArn`. MFA is enforced by Identity Center at sign-in;
+  the trust policy can't test it for those sessions.
+- **After the first deploy of an environment, check** (with the owner):
+  a trail as above is logging; a test signature with the publish role
+  lands in the log (twice), raises the alarm, and its line names the role
+  and no session; a refused `Sign` by another principal is logged too, or
+  note that it isn't; and `GetObject` of a missing `v1/services/<n>.json`
+  under the publish role is a 404.
+
+Until the staging flag day, `votesctl` still signs with the secret's key
+(GC #12646, tasks 2 to 5).
 
 ### Clearing a stray version copy
 

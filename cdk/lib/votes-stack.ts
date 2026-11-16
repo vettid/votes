@@ -18,6 +18,7 @@ import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as sns from 'aws-cdk-lib/aws-sns';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import { Construct } from 'constructs';
 
@@ -117,10 +118,27 @@ function buildApi(): lambda.Code {
   });
 }
 
-/** The KMS operations on the site's keys that raise the key-use alarm:
- * every signature, and every change that could let someone else sign
- * (a grant, a new key policy) or end the key. */
-export const KEY_USE_EVENTS = ['Sign', 'CreateGrant', 'PutKeyPolicy', 'ScheduleKeyDeletion', 'DisableKey'] as const;
+/** The KMS operations on the site's keys that are logged and raise the
+ * key-use alarm: every signature, and every change that could let
+ * someone else sign (a grant, a new key policy, an alias pointed
+ * elsewhere) or end the key. */
+export const KEY_USE_EVENTS = ['Sign', 'CreateGrant', 'PutKeyPolicy', 'ScheduleKeyDeletion', 'DisableKey',
+  'CreateAlias', 'UpdateAlias', 'DeleteAlias'] as const;
+
+/** The IAM operations on the publish role that are logged and alarmed
+ * the same way: a change to who may assume it or what it may do. */
+export const PUBLISH_ROLE_EVENTS = ['UpdateAssumeRolePolicy', 'PutRolePolicy', 'DeleteRolePolicy', 'AttachRolePolicy',
+  'DetachRolePolicy', 'PutRolePermissionsBoundary', 'DeleteRolePermissionsBoundary', 'UpdateRole', 'DeleteRole'] as const;
+
+/** The operations on the watch itself (its rules, its alarms, its log
+ * group, metric filter and resource policy) that are logged and alarmed
+ * the same way, so that it can't be switched off unseen. */
+export const WATCH_EVENTS = {
+  'events.amazonaws.com': ['DisableRule', 'DeleteRule', 'PutRule', 'RemoveTargets', 'PutTargets'],
+  'monitoring.amazonaws.com': ['DisableAlarmActions', 'DeleteAlarms', 'PutMetricAlarm', 'SetAlarmState'],
+  'logs.amazonaws.com': ['DeleteLogGroup', 'PutRetentionPolicy', 'DeleteMetricFilter', 'PutMetricFilter',
+    'DeleteResourcePolicy', 'PutResourcePolicy'],
+} as const;
 
 /** An IAM role ARN, as publisherPrincipalArn must be. */
 export function validRoleArn(a: string): boolean {
@@ -398,9 +416,11 @@ export class VotesStack extends cdk.Stack {
     publish.addToPolicy(new iam.PolicyStatement({
       sid: 'ServiceList', actions: ['s3:GetObject', 's3:PutObject'], resources: [this.bucket.arnForObjects('v1/services*')],
     }));
+    // So that a missing copy is a 404, not a 403. Without a prefix
+    // condition: S3's own check for that has no prefix, and every
+    // document in the bucket is public anyway.
     publish.addToPolicy(new iam.PolicyStatement({
-      sid: 'ServiceListList', actions: ['s3:ListBucket'], resources: [this.bucket.bucketArn], // a missing copy is a 404, not a 403
-      conditions: { StringLike: { 's3:prefix': 'v1/services*' } },
+      sid: 'ServiceListList', actions: ['s3:ListBucket'], resources: [this.bucket.bucketArn],
     }));
 
     const root = new iam.AccountRootPrincipal();
@@ -453,66 +473,131 @@ export class VotesStack extends cdk.Stack {
     });
 
     // Every use, from CloudTrail through EventBridge into a log group kept
-    // for good: the time, the operation, the key and the role, not the
-    // session (an Identity Center session is named by an email address).
+    // for good: the time, the operation, the key or role, the caller's
+    // role, kind and temporary key id (traceable to its AssumeRole), and
+    // the CloudTrail event id; never the session name (an Identity Center
+    // session is named by an email address).
     const keyUse = new logs.LogGroup(this, 'KeyUseLogs', {
       logGroupName: `/vettid/votes/${props.envName}/key-use`,
       retention: logs.RetentionDays.INFINITE,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
-    // EventBridge may write to it. Set here rather than by the
-    // CloudWatchLogGroup target, which would add a Lambda to set it.
+    // Deliveries that fail after EventBridge's retries land here, and
+    // raise the feed alarm: a silent feed must not look like no use.
+    const deadLetters = new sqs.Queue(this, 'KeyUseDeadLetters', {
+      queueName: `${prefix}-key-use-dlq`,
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    const ruleNames = [`${prefix}-key-use`, `${prefix}-key-use-b`];
+    const alarmNames = [`${prefix}-key-use`, `${prefix}-key-use-feed`];
+    const filterName = `${prefix}-key-use`;
+    const policyName = `${prefix}-key-use`;
+    const pattern = {
+      detailType: ['AWS API Call via CloudTrail'],
+      detail: {
+        $or: [
+          { eventSource: ['kms.amazonaws.com'], eventName: [...KEY_USE_EVENTS], resources: { ARN: [site.keyArn, listAnchor.keyArn] } },
+          { eventSource: ['iam.amazonaws.com'], eventName: [...PUBLISH_ROLE_EVENTS], requestParameters: { roleName: [publish.roleName] } },
+          { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS['events.amazonaws.com']], requestParameters: { name: ruleNames } },
+          { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS['events.amazonaws.com']], requestParameters: { rule: ruleNames } },
+          { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS['monitoring.amazonaws.com']], requestParameters: { alarmNames } },
+          { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS['monitoring.amazonaws.com']], requestParameters: { alarmName: alarmNames } },
+          { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS['logs.amazonaws.com']], requestParameters: { logGroupName: [keyUse.logGroupName] } },
+          { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS['logs.amazonaws.com']], requestParameters: { policyName: [policyName] } },
+        ],
+      },
+    };
+    const target = this.formatArn({ service: 'logs', resource: 'log-group', arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME, resourceName: keyUse.logGroupName });
+    const f = (path: string): string => events.EventField.fromPath(path);
+    // Two rules with the same pattern: each logs a change to the other, so
+    // switching one off is seen (every entry is logged twice).
+    const rules = ruleNames.map((ruleName, i) => {
+      const rule = new events.Rule(this, i === 0 ? 'KeyUseRule' : 'KeyUseRuleB', {
+        ruleName,
+        description: 'The votes site keys: every signature, and every change that could let someone else sign or silence this',
+        eventPattern: pattern,
+      });
+      rule.addTarget({
+        bind: () => ({
+          arn: target,
+          deadLetterConfig: { arn: deadLetters.queueArn },
+          retryPolicy: { maximumRetryAttempts: 185, maximumEventAgeInSeconds: 86400 },
+          input: events.RuleTargetInput.fromObject({
+            timestamp: events.EventField.time,
+            message: f('$.detail.eventSource') + ' ' + f('$.detail.eventName') + ' ' + f('$.detail.resources[0].ARN') +
+              f('$.detail.requestParameters.roleName') + ' by ' + f('$.detail.userIdentity.type') + ' ' +
+              f('$.detail.userIdentity.sessionContext.sessionIssuer.arn') + ' key ' + f('$.detail.userIdentity.accessKeyId') +
+              ' error ' + f('$.detail.errorCode') + ' event ' + f('$.detail.eventID'),
+          }),
+        }),
+      });
+      // Sign may count as a read-only management event, which a rule gets
+      // only in this state (not settable through the Rule construct).
+      (rule.node.defaultChild as events.CfnRule).addPropertyOverride('State', 'ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
+      return rule;
+    });
+    const fromRules = { ArnEquals: { 'aws:SourceArn': rules.map((r) => r.ruleArn) } };
+    // Only these rules may write to the log group or the dead letters. Set
+    // here rather than by the CloudWatchLogGroup target, which would add a
+    // Lambda to set it.
     new logs.ResourcePolicy(this, 'KeyUseLogsPolicy', {
-      resourcePolicyName: `${prefix}-key-use`,
+      resourcePolicyName: policyName,
       policyStatements: [new iam.PolicyStatement({
-        principals: [new iam.ServicePrincipal('events.amazonaws.com'), new iam.ServicePrincipal('delivery.logs.amazonaws.com')],
+        principals: [new iam.ServicePrincipal('events.amazonaws.com')],
         actions: ['logs:CreateLogStream', 'logs:PutLogEvents'], resources: [keyUse.logGroupArn],
+        conditions: fromRules,
       })],
     });
-    const rule = new events.Rule(this, 'KeyUseRule', {
-      ruleName: `${prefix}-key-use`,
-      description: 'Every signature with the votes site keys, and every grant, key policy change, deletion or disabling',
-      eventPattern: {
-        source: ['aws.kms'],
-        detailType: ['AWS API Call via CloudTrail'],
-        detail: {
-          eventSource: ['kms.amazonaws.com'],
-          eventName: [...KEY_USE_EVENTS],
-          resources: { ARN: [site.keyArn, listAnchor.keyArn] },
-        },
-      },
-    });
-    rule.addTarget({
-      bind: () => ({
-        arn: this.formatArn({ service: 'logs', resource: 'log-group', arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME, resourceName: keyUse.logGroupName }),
-        input: events.RuleTargetInput.fromObject({
-          timestamp: events.EventField.time,
-          message: events.EventField.fromPath('$.detail.eventName') + ' ' + events.EventField.fromPath('$.detail.resources[0].ARN') +
-            ' by ' + events.EventField.fromPath('$.detail.userIdentity.sessionContext.sessionIssuer.arn') +
-            ' error=' + events.EventField.fromPath('$.detail.errorCode'),
-        }),
-      }),
-    });
-    (rule.node.defaultChild as events.CfnRule).addPropertyOverride('State', 'ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
+    deadLetters.addToResourcePolicy(new iam.PolicyStatement({
+      principals: [new iam.ServicePrincipal('events.amazonaws.com')],
+      actions: ['sqs:SendMessage'], resources: [deadLetters.queueArn],
+      conditions: fromRules,
+    }));
 
     if (props.alarmTopicArn !== undefined) {
-      // Not the heartbeat's namespace: the monitor's role may put metrics
-      // there, and a negative value would hide a use.
+      const topic = sns.Topic.fromTopicArn(this, 'KeyUseTopic', props.alarmTopicArn);
+      // Not the heartbeat's namespace, which the monitor's role may put
+      // metrics in; and SampleCount, not Sum, so that a value anyone puts
+      // there can only raise the alarm, never hide a use.
       const namespace = `VettID/VotesKeys/${props.envName}`;
       new logs.MetricFilter(this, 'KeyUseMetric', {
-        logGroup: keyUse, filterPattern: logs.FilterPattern.allEvents(),
+        filterName, logGroup: keyUse, filterPattern: logs.FilterPattern.allEvents(),
         metricNamespace: namespace, metricName: 'KeyUse', metricValue: '1',
       });
       const alarm = new cloudwatch.Alarm(this, 'KeyUseAlarm', {
-        alarmName: `${prefix}-key-use`,
-        alarmDescription: `A votes site key of ${props.envName} was used or changed (a publish signs twice): see ${keyUse.logGroupName}`,
-        metric: new cloudwatch.Metric({ namespace, metricName: 'KeyUse', statistic: cloudwatch.Stats.SUM, period: cdk.Duration.minutes(1) }),
+        alarmName: alarmNames[0],
+        alarmDescription: `A votes site key of ${props.envName}, its publish role or this watch was used or changed: see ${keyUse.logGroupName}. ` +
+          'A publish raises it (two signatures, each logged twice); a publish that does not means the feed is broken: stop and check it.',
+        metric: new cloudwatch.Metric({ namespace, metricName: 'KeyUse', statistic: cloudwatch.Stats.SAMPLE_COUNT, period: cdk.Duration.minutes(1) }),
         threshold: 1,
         comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
         evaluationPeriods: 1,
         treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
       });
-      alarm.addAlarmAction(new cwactions.SnsAction(sns.Topic.fromTopicArn(this, 'KeyUseTopic', props.alarmTopicArn)));
+      alarm.addAlarmAction(new cwactions.SnsAction(topic));
+      // The feed: a failed delivery, or one in the dead letters.
+      const failed = new cloudwatch.MathExpression({
+        label: 'failed deliveries and dead letters',
+        expression: 'f0 + f1 + d',
+        usingMetrics: {
+          f0: new cloudwatch.Metric({ namespace: 'AWS/Events', metricName: 'FailedInvocations', dimensionsMap: { RuleName: ruleNames[0] }, statistic: cloudwatch.Stats.SUM, period: cdk.Duration.minutes(5) }),
+          f1: new cloudwatch.Metric({ namespace: 'AWS/Events', metricName: 'FailedInvocations', dimensionsMap: { RuleName: ruleNames[1] }, statistic: cloudwatch.Stats.SUM, period: cdk.Duration.minutes(5) }),
+          d: deadLetters.metricApproximateNumberOfMessagesVisible({ statistic: cloudwatch.Stats.MAXIMUM, period: cdk.Duration.minutes(5) }),
+        },
+        period: cdk.Duration.minutes(5),
+      });
+      const feed = new cloudwatch.Alarm(this, 'KeyUseFeedAlarm', {
+        alarmName: alarmNames[1],
+        alarmDescription: `The key-use feed of ${props.envName} failed to deliver: uses of the votes site keys may be missing from ${keyUse.logGroupName}; see ${deadLetters.queueName}`,
+        metric: failed,
+        threshold: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      });
+      feed.addAlarmAction(new cwactions.SnsAction(topic));
     }
 
     new cdk.CfnOutput(this, 'SiteSigningKeyArn', { value: site.keyArn });

@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import { API_RATE_LIMIT, API_RATE_WINDOW_SECONDS, HEARTBEAT, heartbeatNamespace, KEY_USE_EVENTS, LAMBDA_TIMEOUT_SECONDS, MONITOR_OIDC, VotesStack, validRoleArn, validSiteKey } from '../lib/votes-stack';
+import { API_RATE_LIMIT, API_RATE_WINDOW_SECONDS, HEARTBEAT, heartbeatNamespace, KEY_USE_EVENTS, LAMBDA_TIMEOUT_SECONDS, MONITOR_OIDC, PUBLISH_ROLE_EVENTS, VotesStack, validRoleArn, validSiteKey, WATCH_EVENTS } from '../lib/votes-stack';
 
 // A fixed public test value, not a real key: 32 bytes of 0x07.
 const SITE_KEY = Buffer.alloc(32, 7).toString('base64');
@@ -262,7 +262,7 @@ describe('monitor alerts', () => {
   });
 
   test('the heartbeat alarm: three hours without a successful run, missing data breaching, to the topic', () => {
-    m.resourceCountIs('AWS::CloudWatch::Alarm', 2); // and the key-use alarm (site keys, below)
+    m.resourceCountIs('AWS::CloudWatch::Alarm', 3); // and the key-use and feed alarms (site keys, below)
     m.hasResourceProperties('AWS::CloudWatch::Alarm', {
       AlarmName: 'vettid-votes-staging-monitor-heartbeat',
       Namespace: heartbeatNamespace('staging'), MetricName: 'MonitorHeartbeat', Dimensions: [{ Name: 'env', Value: 'staging' }],
@@ -333,7 +333,9 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     const st: any[] = pol.Properties.PolicyDocument.Statement;
     expect(st.map((x) => x.Sid).sort()).toEqual(['ServiceList', 'ServiceListList']);
     expect(JSON.stringify(st.find((x) => x.Sid === 'ServiceList').Resource)).toContain('/v1/services*');
-    expect(st.find((x) => x.Sid === 'ServiceListList').Condition).toEqual({ StringLike: { 's3:prefix': 'v1/services*' } });
+    // Unconditioned, so that a missing copy is a 404 (all documents are public).
+    expect(st.find((x) => x.Sid === 'ServiceListList')).toMatchObject({ Action: 's3:ListBucket', Resource: { 'Fn::GetAtt': [expect.stringMatching(/^Bucket/), 'Arn'] } });
+    expect(st.find((x) => x.Sid === 'ServiceListList').Condition).toBeUndefined();
     // No KMS in the role's own policy: the key policies are what let it sign.
     expect(JSON.stringify(st)).not.toContain('kms:');
   });
@@ -345,34 +347,86 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     expect(() => stack('x', 'staging', { publisherPrincipalArn: '*' })).toThrow(/publisherPrincipalArn/);
   });
 
-  test('every use is logged, without the session name', () => {
-    const rule = Object.values(t.findResources('AWS::Events::Rule'))[0] as any;
-    expect(rule.Properties.State).toBe('ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
-    const pat = rule.Properties.EventPattern;
-    expect(pat.source).toEqual(['aws.kms']);
-    expect(pat.detail.eventName).toEqual([...KEY_USE_EVENTS]);
-    expect(pat.detail.resources.ARN).toHaveLength(2);
-    const target = JSON.stringify(rule.Properties.Targets);
-    expect(rule.Properties.Targets).toHaveLength(1);
-    expect(target).toContain(':log-group:');
-    t.hasResourceProperties('AWS::Logs::ResourcePolicy', { PolicyName: 'vettid-votes-staging-key-use' });
-    expect(target).toContain('sessionIssuer.arn');
-    expect(target).not.toContain('userIdentity.arn');
-    expect(target).not.toContain('principalId');
-    t.hasResource('AWS::Logs::LogGroup', { DeletionPolicy: 'Retain', Properties: { LogGroupName: '/vettid/votes/staging/key-use' } });
-    // Without a topic, no alarm.
-    expect(Object.keys(t.findResources('AWS::CloudWatch::Alarm', { Properties: { AlarmName: 'vettid-votes-staging-key-use' } }))).toHaveLength(0);
+  const rules = (): any[] => Object.values(t.findResources('AWS::Events::Rule')) as any[];
+  const alts = (): any[] => rules()[0].Properties.EventPattern.detail.$or;
+  const alt = (src: string): any[] => alts().filter((x) => x.eventSource[0] === src);
+
+  test('two rules with one pattern, each in the state that gets read-only events', () => {
+    const r = rules();
+    expect(r.map((x) => x.Properties.Name).sort()).toEqual(['vettid-votes-staging-key-use', 'vettid-votes-staging-key-use-b']);
+    expect(r[1].Properties.EventPattern).toEqual(r[0].Properties.EventPattern);
+    for (const x of r) expect(x.Properties.State).toBe('ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
+    expect(r[0].Properties.EventPattern['detail-type']).toEqual(['AWS API Call via CloudTrail']);
   });
 
-  test('with the alert topic: any use raises the key-use alarm, outside the monitor\'s namespace', () => {
+  test('watched: the keys, the publish role, and the watch itself', () => {
+    const k = alt('kms.amazonaws.com');
+    expect(k).toHaveLength(1);
+    expect(k[0].eventName).toEqual([...KEY_USE_EVENTS]);
+    expect(k[0].eventName).toEqual(expect.arrayContaining(['Sign', 'CreateGrant', 'PutKeyPolicy', 'UpdateAlias']));
+    expect(k[0].resources.ARN).toHaveLength(2);
+    const i = alt('iam.amazonaws.com');
+    expect(i).toHaveLength(1);
+    expect(i[0].eventName).toEqual([...PUBLISH_ROLE_EVENTS]);
+    expect(i[0].eventName).toEqual(expect.arrayContaining(['UpdateAssumeRolePolicy', 'PutRolePolicy', 'AttachRolePolicy']));
+    expect(i[0].requestParameters.roleName).toEqual([{ Ref: publishLogical }]);
+    const ev = JSON.stringify(alt('events.amazonaws.com'));
+    expect(ev).toContain('DisableRule');
+    expect(ev).toContain('vettid-votes-staging-key-use-b');
+    const mon = JSON.stringify(alt('monitoring.amazonaws.com'));
+    for (const w of ['DisableAlarmActions', 'DeleteAlarms', 'vettid-votes-staging-key-use-feed']) expect(mon).toContain(w);
+    const lg = JSON.stringify(alt('logs.amazonaws.com'));
+    for (const w of ['DeleteMetricFilter', 'DeleteResourcePolicy', 'DeleteLogGroup', 'vettid-votes-staging-key-use']) expect(lg).toContain(w);
+    for (const src of Object.keys(WATCH_EVENTS)) expect(alt(src).length).toBeGreaterThan(0);
+  });
+
+  test('every use is logged, without the session name; failed deliveries go to the dead letters', () => {
+    for (const r of rules()) {
+      expect(r.Properties.Targets).toHaveLength(1);
+      const tg = r.Properties.Targets[0];
+      expect(JSON.stringify(tg.Arn)).toContain(':log-group:');
+      expect(tg.DeadLetterConfig.Arn).toEqual({ 'Fn::GetAtt': [expect.stringMatching(/^KeyUseDeadLetters/), 'Arn'] });
+      const paths = Object.values(tg.InputTransformer.InputPathsMap) as string[];
+      expect(paths).toEqual(expect.arrayContaining(['$.time', '$.detail.eventName', '$.detail.userIdentity.sessionContext.sessionIssuer.arn',
+        '$.detail.userIdentity.type', '$.detail.userIdentity.accessKeyId', '$.detail.eventID']));
+      for (const pth of paths) {
+        expect(pth).not.toMatch(/userIdentity\.(arn|principalId|userName)$|sessionName|email/);
+      }
+      // The shape a log group target needs: {"timestamp": <time>, "message": "..."}.
+      expect(tg.InputTransformer.InputTemplate).toMatch(/^\{"timestamp":<time>,"message":"[^"]*"\}$/);
+    }
+    t.hasResource('AWS::Logs::LogGroup', { DeletionPolicy: 'Retain', Properties: { LogGroupName: '/vettid/votes/staging/key-use' } });
+    // Without a topic, no alarm.
+    expect(Object.keys(t.findResources('AWS::CloudWatch::Alarm'))).toHaveLength(0);
+  });
+
+  test('only the two rules may write the log group and the dead letters', () => {
+    const lp = Object.values(t.findResources('AWS::Logs::ResourcePolicy'))[0] as any;
+    const doc = JSON.parse(lp.Properties.PolicyDocument['Fn::Join'] ? JSON.stringify(lp.Properties.PolicyDocument) : lp.Properties.PolicyDocument);
+    const text = JSON.stringify(doc);
+    expect(text).toContain('events.amazonaws.com');
+    expect(text).not.toContain('delivery.logs.amazonaws.com');
+    expect(text).toContain('aws:SourceArn');
+    const qp = Object.values(t.findResources('AWS::SQS::QueuePolicy'))[0] as any;
+    const send = qp.Properties.PolicyDocument.Statement.find((x: any) => x.Action === 'sqs:SendMessage');
+    expect(send.Principal).toEqual({ Service: 'events.amazonaws.com' });
+    expect(send.Condition.ArnEquals['aws:SourceArn']).toHaveLength(2);
+  });
+
+  test('with the alert topic: any use raises the key-use alarm (SampleCount, outside the monitor\'s namespace), and a failed delivery the feed alarm', () => {
     const a = Template.fromStack(stack('staging', 'staging', { alarmTopicArn: TOPIC, githubOidcProviderArn: PROVIDER }));
     a.hasResourceProperties('AWS::CloudWatch::Alarm', {
-      AlarmName: 'vettid-votes-staging-key-use', Namespace: 'VettID/VotesKeys/staging', MetricName: 'KeyUse',
+      AlarmName: 'vettid-votes-staging-key-use', Namespace: 'VettID/VotesKeys/staging', MetricName: 'KeyUse', Statistic: 'SampleCount',
       Threshold: 1, ComparisonOperator: 'GreaterThanOrEqualToThreshold', EvaluationPeriods: 1, Period: 60,
       AlarmActions: [TOPIC], TreatMissingData: 'notBreaching',
     });
+    const feed = Object.values(a.findResources('AWS::CloudWatch::Alarm', { Properties: { AlarmName: 'vettid-votes-staging-key-use-feed' } }))[0] as any;
+    expect(feed.Properties.AlarmActions).toEqual([TOPIC]);
+    const text = JSON.stringify(feed.Properties.Metrics);
+    expect(text).toContain('FailedInvocations');
+    expect(text).toContain('ApproximateNumberOfMessagesVisible');
+    expect(text).toContain('vettid-votes-staging-key-use-b');
     a.hasResourceProperties('AWS::Logs::MetricFilter', { MetricTransformations: [Match.objectLike({ MetricNamespace: 'VettID/VotesKeys/staging' })] });
-    expect('VettID/VotesKeys/staging').not.toBe(heartbeatNamespace('staging'));
     expect(heartbeatNamespace('staging').startsWith('VettID/VotesKeys')).toBe(false);
   });
 
