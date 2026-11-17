@@ -608,6 +608,11 @@ export class VotesStack extends cdk.Stack {
     const heartbeatRuleName = `${prefix}-kw-heartbeat`;
     const heartbeatAlarmName = `${prefix}-key-watch-heartbeat`;
     const watchedRuleNames = [...ruleNames, heartbeatRuleName];
+    const heartbeatLogName = `/vettid/votes/${props.envName}/key-watch-heartbeat`;
+    // The key watch's metrics. The heartbeat alarm fires on too few data
+    // points, so a metric filter elsewhere feeding this namespace could
+    // keep it quiet: any PutMetricFilter into it is watched.
+    const keysNamespace = `VettID/VotesKeys/${props.envName}`;
     const alarmNames = [`${prefix}-key-use`, `${prefix}-key-use-feed`, heartbeatAlarmName];
     const policyName = `${prefix}-key-use`;
     const topicArns = [alarmTopicArn, ...watchTopics.map((t) => t.topicArn)];
@@ -633,8 +638,12 @@ export class VotesStack extends cdk.Stack {
         // rule and alarm, this pattern would pass the quota.)
         // Any alarm mute rule: one can name the watch's alarms.
         { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.muteRules] },
-        { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logGroup], requestParameters: { logGroupName: [keyUse.logGroupName] } },
+        { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logGroup],
+          requestParameters: { logGroupName: [keyUse.logGroupName, heartbeatLogName] } },
         { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logPolicies] },
+        // A metric filter on any log group that feeds the watch's metrics.
+        { eventSource: ['logs.amazonaws.com'], eventName: ['PutMetricFilter'],
+          requestParameters: { metricTransformations: { metricNamespace: [keysNamespace] } } },
         { eventSource: ['sqs.amazonaws.com'], eventName: [...WATCH_EVENTS.queue], requestParameters: { queueUrl: [deadLetters.queueUrl] } },
       ],
       notify: [
@@ -708,7 +717,7 @@ export class VotesStack extends cdk.Stack {
       sid: 'KeyWatchHeartbeat', actions: ['kms:DescribeKey'], resources: [site.keyArn],
     }));
     const heartbeatLogs = new logs.LogGroup(this, 'KeyWatchHeartbeatLogs', {
-      logGroupName: `/vettid/votes/${props.envName}/key-watch-heartbeat`,
+      logGroupName: heartbeatLogName,
       retention: logs.RetentionDays.ONE_MONTH,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
@@ -765,10 +774,14 @@ export class VotesStack extends cdk.Stack {
 
     // The alarms, to every topic: the alarm topic and the watch's two (so
     // silencing one path is told on another).
-    // Not the heartbeat's namespace, which the monitor's role may put
-    // metrics in; and SampleCount, not Sum, so that a value anyone puts
-    // there can only raise the alarm, never hide a use.
-    const namespace = `VettID/VotesKeys/${props.envName}`;
+    // Not the monitor heartbeat's namespace, which the monitor's role may
+    // put metrics in. For key-use, SampleCount, not Sum, so that a value
+    // anyone puts there can only raise the alarm, never hide a use. The
+    // key watch heartbeat's alarm fires on too few data points, so a value
+    // put there could hide a stopped feed: PutMetricData is a data-plane
+    // call no trail shows, a stated limit (README "The heartbeat"); a
+    // metric filter into the namespace is watched (above).
+    const namespace = keysNamespace;
     new logs.MetricFilter(this, 'KeyUseMetric', {
       filterName: policyName, logGroup: keyUse, filterPattern: logs.FilterPattern.allEvents(),
       metricNamespace: namespace, metricName: 'KeyUse', metricValue: '1',
@@ -798,7 +811,8 @@ export class VotesStack extends cdk.Stack {
     });
     const feed = new cloudwatch.Alarm(this, 'KeyUseFeedAlarm', {
       alarmName: alarmNames[1],
-      alarmDescription: `The key watch of ${props.envName} failed to deliver: uses of the votes site keys may be missing from ${keyUse.logGroupName} and its emails. ` +
+      alarmDescription: `The key watch of ${props.envName} failed to deliver: uses of the votes site keys may be missing from ${keyUse.logGroupName} and its emails ` +
+        `(or heartbeats from ${heartbeatLogName}). ` +
         `Read the dead letters in ${deadLetters.queueName}, then purge them: the alarm stays in ALARM while any remain.`,
       metric: failed,
       threshold: 1,

@@ -193,13 +193,14 @@ jobs:
         env:
           ENV_NAME: ${{ matrix.env }}
         run: |
-          aws kms describe-key --key-id "alias/vettid-votes-${ENV_NAME}-site" --region us-east-1 \
+          aws kms describe-key --key-id "alias/vettid-votes-${ENV_NAME}-site" --region "$AWS_REGION" \
             --query 'KeyMetadata.[KeyId,KeyState]' --output text
       - name: alert (a failed run)
         if: ${{ failure() && steps.aws.outcome == 'success' }}
         env:
           TOPIC_ARN: ${{ vars[matrix.topic_var] }}
           CODE: ${{ steps.check.outputs.code }}
+          CHECK: ${{ steps.check.outcome }}
           KEY_WATCH: ${{ steps.key_watch.outcome }}
           ENV_NAME: ${{ matrix.env }}
           SITE: ${{ matrix.site }}
@@ -208,20 +209,24 @@ jobs:
           case "$CODE" in
             3) what="mismatches (votesctl check exit 3)" ;;
             1) what="a check failed (votesctl check exit 1)" ;;
-            ""|0) what="" ;;
+            config) what="the monitor is misconfigured (no site key or log pins; votesctl did not run)" ;;
+            0) what="" ;;
+            "") if [ "$CHECK" = "success" ]; then what=""; else what="the run failed before the check"; fi ;;
             *) what="votesctl check exit $CODE" ;;
           esac
           if [ "$KEY_WATCH" = "failure" ]; then
             what="${what:+$what; }the key watch heartbeat failed (aws kms describe-key)"
           fi
-          [ -n "$what" ] || what="the run failed before the check"
+          [ -n "$what" ] || what="the run failed (see its log)"
           region=$(cut -d: -f4 <<<"$TOPIC_ARN")
           aws sns publish --region "$region" --topic-arn "$TOPIC_ARN" \
             --subject "votes monitor ($ENV_NAME): failed" \
             --message "$(printf 'The votes monitor failed for %s (%s): %s.\nThe report is in the log of the run: %s\n' "$ENV_NAME" "$SITE" "$what" "$RUN_URL")"
-      # Only after a check that ran: a skipped one (no site key) puts none.
+      # Only after a check that ran and passed: a skipped one (no site key)
+      # puts none. A failed key watch heartbeat doesn't stop it, so that its
+      # own alarm fires alone (README "The heartbeat").
       - name: heartbeat (a successful check)
-        if: ${{ success() && steps.check.outputs.checked == 'true' && steps.aws.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.check.outcome == 'success' && steps.check.outputs.checked == 'true' && steps.aws.outcome == 'success' }}
         env:
           ENV_NAME: ${{ matrix.env }}
         run: |

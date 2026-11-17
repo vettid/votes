@@ -395,8 +395,14 @@ event to the log group `/vettid/votes/<env>/key-watch-heartbeat` (kept a
 month; failures go to the same dead letters), not to the key-use log
 group or the watch topics: it is no use of the key. Three hours without
 a line there raise `vettid-votes-<env>-key-watch-heartbeat`, which
-notifies the alarm topic and both watch topics. The rule and the alarm
-are watched like the watch's own (a change to either is emailed). Like
+notifies the alarm topic and both watch topics. The rule, the alarm, the
+heartbeat log group and any metric filter into the watch's metric
+namespace (`VettID/VotesKeys/<env>`) are watched like the watch's own (a
+change to any is emailed). **It proves honest failures, not an
+administrator faking it:** `PutMetricData` into that namespace, or
+`PutLogEvents` into the heartbeat group, are data-plane calls no trail
+shows, and either could keep the alarm quiet while the feed is cut. The
+cross-account forward (below) is what covers an administrator. Like
 the monitor's own heartbeat, **3 missed hours raise it whatever the
 cause**, including GitHub delaying or skipping scheduled runs, or a
 GitHub outage. When it fires alone (no `monitor-heartbeat` alarm with

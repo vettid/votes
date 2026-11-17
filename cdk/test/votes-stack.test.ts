@@ -427,7 +427,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       expect(x.DeletionPolicy).toBe('Retain');
       expect(x.Properties.EventPattern['detail-type']).toEqual(['AWS API Call via CloudTrail']);
     }
-    expect(alts()).toHaveLength(14);
+    expect(alts()).toHaveLength(15); // 14, plus a metric filter into the watch's namespace
   });
 
   // Each pattern, its ARNs resolved at realistic lengths, stays under
@@ -522,8 +522,12 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     expect(group('notify').filter((x) => x.eventSource[0] === 'monitoring.amazonaws.com')).toHaveLength(1);
     expect(group('watch').filter((x) => x.eventSource[0] === 'monitoring.amazonaws.com')).toHaveLength(1);
     expect(alt('logs.amazonaws.com')).toEqual([
-      { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logGroup], requestParameters: { logGroupName: [{ Ref: logGroup }] } },
+      { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logGroup],
+        requestParameters: { logGroupName: [{ Ref: logGroup }, '/vettid/votes/staging/key-watch-heartbeat'] } },
       { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logPolicies] }, // any name
+      // A metric filter on any log group into the watch's namespace.
+      { eventSource: ['logs.amazonaws.com'], eventName: ['PutMetricFilter'],
+        requestParameters: { metricTransformations: { metricNamespace: ['VettID/VotesKeys/staging'] } } },
     ]);
     expect(alt('cloudtrail.amazonaws.com')).toEqual([{ eventSource: ['cloudtrail.amazonaws.com'], eventName: [...WATCH_EVENTS.trails] }]); // any trail
     const topics = [TOPIC, { Ref: topicA }, { Ref: topicB }];
