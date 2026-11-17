@@ -129,9 +129,10 @@ function buildApi(): lambda.Code {
 /** The KMS operations on the site's keys (or their aliases) that are
  * watched: every signature, and every change that could let someone else
  * sign (a grant, a new key policy, an alias pointed elsewhere) or end the
- * key. */
+ * key, and every change of its tags (the list anchor key's names the
+ * Sigstore instance votesctl logs on). */
 export const KEY_USE_EVENTS = ['Sign', 'CreateGrant', 'PutKeyPolicy', 'ScheduleKeyDeletion', 'DisableKey',
-  'CreateAlias', 'UpdateAlias', 'DeleteAlias'] as const;
+  'CreateAlias', 'UpdateAlias', 'DeleteAlias', 'TagResource', 'UntagResource'] as const;
 
 /** The IAM operations on the publish role that are watched: a change to
  * who may assume it or what it may do. */
@@ -498,7 +499,7 @@ export class VotesStack extends cdk.Stack {
         }),
         new iam.PolicyStatement({
           sid: 'PublishRoleReads', principals: [publish], resources: ['*'],
-          actions: ['kms:GetPublicKey', 'kms:DescribeKey'],
+          actions: ['kms:GetPublicKey', 'kms:DescribeKey', 'kms:ListResourceTags'],
         }),
         new iam.PolicyStatement({
           sid: 'OnlyThePublishRoleSigns', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()], resources: ['*'],
@@ -535,6 +536,9 @@ export class VotesStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
       pendingWindow: cdk.Duration.days(30),
     });
+    // The Sigstore instance this environment logs its lists on: votesctl
+    // refuses a -sigstore that differs (a change of it is watched).
+    cdk.Tags.of(listAnchor).add('vettid:sigstore', props.sigstore);
     const aliasArn = (name: string): string =>
       this.formatArn({ service: 'kms', resource: 'alias', arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME, resourceName: name });
 

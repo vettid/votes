@@ -3,8 +3,11 @@
 //	votesctl site-key -kms <key arn> | -secret <arn>
 //	    prints the site's Ed25519 public key (base64), from its KMS key or
 //	    its secret
+//	votesctl list-anchor-key -kms <key arn>
+//	    prints the list anchor key's SubjectPublicKeyInfo (base64), to pin
 //	votesctl publish-services -kms <key arn> -site-key <base64> -watch-topics <arn>,<arn>
-//	        -list-anchor-key <key arn> -sigstore staging|production -bucket <name> -in services.json
+//	        -list-anchor-key <key arn> -list-anchor-pub <base64> -sigstore staging|production
+//	        -bucket <name> -in services.json
 //	votesctl publish-services -secret <arn> -bucket <name> -in services.json
 //	    signs the service list and publishes it, if it extends the one
 //	    published: a higher version, the previous one's hash, and every
@@ -81,13 +84,22 @@ func main() {
 		watch := fs.String("watch-topics", "", "with -kms: the key watch's topics, comma-separated (KeyWatchTopicArn,KeyWatchTopicBArn)")
 		previous := fs.String("previous-site-key", "", "with -kms, on the flag day only: the key (base64) the published list is signed with")
 		listAnchor := fs.String("list-anchor-key", "", "with -kms: the list anchor key's KMS key ARN (the stack's ListAnchorKeyArn), which logs the list in Rekor")
+		listAnchorPub := fs.String("list-anchor-pub", "", "with -kms: the list anchor key's SubjectPublicKeyInfo (base64), from its independent pin")
 		sigstore := fs.String("sigstore", "", "with -kms: the Sigstore instance the list is logged on, staging or production (the stack's sigstore)")
 		secret := fs.String("secret", "", "the site key's Secrets Manager secret (until the flag day)")
 		bucket := fs.String("bucket", "", "the site's bucket")
 		in := fs.String("in", "services.json", "the service list")
 		_ = fs.Parse(os.Args[2:])
 		err = publish(ctx, publishArgs{kms: *kmsKey, siteKey: *expect, watch: *watch, previous: *previous,
-			listAnchor: *listAnchor, sigstore: *sigstore, secret: *secret, bucket: *bucket, in: *in})
+			listAnchor: *listAnchor, listAnchorPub: *listAnchorPub, sigstore: *sigstore, secret: *secret, bucket: *bucket, in: *in})
+	case "list-anchor-key":
+		fs := flag.NewFlagSet("list-anchor-key", flag.ExitOnError)
+		kmsKey := fs.String("kms", "", "the list anchor key's KMS key ARN (the stack's ListAnchorKeyArn)")
+		_ = fs.Parse(os.Args[2:])
+		var spki []byte
+		if spki, err = listAnchorPublicKey(ctx, *kmsKey); err == nil {
+			fmt.Println(base64.StdEncoding.EncodeToString(spki))
+		}
 	case "check":
 		os.Exit(runCheck(ctx, os.Args[2:], os.Stdout, os.Stderr))
 	default:
@@ -101,7 +113,8 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: votesctl site-key -kms <key arn> | -secret <arn>\n"+
-		"       votesctl publish-services -kms <key arn> -site-key <base64> -watch-topics <arn>,<arn> -list-anchor-key <key arn> -sigstore staging|production -bucket <name> -in <file>\n"+
+		"       votesctl list-anchor-key -kms <key arn>\n"+
+		"       votesctl publish-services -kms <key arn> -site-key <base64> -watch-topics <arn>,<arn> -list-anchor-key <key arn> -list-anchor-pub <base64> -sigstore staging|production -bucket <name> -in <file>\n"+
 		"       votesctl publish-services -secret <arn> -bucket <name> -in <file>\n"+
 		"       votesctl check -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] <proposal_id>\n"+
 		"       votesctl check -all [-since YYYY-MM] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>]")
@@ -149,7 +162,7 @@ func sitePublicKey(ctx context.Context, kmsKey, secret string) (ed25519.PublicKe
 }
 
 type publishArgs struct {
-	kms, siteKey, watch, previous, listAnchor, sigstore, secret, bucket, in string
+	kms, siteKey, watch, previous, listAnchor, listAnchorPub, sigstore, secret, bucket, in string
 }
 
 func publish(ctx context.Context, a publishArgs) error {
@@ -159,11 +172,18 @@ func publish(ctx context.Context, a publishArgs) error {
 	if (a.kms == "") == (a.secret == "") {
 		return errors.New("give exactly one of -kms and -secret")
 	}
-	if a.kms == "" && (a.siteKey != "" || a.watch != "" || a.previous != "" || a.listAnchor != "" || a.sigstore != "") {
-		return errors.New("-site-key, -watch-topics, -list-anchor-key, -sigstore and -previous-site-key go with -kms")
+	if a.kms == "" && (a.siteKey != "" || a.watch != "" || a.previous != "" || a.listAnchor != "" || a.listAnchorPub != "" || a.sigstore != "") {
+		return errors.New("-site-key, -watch-topics, -list-anchor-key, -list-anchor-pub, -sigstore and -previous-site-key go with -kms")
 	}
-	if a.kms != "" && (a.siteKey == "" || a.watch == "" || a.listAnchor == "" || a.sigstore == "") {
-		return errors.New("-kms needs -site-key (the site's public key), -watch-topics (the key watch's two topics), -list-anchor-key (the stack's ListAnchorKeyArn) and -sigstore (the stack's sigstore)")
+	if a.kms != "" && (a.siteKey == "" || a.watch == "" || a.listAnchor == "" || a.listAnchorPub == "" || a.sigstore == "") {
+		return errors.New("-kms needs -site-key (the site's public key), -watch-topics (the key watch's two topics), -list-anchor-key (the stack's ListAnchorKeyArn), -list-anchor-pub (its pinned public key) and -sigstore (the stack's sigstore)")
+	}
+	var anchorPin []byte
+	if a.listAnchorPub != "" {
+		var err error
+		if anchorPin, err = base64.StdEncoding.Strict().DecodeString(a.listAnchorPub); err != nil || len(anchorPin) == 0 {
+			return errors.New("-list-anchor-pub: the list anchor key's SubjectPublicKeyInfo, base64 (as votesctl list-anchor-key prints it)")
+		}
 	}
 	var region string
 	if a.kms != "" {
@@ -209,7 +229,7 @@ func publish(ctx context.Context, a publishArgs) error {
 	if err != nil {
 		return err
 	}
-	lg, err := newRekorLog(ctx, kc, a.listAnchor, a.kms, a.sigstore)
+	lg, err := newRekorLog(ctx, kc, a.listAnchor, a.kms, a.sigstore, anchorPin)
 	if err != nil {
 		return err
 	}
@@ -290,6 +310,22 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, lg
 		previous = pub
 	}
 	notFlagDay := errors.New("-previous-site-key is only for the flag day, the next version after a list under the old key: leave it out")
+	// -secret never logs: once a list is logged (the KMS key's), it is
+	// refused, whatever else holds.
+	if _, secret := key.(secretSigner); secret {
+		for _, v := range []int64{next.Version - 1, next.Version} {
+			if v < 1 {
+				continue
+			}
+			o, err := get(ctx, c, bucket, bundleKey(v))
+			if err != nil {
+				return err
+			}
+			if o.data != nil {
+				return fmt.Errorf("-secret is refused: %s exists, so the lists are logged and under the KMS key: publish with -kms", bundleKey(v))
+			}
+		}
+	}
 	cur, err := get(ctx, c, bucket, "v1/services.json")
 	if err != nil {
 		return err
@@ -369,12 +405,18 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, lg
 		if err := site.Extends(prev, cur.data, next); err != nil {
 			return err
 		}
-		// The published list's bundle, if it has one, must verify here: a
-		// -sigstore that isn't the stack's (or another list anchor key) is
-		// refused before anything is signed or logged.
+		// The published list's bundle must verify here: a -sigstore that
+		// isn't the stack's (or another list anchor key) is refused before
+		// anything is signed or logged. Every list from the first one
+		// logged on has one; only on the flag day is the published list
+		// (the old key's) unlogged.
 		if lg != nil {
-			if _, err := keptBundle(ctx, c, bucket, lg, prev.Version, cur.data); err != nil {
+			pb, err := keptBundle(ctx, c, bucket, lg, prev.Version, cur.data)
+			if err != nil {
 				return err
+			}
+			if pb == nil && !flagDay {
+				return fmt.Errorf("version %d is current without its bundle (%s): run publish-services with that version's list first, which logs it", prev.Version, bundleKey(prev.Version))
 			}
 		}
 		if next.Version != prev.Version+1 {

@@ -147,7 +147,7 @@ has a default.
    from the service vault's `GET /v1/anchor-key`. Each later list has the
    next `version` and, as `previous`, the base64 SHA-256 of the published
    `v1/services.json`. Publish it with
-   `./votesctl publish-services -kms <SiteSigningKeyArn> -site-key <that key> -watch-topics <KeyWatchTopicArn>,<KeyWatchTopicBArn> -list-anchor-key <ListAnchorKeyArn> -sigstore <the stack's sigstore> -bucket <BucketName> -in services.json`,
+   `./votesctl publish-services -kms <SiteSigningKeyArn> -site-key <that key> -watch-topics <KeyWatchTopicArn>,<KeyWatchTopicBArn> -list-anchor-key <ListAnchorKeyArn> -list-anchor-pub <its pinned key> -sigstore <the stack's sigstore> -bucket <BucketName> -in services.json`,
    as the publish role (until the flag day, with the secret's key:
    `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`).
    With `-kms` it takes the key's ARN only, never an alias, and uses the
@@ -186,25 +186,38 @@ has a default.
    instance, in the Rekor profile of BALLOT-PROTOCOL §8.5. The bundle is
    checked under that instance's trusted root and kept write-once as
    `v1/services/<version>.bundle`, before the signature and the list, so
-   that no list is served without its entry. A Rekor entry is public and
-   permanent: a list that any check refuses is never logged. A bundle
-   already kept for the version must anchor this list (one that anchors
-   anything else is refused before anything is signed: clear it as a
-   stray, below) and is used, so a rerun logs nothing again; a list
-   already published without a bundle (before this step) is logged by
-   running the same command again, with no new site signature. If
-   logging fails, nothing is written; run the same command again. The
-   site key then signs again, so that publish is emailed twice; and if
-   Rekor had already accepted the entry (the failure came after it: a
-   lost answer, the bundle's check, or its write), the list anchor key
-   signs again too, and Rekor holds a second entry for the same list
-   (the monitor, task 4, is to match entries by the list's SHA-256, so
-   that is no mismatch). Before anything is signed, the published list's own
-   bundle, if it has one, must verify on `-sigstore` under the list
-   anchor key, so a `-sigstore` that isn't the stack's is refused, not
-   logged. `-secret` doesn't log (it goes after the flag day), and it
-   can't publish once a list under the KMS key is current, so every
-   version from the first one published with `-kms` on has a bundle.
+   that no list is served without its entry.
+
+   Before anything is signed it checks:
+   - the key's public key is `-list-anchor-pub` (its SubjectPublicKeyInfo,
+     base64). **Take it from an independent pin**, the monitor's
+     configuration (task 4). The first time, print it with
+     `./votesctl list-anchor-key -kms <ListAnchorKeyArn>` (as the publish
+     role) and pin it there, with the owner's go, before the first
+     publish;
+   - `-sigstore` is the stack's: the key's tag `vettid:sigstore`, which
+     the stack sets to its `sigstore` (a change of the tag is watched);
+   - the published list's own bundle verifies on that instance under that
+     key. Only on the flag day may the published list (the old key's)
+     have none; otherwise it is refused ("version N is current without
+     its bundle"): run the command with that version's list first, which
+     logs it with no new site signature;
+   - a bundle already kept for this version anchors this list. One that
+     anchors anything else is refused (clear it as a stray, below); one
+     that does is used, so a rerun logs nothing again.
+
+   A Rekor entry is public and permanent: a list is logged only after it
+   has passed every check and the site key has signed it. **After a
+   failed publish, run the same command with the same file.** If
+   logging failed, nothing was written, and the site key signs again (so
+   that publish is emailed twice); and if Rekor had already accepted the
+   entry (the failure came after it: a lost answer, the bundle's check,
+   or its write), the list anchor key signs again too, and Rekor holds a
+   second entry for the same list (the monitor is to match entries by
+   the list's SHA-256, so that is no mismatch). `-secret` doesn't log (it
+   goes after the flag day), and it is refused once the current or the
+   next version has a bundle, so every version from the first one
+   published with `-kms` on has a bundle.
 
    **On the flag day** (GC #12646), the published list is signed with
    the secret's key: give that key as `-previous-site-key` on the first
@@ -274,9 +287,12 @@ account's root user schedule their deletion. The account keeps
 administering them: **any administrator of the account** (any principal
 whose IAM policies allow it) may change a key policy, so that the keys
 can't be locked out; no one gets `Sign` that way, and such a change is
-watched (below). The publish role may read and write `v1/services.json`,
-`v1/services.json.sig` and `v1/services/*`, and list the bucket (so that
-a missing copy is a 404; every document is public), and nothing else.
+watched (below). The publish role may read each key's public key, its
+description and its tags (the list anchor key's tag `vettid:sigstore` is
+the stack's `sigstore`, which `publish-services` checks), read and write
+`v1/services.json`, `v1/services.json.sig` and `v1/services/*`, and list
+the bucket (so that a missing copy is a 404; every document is public),
+and nothing else.
 
 **The watch.** Six EventBridge rules, three pairs
 (`vettid-votes-<env>-kw-keys`, `-kw-watch` and `-kw-notify`, each with
@@ -296,7 +312,8 @@ queue policies, the alarms and the queue are not), and the stack has
 termination protection. They match:
 
 - every signature with either key, and every grant, key policy change,
-  alias change, deletion or disabling of either key or its alias;
+  alias change, tag change, deletion or disabling of either key or its
+  alias;
 - every change to the publish role (its trust or permission policies, a
   boundary, its deletion);
 - every change to the watch: its rules and targets, its alarms (enabling

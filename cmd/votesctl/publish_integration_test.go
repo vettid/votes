@@ -263,11 +263,15 @@ func TestPublishServicesKMS(t *testing.T) {
 	// With the list log (a fake Rekor): the bundle is kept write-once, and
 	// a stray at the next version's bundle is refused before signing.
 	lg := &fakeLog{}
+	// v1 was published unlogged: it is logged first, by a rerun.
+	if err := publishList(ctx, c, bucket, k, lg, nil, v1); err != nil {
+		t.Fatal(err)
+	}
 	v2 := list(2, h[:])
 	if err := publishList(ctx, c, bucket, k, lg, nil, v2); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := get(ctx, c, bucket, "v1/services/2.bundle"); !bytes.Equal(got.data, fakeBundle(v2)) || len(lg.entries) != 1 {
+	if got, _ := get(ctx, c, bucket, "v1/services/2.bundle"); !bytes.Equal(got.data, fakeBundle(v2)) || len(lg.entries) != 2 {
 		t.Fatalf("the bundle: %q, %d entries", got.data, len(lg.entries))
 	}
 	h2 := sha256.Sum256(v2)

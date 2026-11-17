@@ -31,6 +31,7 @@ type fakeS3 struct {
 type fakeObject struct {
 	data []byte
 	etag string
+	cc   string // its Cache-Control
 }
 
 func newFakeS3() *fakeS3 { return &fakeS3{objs: map[string]fakeObject{}} }
@@ -55,7 +56,7 @@ func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*
 	}
 	b, _ := io.ReadAll(in.Body)
 	f.n++
-	f.objs[k] = fakeObject{data: b, etag: fmt.Sprintf(`"%d"`, f.n)}
+	f.objs[k] = fakeObject{data: b, etag: fmt.Sprintf(`"%d"`, f.n), cc: aws.ToString(in.CacheControl)}
 	return &s3.PutObjectOutput{}, nil
 }
 
@@ -240,7 +241,7 @@ func TestKMSPublishBindsTopics(t *testing.T) {
 		}
 	}
 	// The ARN's form, before reading the file or calling AWS.
-	err := publish(ctx, publishArgs{kms: "alias/vettid-votes-staging-site", siteKey: "k", watch: "w", listAnchor: testAnchorARN, sigstore: "staging", bucket: "b", in: "/nonexistent"})
+	err := publish(ctx, publishArgs{kms: "alias/vettid-votes-staging-site", siteKey: "k", watch: "w", listAnchor: testAnchorARN, listAnchorPub: "cGlu", sigstore: "staging", bucket: "b", in: "/nonexistent"})
 	if err == nil || !strings.Contains(err.Error(), "not an alias") {
 		t.Fatalf("%v", err)
 	}
@@ -336,7 +337,7 @@ func TestPreviousKeyOnlyOnFlagDay(t *testing.T) {
 		t.Fatalf("a rerun of the flag day with the flag: %v", err)
 	}
 	// The flag's own decoding, before AWS.
-	if err := publish(ctx, publishArgs{kms: testKeyARN, siteKey: base64Key(pub(nw)), watch: topicA + "," + topicB, previous: "nope", listAnchor: testAnchorARN, sigstore: "staging", bucket: "b", in: "/nonexistent"}); err == nil ||
+	if err := publish(ctx, publishArgs{kms: testKeyARN, siteKey: base64Key(pub(nw)), watch: topicA + "," + topicB, previous: "nope", listAnchor: testAnchorARN, listAnchorPub: "cGlu", sigstore: "staging", bucket: "b", in: "/nonexistent"}); err == nil ||
 		!strings.HasPrefix(err.Error(), "-previous-site-key: an Ed25519 public key") {
 		t.Fatalf("%v", err)
 	}
@@ -459,7 +460,7 @@ func TestFlagDayEdges(t *testing.T) {
 		t.Fatalf("a broken pair with the flag: %v", err)
 	}
 	err := publish(ctx, publishArgs{kms: testKeyARN, siteKey: base64Key(pub(nw)), previous: base64Key(pub(nw)),
-		watch: topicA + "," + topicB, listAnchor: testAnchorARN, sigstore: "staging", bucket: "b", in: "/nonexistent"})
+		watch: topicA + "," + topicB, listAnchor: testAnchorARN, listAnchorPub: "cGlu", sigstore: "staging", bucket: "b", in: "/nonexistent"})
 	if err == nil || !strings.Contains(err.Error(), "is -site-key") {
 		t.Fatalf("the flag equal to -site-key: %v", err)
 	}
