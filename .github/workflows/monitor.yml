@@ -6,9 +6,11 @@ name: monitor
 # archive. The job fails on a failed check (exit 1) or a mismatch (exit 3,
 # "ok": false), and the report is in its log.
 #
-# The site keys are public. Staging's is the member vaults' release config
-# (vettid-vault, enclave/releasecfg/staging.json, vote_site_key), used
-# unless the repository variable VOTES_STAGING_SITE_KEY overrides it.
+# The site keys are public. Staging's is pinned below (default_key), the
+# key the member vaults' release config pins too (vettid-vault,
+# enclave/releasecfg/staging.json, vote_site_key), and only here: no
+# repository variable overrides it (its key_var is empty), so a change of
+# it is a reviewed PR, like the log pins.
 # Production's is not published yet: set the repository variable
 # VOTES_PROD_SITE_KEY to it (`votesctl site-key`) once production is
 # deployed; until then its check is skipped with a warning.
@@ -17,16 +19,14 @@ name: monitor
 # environment's list anchor key (its SubjectPublicKeyInfo, base64, as
 # `votesctl list-anchor-key` prints it) and the first version logged with
 # it are pinned here, in this file, so that a change of either is a
-# reviewed PR, never a repository variable. Both are set by a PR on the
-# environment's first publish with -kms (staging: the flag day, GC
-# #12646); until then the log isn't checked, with a warning, and one set
-# without the other fails the run. Production (log_required) has its KMS
-# keys from its first deploy, so its check fails without both pins. The
-# flag day's pin PR, merged before the publish, sets first_logged to the
-# version about to be published with log_pending true (and staging's
-# log_required true); the next PR, after the publish, removes
-# log_pending. Without it, a first_logged past the current list fails the
-# run (a rollback to before logging began).
+# reviewed PR, never a repository variable. Both are set by a PR before
+# the environment's first publish with -kms, with first_logged "1" (a
+# fresh list; staging started fresh under its KMS keys, GC #12656, docs/
+# STAGING-FLAG-DAY.md); until then the log isn't checked, with a warning,
+# and one set without the other fails the run. An environment with
+# log_required fails without both pins once its site key is set (staging
+# since its fresh start; production from its first deploy, which has its
+# KMS keys).
 #
 # Partial uploads the site can never complete are listed, each by PR with
 # its reason, in monitor/acknowledged-<env>.json (docs/VOTES-SITE.md §7).
@@ -77,13 +77,16 @@ jobs:
           - env: staging
             site: https://votes.staging.vettid.org
             sigstore: staging
-            key_var: VOTES_STAGING_SITE_KEY
-            default_key: c4dqg2ssGVylbO9Xnpdv4zopmzx9S++4KgxMWOyhXJQ=
-            list_anchor_pub: ""
-            first_logged: ""
-            # first_logged stays a quoted decimal string, e.g. "12".
-            log_pending: false # true only between the flag day pin PR and its publish
-            log_required: false # set true in the flag day pin PR
+            key_var: "" # no override: the pin below is the only source
+            # The KMS site key (alias/vettid-votes-staging-site) since the
+            # fresh start; the vaults pin the same key (vote_site_key).
+            default_key: m3x8G8MlAnzaOoHr0eg0M2j38mE4d15hkNekqdOAios=
+            # The list anchor key (alias/vettid-votes-staging-list-anchor).
+            list_anchor_pub: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEVhK17Y0fK2EG4KYQPzr2h5AVhO/BkVMQuQ9LTQVH6+02DFyVqD3hJMwZHHxke9bHEdocFFhd7FqqMOAnqxMFA==
+            # first_logged stays a quoted decimal string.
+            first_logged: "1"
+            log_pending: false # obsolete: removed with the -secret path (GC #12657)
+            log_required: true
             role_var: VOTES_STAGING_MONITOR_ROLE_ARN
             topic_var: VOTES_STAGING_ALERT_TOPIC_ARN
           - env: prod
@@ -123,7 +126,7 @@ jobs:
         env:
           SITE: ${{ matrix.site }}
           SIGSTORE: ${{ matrix.sigstore }}
-          SITE_KEY: ${{ vars[matrix.key_var] || matrix.default_key }}
+          SITE_KEY: ${{ (matrix.key_var && vars[matrix.key_var]) || matrix.default_key }}
           KEY_VAR: ${{ matrix.key_var }}
           LIST_ANCHOR_PUB: ${{ matrix.list_anchor_pub }}
           FIRST_LOGGED: ${{ matrix.first_logged }}

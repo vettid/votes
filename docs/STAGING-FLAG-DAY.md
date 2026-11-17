@@ -34,6 +34,9 @@ BUCKET=votessite-staging-bucket83908e77-bppc9pn4gncf
 DIST=E2U8AQVDFFZZDH
 OLD_KEY=c4dqg2ssGVylbO9Xnpdv4zopmzx9S++4KgxMWOyhXJQ=
 ALARM_TOPIC=arn:aws:sns:us-east-1:<staging account>:vettid-org-staging-vault-alerts
+# From step 4 (2026-11-17), checked against KMS's own public keys:
+NEW_KEY=m3x8G8MlAnzaOoHr0eg0M2j38mE4d15hkNekqdOAios=
+SPKI=MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEVhK17Y0fK2EG4KYQPzr2h5AVhO/BkVMQuQ9LTQVH6+02DFyVqD3hJMwZHHxke9bHEdocFFhd7FqqMOAnqxMFA==
 ```
 
 The code deployed and built is votes `main` at or after `c98a713`
@@ -184,7 +187,10 @@ pin:
   start;
 - `.gitleaks.toml`: the new key, and the SPKI if gitleaks flags it, as
   narrow allowlist entries with a comment (each is public);
-- the nits carried from votes #36 (GC #13026);
+- staging's `key_var` emptied, so no repository variable can override
+  the pinned site key (votes #39). The nits carried from votes #36 (GC
+  #13026) were about the pending pin, which GC #12657 removes, so they
+  aren't done;
 - this document, with `NEW_KEY` and `SPKI` written into step 9's command.
 
 ## 8. Before the publish (read-only)
@@ -212,9 +218,9 @@ pin:
 As the publish role (`AWS_PROFILE=votes-publish-staging`):
 
 ```sh
-./votesctl publish-services -kms <SiteSigningKeyArn> -site-key <NEW_KEY> \
+./votesctl publish-services -kms <SiteSigningKeyArn> -site-key $NEW_KEY \
   -watch-topics <KeyWatchTopicArn>,<KeyWatchTopicBArn> -list-anchor-key <ListAnchorKeyArn> \
-  -list-anchor-pub <SPKI> -sigstore staging -bucket $BUCKET -in services.json
+  -list-anchor-pub $SPKI -sigstore staging -bucket $BUCKET -in services.json
 ```
 
 It writes `v1/services/1.bundle`, then `v1/services.json.sig` and
