@@ -21,6 +21,14 @@ paths = ['''^cdk/cdk\.out/''', '''^cdk/node_modules/''']
 description = "the staging votes site's public key"
 regexes = ['''c4dqg2ssGVylbO9Xnpdv4zopmzx9S\+\+4KgxMWOyhXJQ=''']
 
+# The staging site's KMS keys' public halves since its fresh start (GC
+# #12656): the site key (Ed25519, base64) and the list anchor key's
+# SubjectPublicKeyInfo (P-256, base64), pinned in monitor.yml and the
+# runbook. Both are public.
+[[allowlists]]
+description = "the staging votes site's KMS public keys"
+regexes = ['''m3x8G8MlAnzaOoHr0eg0M2j38mE4d15hkNekqdOAios=''', '''MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEVhK17Y0fK2EG4KYQPzr2h5AVhO/BkVMQuQ9LTQVH6\+02DFyVqD3hJMwZHHxke9bHEdocFFhd7FqqMOAnqxMFA==''']
+
 # A made-up KMS key id in votesctl's tests (cmd/votesctl/sign_test.go,
 # votes PR #34): a fixture of sequential hex, not a key of any account.
 # Every branch's history is scanned (fetch-depth 0, gitleaks git scans
