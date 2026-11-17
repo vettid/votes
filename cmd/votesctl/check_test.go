@@ -146,8 +146,8 @@ func TestCheckCommand(t *testing.T) {
 		rep2.Proposals[0].ProposalID != p.ProposalID || len(rep2.Months) == 0 || rep2.Services.Log != "not pinned" {
 		t.Fatalf("-all: %+v %v %v", rep2, ok, err)
 	}
-	// A pin the chain refuses (past the next version): an error, and the
-	// report still says which pin.
+	// A pin the chain refuses (past the current version, not pending): an
+	// error, and the report still says which pin.
 	var eout bytes.Buffer
 	if ok, err := checkAll(context.Background(), &eout, httpFetcher(srv.URL, noRedirects()), httpModified(srv.URL, noRedirects()), anchors, key, "2026-10", nil,
 		&listLogPin{spki: []byte("pin"), first: 9}, time.Now()); !errors.Is(err, errChecksFailed) || ok ||

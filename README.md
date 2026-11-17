@@ -105,7 +105,8 @@ sits past the current version (VOTES-SITE §7). The report's
 bundles verified, or `not pinned`. The `monitor` workflow takes both from
 `list_anchor_pub` and `first_logged` in its own matrix, pinned by PR on
 each environment's first publish with `-kms`; until then it warns on
-staging and fails on production (`log_required`). `-list-anchor-pub` must
+staging and fails on production once its site key is set
+(`log_required`). `-list-anchor-pub` must
 be a P-256 key's SubjectPublicKeyInfo and `-first-logged` a decimal
 version from 1; a pin past the real first logged version (the version
 before it has a bundle) is a mismatch. A `-first-logged` past the current
@@ -113,7 +114,10 @@ version is an error unless `-first-logged-pending` is given (the
 workflow's `log_pending`), which is only for the flag day: its pin PR,
 merged before the publish, sets `first_logged` to the version about to be
 published with `log_pending: true` and staging's `log_required: true`;
-the next PR, after the publish, removes `log_pending`.
+the next PR, after the publish, removes `log_pending`. Between the
+publish and that PR's merge, each hourly run fails with "is published,
+but the pin is still pending": expected, and the reason to merge the
+follow-up promptly.
 
 **Production's site key** is a repository variable today
 (`VOTES_PROD_SITE_KEY`); at production's launch, pin it in the workflow's
@@ -219,8 +223,8 @@ has a default.
      time, print it with
      `./votesctl list-anchor-key -kms <ListAnchorKeyArn>` (as the publish
      role) and pin it there by PR, with `first_logged` set to the version
-     about to be published, with the owner's go, before the first
-     publish;
+     about to be published and `log_pending: true` (removed by a PR after
+     the publish), with the owner's go, before the first publish;
    - `-sigstore` is the stack's: the key's tag `vettid:sigstore`, which
      the stack sets to its `sigstore` (a change of the tag is watched).
      **On this refusal, don't change `-sigstore` to match the tag**: an

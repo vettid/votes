@@ -81,6 +81,7 @@ jobs:
             default_key: c4dqg2ssGVylbO9Xnpdv4zopmzx9S++4KgxMWOyhXJQ=
             list_anchor_pub: ""
             first_logged: ""
+            # first_logged stays a quoted decimal string, e.g. "12".
             log_pending: false # true only between the flag day pin PR and its publish
             log_required: false # set true in the flag day pin PR
             role_var: VOTES_STAGING_MONITOR_ROLE_ARN

@@ -227,12 +227,15 @@ reports to AWS (**Alerts**, below).
   current version, both write-once (a mismatch); there is no separate
   high-water mark. Until an environment's pins are set (its first
   publish with `-kms`) the report says `"log": "not pinned"` and the run
-  warns; production's run fails without them (it has its KMS keys from
-  its first deploy). The check holds at the time of each run: a list
+  warns; production's run fails without them once its site key is set
+  (it has its KMS keys from its first deploy). A pin still pending once
+  its first logged version is published is a mismatch: the flag day's
+  follow-up PR removes it, and until then each run alerts. The check holds at the time of each run: a list
   served between two runs and removed with no kept copy leaves nothing
   to check, and a bundle's Rekor time isn't compared with when its list
   was served, so a bundle made after the fact with the list anchor key
-  passes. It checks verifying Rekor bundles, not Rekor itself. **Not in this check:** entries in Rekor under the list anchor key
+  passes. It verifies the served bundles offline; it does not query
+  Rekor. **Not in this check:** entries in Rekor under the list anchor key
   that are no kept version's (a list signed but served elsewhere); that
   search is its own task, designed first (the owner's a, GC #12980).
 - **Every proposal** in `index.json` and in the archive's months, from

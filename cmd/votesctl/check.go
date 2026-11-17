@@ -319,7 +319,9 @@ type servicesOut struct {
 	Checked int   `json:"checked"`
 	// Log is the list's Rekor log: "not pinned" when check ran without
 	// -list-anchor-pub and -first-logged, else "from version <n>", with
-	// Logged the bundles verified.
+	// " (pending: not published yet)" while pinned pending and ", none
+	// logged yet" when no bundle was checked; Logged is the bundles
+	// verified.
 	Log        string   `json:"log"`
 	Logged     int      `json:"logged"`
 	Mismatches []string `json:"mismatches,omitempty"`

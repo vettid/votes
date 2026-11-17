@@ -79,8 +79,12 @@ func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.Publi
 // verify is an error. A bundle past the current version is a list logged
 // but never served (a publish lost a race or was abandoned, or one not
 // served at all): a mismatch, unless it was written within ListingGrace
-// (a publish in progress), as modified says of it. A First past the next
-// version is an error (the pin is wrong).
+// (a publish in progress), as modified says of it. A First past the
+// current version is an error (a rollback to before logging began, or a
+// wrong pin), unless lg.Pending, when it may be the next version; a
+// Pending pin whose First is published is a mismatch (it is to be
+// removed). A bundle at First-1 is a mismatch (the pin is past the real
+// first logged version).
 func CheckServiceChainLogged(ctx context.Context, fetch Fetcher, siteKey ed25519.PublicKey, now time.Time,
 	modified func(ctx context.Context, path string) (time.Time, error), lg *ListLog) (*ChainReport, error) {
 	cur, curSig, err := fetchPair(ctx, fetch, "v1/services.json")
@@ -102,6 +106,10 @@ func CheckServiceChainLogged(ctx context.Context, fetch Fetcher, siteKey ed25519
 		}
 		if lg.First < 1 || lg.First > limit || len(lg.SPKI) == 0 || lg.Anchors == nil {
 			return nil, fmt.Errorf("site: the list log's pins: first logged version %d with current version %d, pending %v (or no key): a rollback to before logging began, or a wrong pin", lg.First, current.Version, lg.Pending)
+		}
+		if lg.Pending && lg.First <= current.Version {
+			// Left on, it would let a rollback by one pass for pending.
+			rep.Mismatches = append(rep.Mismatches, "services/"+strconv.FormatInt(lg.First, 10)+": is published, but the pin is still pending: remove log_pending")
 		}
 	}
 	// logged checks version v's bundle against its bytes.

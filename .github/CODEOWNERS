@@ -16,6 +16,8 @@
 /site/chain.go                   @mesmerverse
 /site/anchor.go                  @mesmerverse
 /site/check.go                   @mesmerverse
+/site/services.go                @mesmerverse
+/site/roots.go                   @mesmerverse
 /cmd/votesctl/check.go           @mesmerverse
 /go.mod                          @mesmerverse
 /go.sum                          @mesmerverse

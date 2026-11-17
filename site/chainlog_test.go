@@ -186,6 +186,15 @@ func TestServiceChainLogPins(t *testing.T) {
 	if _, err := logCheckP(objs, 5, true, time.Now(), nil); err == nil {
 		t.Fatal("past the next version, pending")
 	}
+	// Pending left on once First is published: a mismatch, so it alerts
+	// until the pin PR is followed up.
+	objs["v1/services/3.bundle"] = fakeBundle(objs["v1/services/3.json"])
+	if rep, err := logCheckP(objs, 3, true, time.Now(), nil); err != nil || !has(rep.Mismatches, "services/3: is published, but the pin is still pending") || rep.Logged != 1 {
+		t.Fatalf("a stale pending: %v %+v", err, rep)
+	}
+	if rep, err := logCheck(objs, 3, time.Now(), nil); err != nil || len(rep.Mismatches) != 0 {
+		t.Fatalf("not pending: %v %+v", err, rep)
+	}
 	lg := &ListLog{Anchors: fakeBundles{spki: testListKey}, First: 1}
 	if _, err := CheckServiceChainLogged(context.Background(), fetcher(objs), siteKey().Public().(ed25519.PublicKey), time.Now(), nil, lg); err == nil {
 		t.Fatal("no key")
