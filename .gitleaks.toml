@@ -20,3 +20,11 @@ paths = ['''^cdk/cdk\.out/''', '''^cdk/node_modules/''']
 [[allowlists]]
 description = "the staging votes site's public key"
 regexes = ['''c4dqg2ssGVylbO9Xnpdv4zopmzx9S\+\+4KgxMWOyhXJQ=''']
+
+# A made-up KMS key id in votesctl's tests (cmd/votesctl/sign_test.go,
+# votes PR #34): a fixture of sequential hex, not a key of any account.
+# Every branch's history is scanned (fetch-depth 0, gitleaks git scans
+# --all), so this is in both PRs that the scan sees it from.
+[[allowlists]]
+description = "a made-up KMS key id in votesctl's tests"
+regexes = ['''0123abcd-4567-89ab-cdef-0123456789ab''']
