@@ -27,8 +27,50 @@ func (f fakeBundles) Verify(b, doc, spki []byte) (time.Time, error) {
 var testListKey = []byte("list anchor spki")
 
 func logCheck(objs map[string][]byte, first int64, now time.Time, modified func(context.Context, string) (time.Time, error)) (*ChainReport, error) {
-	lg := &ListLog{Anchors: fakeBundles{spki: testListKey}, SPKI: testListKey, First: first}
+	return logCheckP(objs, first, false, now, modified)
+}
+
+func logCheckP(objs map[string][]byte, first int64, pending bool, now time.Time, modified func(context.Context, string) (time.Time, error)) (*ChainReport, error) {
+	lg := &ListLog{Anchors: fakeBundles{spki: testListKey}, SPKI: testListKey, First: first, Pending: pending}
 	return CheckServiceChainLogged(context.Background(), fetcher(objs), siteKey().Public().(ed25519.PublicKey), now, modified, lg)
+}
+
+// Rolled back to the list before logging began: without the pending pin
+// (only between the flag day's pin and its publish), a first logged
+// version past the current one is an error, not a clean pass with
+// nothing checked.
+func TestServiceChainLogRollbackBeforeFirst(t *testing.T) {
+	f := loadFixture(t)
+	objs, datas := chainSite(t, f)
+	objs["v1/services/3.bundle"] = fakeBundle(datas[2])
+	objs["v1/services.json"], objs["v1/services.json.sig"] = objs["v1/services/2.json"], objs["v1/services/2.json.sig"]
+	if _, err := logCheck(objs, 3, time.Now(), nil); err == nil || !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("%v", err)
+	}
+	// Pending, the rollback still shows: version 3's copy and bundle sit
+	// past the current version.
+	rep, err := logCheckP(objs, 3, true, time.Now(), nil)
+	if err != nil || !has(rep.Mismatches, "services/3: a bundle past the current version") || !has(rep.Mismatches, "services/3: published past") {
+		t.Fatalf("%v %+v", err, rep)
+	}
+}
+
+// A Last-Modified in the future doesn't hold the grace open.
+func TestServiceChainLogFutureModified(t *testing.T) {
+	f := loadFixture(t)
+	objs, datas := chainSite(t, f)
+	objs["v1/services/3.bundle"] = fakeBundle(datas[2])
+	objs["v1/services/4.bundle"] = []byte("bundle:anything")
+	now := time.Unix(1_800_000_000, 0)
+	at := func(d time.Duration) func(context.Context, string) (time.Time, error) {
+		return func(context.Context, string) (time.Time, error) { return now.Add(d), nil }
+	}
+	if rep, err := logCheck(objs, 3, now, at(time.Minute)); err != nil || len(rep.Mismatches) != 0 {
+		t.Fatalf("within the skew: %v %+v", err, rep)
+	}
+	if rep, err := logCheck(objs, 3, now, at(time.Minute+time.Second)); err != nil || !has(rep.Mismatches, "services/4: a bundle past") {
+		t.Fatalf("past the skew: %v %+v", err, rep)
+	}
 }
 
 func has(ms []string, s string) bool {
@@ -133,9 +175,16 @@ func TestServiceChainLogPins(t *testing.T) {
 			t.Errorf("first %d: %v", first, err)
 		}
 	}
-	// The next version: pinned before the flag day's publish; nothing yet.
-	if rep, err := logCheck(objs, 4, time.Now(), nil); err != nil || rep.Logged != 0 || len(rep.Mismatches) != 0 {
+	// The next version: only pending (pinned before the flag day's
+	// publish), with nothing checked yet; without it, an error.
+	if rep, err := logCheckP(objs, 4, true, time.Now(), nil); err != nil || rep.Logged != 0 || len(rep.Mismatches) != 0 {
 		t.Fatalf("%v %+v", err, rep)
+	}
+	if _, err := logCheck(objs, 4, time.Now(), nil); err == nil {
+		t.Fatal("the next version, not pending")
+	}
+	if _, err := logCheckP(objs, 5, true, time.Now(), nil); err == nil {
+		t.Fatal("past the next version, pending")
 	}
 	lg := &ListLog{Anchors: fakeBundles{spki: testListKey}, First: 1}
 	if _, err := CheckServiceChainLogged(context.Background(), fetcher(objs), siteKey().Public().(ed25519.PublicKey), time.Now(), nil, lg); err == nil {
@@ -156,8 +205,8 @@ func TestServiceChainLogPinTooHigh(t *testing.T) {
 	if rep, err := logCheck(objs, 3, time.Now(), nil); err != nil || !has(rep.Mismatches, "services/2: has a bundle, so the pinned first logged version is past the real one") {
 		t.Fatalf("%v %+v", err, rep)
 	}
-	// Pinned from the next version while the current one is logged.
-	if rep, err := logCheck(objs, 4, time.Now(), nil); err != nil || !has(rep.Mismatches, "services/3: has a bundle") {
+	// Pinned pending from the next version while the current one is logged.
+	if rep, err := logCheckP(objs, 4, true, time.Now(), nil); err != nil || !has(rep.Mismatches, "services/3: has a bundle") {
 		t.Fatalf("%v %+v", err, rep)
 	}
 	if rep, err := logCheck(objs, 2, time.Now(), nil); err != nil || len(rep.Mismatches) != 0 {

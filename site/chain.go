@@ -41,6 +41,11 @@ type ListLog struct {
 	Anchors BundleVerifier
 	SPKI    []byte
 	First   int64
+	// Pending is set only between pinning First and its publish (the
+	// flag day's pin PR, removed by the next): First may then be the next
+	// version. Without it, a First past the current version is an error
+	// (a rollback to before logging began, or a wrong pin).
+	Pending bool
 }
 
 // BundleVerifier checks a bundle over doc under the key spki: *Anchors.
@@ -90,8 +95,14 @@ func CheckServiceChainLogged(ctx context.Context, fetch Fetcher, siteKey ed25519
 		return nil, fmt.Errorf("site: services.json: %w", err)
 	}
 	rep := &ChainReport{Version: current.Version}
-	if lg != nil && (lg.First < 1 || lg.First > current.Version+1 || len(lg.SPKI) == 0 || lg.Anchors == nil) {
-		return nil, fmt.Errorf("site: the list log's pins: first logged version %d with current version %d (or no key)", lg.First, current.Version)
+	if lg != nil {
+		limit := current.Version
+		if lg.Pending {
+			limit++
+		}
+		if lg.First < 1 || lg.First > limit || len(lg.SPKI) == 0 || lg.Anchors == nil {
+			return nil, fmt.Errorf("site: the list log's pins: first logged version %d with current version %d, pending %v (or no key): a rollback to before logging began, or a wrong pin", lg.First, current.Version, lg.Pending)
+		}
 	}
 	// logged checks version v's bundle against its bytes.
 	logged := func(v int64, data []byte) error {
@@ -178,7 +189,7 @@ func CheckServiceChainLogged(ctx context.Context, fetch Fetcher, siteKey ed25519
 			return nil, err
 		}
 	}
-	if lg != nil && lg.First > 1 && lg.First <= current.Version+1 {
+	if lg != nil && lg.First > 1 {
 		// Versions before the first logged one have no bundle (§3): one
 		// there means the pin is past the real first logged version, and
 		// the versions between would go unchecked.
@@ -217,14 +228,22 @@ func recent(ctx context.Context, modified func(context.Context, string) (time.Ti
 }
 
 // recentPath reports whether path changed within ListingGrace (never, if
-// modified is nil or fails).
+// modified is nil or fails, or names a time more than futureSkew ahead of
+// now: a Last-Modified in the future would hold the grace open).
 func recentPath(ctx context.Context, modified func(context.Context, string) (time.Time, error), path string, now time.Time) bool {
 	if modified == nil {
 		return false
 	}
 	t, err := modified(ctx, path)
-	return err == nil && !t.IsZero() && now.Sub(t) <= ListingGrace
+	if err != nil || t.IsZero() || t.After(now.Add(futureSkew)) {
+		return false
+	}
+	return now.Sub(t) <= ListingGrace
 }
+
+// futureSkew is how far ahead of the monitor's clock a Last-Modified may
+// be and still count.
+const futureSkew = time.Minute
 
 // fetchPair fetches a list and its signature (path + ".sig").
 func fetchPair(ctx context.Context, fetch Fetcher, path string) (data, sig []byte, err error) {

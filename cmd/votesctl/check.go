@@ -47,9 +47,10 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	ackFile := fs.String("acknowledged", "", "a file of acknowledged partial uploads (docs/VOTES-SITE.md §7)")
 	anchorPub := fs.String("list-anchor-pub", "", "with -all: the list anchor key's SubjectPublicKeyInfo (base64), pinned; with -first-logged, every version from it on must have its Rekor bundle")
 	firstLogged := fs.String("first-logged", "", "with -all and -list-anchor-pub: the first version of the service list that was logged in Rekor (decimal), pinned")
-	usageLine := "usage: votesctl check [-all [-since YYYY-MM] [-list-anchor-pub <base64> -first-logged <version>] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] [-acknowledged <file>]"
+	pending := fs.Bool("first-logged-pending", false, "with -first-logged: it isn't published yet (only between the flag day's pin and its publish): it may be the next version")
+	usageLine := "usage: votesctl check [-all [-since YYYY-MM] [-list-anchor-pub <base64> -first-logged <version> [-first-logged-pending]] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] [-acknowledged <file>]"
 	if fs.Parse(args) != nil || *all != (fs.NArg() == 0) || fs.NArg() > 1 ||
-		(*anchorPub == "") != (*firstLogged == "") || (*anchorPub != "" && !*all) {
+		(*anchorPub == "") != (*firstLogged == "") || (*anchorPub != "" && !*all) || (*pending && *anchorPub == "") {
 		fmt.Fprintln(stderr, usageLine)
 		return exitUsage
 	}
@@ -60,6 +61,7 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			fmt.Fprintln(stderr, "votesctl:", err)
 			return exitUsage
 		}
+		pin.pending = *pending
 		logPin = pin
 	}
 	var acks []site.Acknowledgement
@@ -326,8 +328,22 @@ type servicesOut struct {
 
 // listLogPin is check -all's pins for the list's Rekor log.
 type listLogPin struct {
-	spki  []byte
-	first int64
+	spki    []byte
+	first   int64
+	pending bool
+}
+
+// listLogFor is the chain walk's list log for the pins, on anchors (the
+// run's trusted root), and how the report names it.
+func listLogFor(anchors site.BundleVerifier, pin *listLogPin) (*site.ListLog, string) {
+	if pin == nil {
+		return nil, "not pinned"
+	}
+	desc := fmt.Sprintf("from version %d", pin.first)
+	if pin.pending {
+		desc += " (pending: not published yet)"
+	}
+	return &site.ListLog{Anchors: anchors, SPKI: pin.spki, First: pin.first, Pending: pin.pending}, desc
 }
 
 // parseLogPin checks the pins as given, so that a typo fails at once, not
@@ -374,17 +390,15 @@ func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, modified fun
 		return false, errors.New("-since: a month, YYYY-MM")
 	}
 	out := allReport{TrustedRoot: anchors.RootSource(), Months: []string{}, Proposals: []report{}}
-	var lg *site.ListLog
-	logDesc := "not pinned"
-	if pin != nil {
-		lg = &site.ListLog{Anchors: anchors, SPKI: pin.spki, First: pin.first}
-		logDesc = fmt.Sprintf("from version %d", pin.first)
-	}
+	lg, logDesc := listLogFor(anchors, pin)
 	out.Services.Log = logDesc
 	if c, err := site.CheckServiceChainLogged(ctx, fetch, key, now, modified, lg); err != nil {
 		out.Services.Error = err.Error()
 		out.Errors++
 	} else {
+		if lg != nil && c.Logged == 0 {
+			logDesc += ", none logged yet"
+		}
 		out.Services = servicesOut{Version: c.Version, Checked: c.Checked, Log: logDesc, Logged: c.Logged, Mismatches: c.Mismatches}
 	}
 

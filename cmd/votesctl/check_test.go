@@ -158,7 +158,7 @@ func TestCheckCommand(t *testing.T) {
 	var lout bytes.Buffer
 	if ok, err := checkAll(context.Background(), &lout, httpFetcher(srv.URL, noRedirects()), httpModified(srv.URL, noRedirects()), anchors, key, "2026-10", nil,
 		&listLogPin{spki: []byte("pin"), first: 1}, time.Now()); err != nil || ok ||
-		!bytes.Contains(lout.Bytes(), []byte(`"log": "from version 1"`)) || !bytes.Contains(lout.Bytes(), []byte(`services/1: no bundle`)) {
+		!bytes.Contains(lout.Bytes(), []byte(`"log": "from version 1, none logged yet"`)) || !bytes.Contains(lout.Bytes(), []byte(`services/1: no bundle`)) {
 		t.Fatalf("pinned: %v %v %s", ok, err, lout.Bytes())
 	}
 	// A listed proposal the site doesn't serve is an error, reported with
@@ -222,8 +222,11 @@ func TestCheckCommand(t *testing.T) {
 		{args("-site-key", key, "-all", "-list-anchor-pub", testPinB64, "-first-logged", "-1"), exitUsage},
 		// Pinned from version 1: the list has no bundle, a mismatch.
 		{args("-site-key", key, "-all", "-list-anchor-pub", testPinB64, "-first-logged", "1"), exitMismatch},
-		// Pinned from the next version (before the flag day's publish): ok.
-		{args("-site-key", key, "-all", "-list-anchor-pub", testPinB64, "-first-logged", "2"), exitOK},
+		// Pinned from the next version: only pending (before the flag day's
+		// publish), else an error; pending needs the pins.
+		{args("-site-key", key, "-all", "-list-anchor-pub", testPinB64, "-first-logged", "2", "-first-logged-pending"), exitOK},
+		{args("-site-key", key, "-all", "-list-anchor-pub", testPinB64, "-first-logged", "2"), exitFailed},
+		{args("-site-key", key, "-all", "-first-logged-pending"), exitUsage},
 	} {
 		if got := code(c.args); got != c.want {
 			t.Errorf("%v: exit %d, want %d", c.args[6:], got, c.want)

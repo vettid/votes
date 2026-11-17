@@ -108,7 +108,17 @@ each environment's first publish with `-kms`; until then it warns on
 staging and fails on production (`log_required`). `-list-anchor-pub` must
 be a P-256 key's SubjectPublicKeyInfo and `-first-logged` a decimal
 version from 1; a pin past the real first logged version (the version
-before it has a bundle) is a mismatch.
+before it has a bundle) is a mismatch. A `-first-logged` past the current
+version is an error unless `-first-logged-pending` is given (the
+workflow's `log_pending`), which is only for the flag day: its pin PR,
+merged before the publish, sets `first_logged` to the version about to be
+published with `log_pending: true` and staging's `log_required: true`;
+the next PR, after the publish, removes `log_pending`.
+
+**Production's site key** is a repository variable today
+(`VOTES_PROD_SITE_KEY`); at production's launch, pin it in the workflow's
+matrix (`default_key`) instead, by PR, as staging's is, along with its
+list anchor key.
 
 **The trusted root:** Sigstore's, for `-sigstore` (`production` by
 default), fetched through its TUF repository, or, if that fails, the one

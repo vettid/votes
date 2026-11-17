@@ -209,23 +209,30 @@ reports to AWS (**Alerts**, below).
   key and the instance's trusted root, for that version's bytes (the
   current version's for `services.json` itself, so its copy's lag doesn't
   matter). A bundle that doesn't verify is an error; a missing one is a
-  mismatch at once, as it is written before the list moves. A bundle past
-  the current version is a list logged but never served: a mismatch,
-  except in the 10 minutes after it was written (its `Last-Modified`), a
-  publish in progress. A first logged version past the next one is an
-  error, and a bundle at the version before it (which has none, §3) is a
-  mismatch: the pin is past the real first logged version, and the
+  mismatch at once, as it is written before the list moves. A bundle at
+  the next version is a list logged but not served: a mismatch, except in
+  the 10 minutes after it was written (its `Last-Modified`, which counts
+  only up to a minute ahead of the monitor's clock), a publish in
+  progress. A first logged version past the current one is an error (a
+  rollback to before logging began, or a wrong pin), except while it is
+  pinned **pending**, only between the flag day's pin and its publish,
+  when it may be the next version and nothing is checked yet (the report
+  says so); and a bundle at the version before it (which has none, §3) is
+  a mismatch: the pin is past the real first logged version, and the
   versions between would go unchecked. Versions before the first logged
   one aren't otherwise checked; a version
   whose copy is missing (already a mismatch) has its bundle checked only
-  once the copy is there. Until an environment's pins are set (its first
+  once the copy is there. A rollback of `services.json` to an older
+  version shows as that version's next copy and bundle sitting past the
+  current version, both write-once (a mismatch); there is no separate
+  high-water mark. Until an environment's pins are set (its first
   publish with `-kms`) the report says `"log": "not pinned"` and the run
   warns; production's run fails without them (it has its KMS keys from
   its first deploy). The check holds at the time of each run: a list
   served between two runs and removed with no kept copy leaves nothing
   to check, and a bundle's Rekor time isn't compared with when its list
   was served, so a bundle made after the fact with the list anchor key
-  passes. **Not in this check:** entries in Rekor under the list anchor key
+  passes. It checks verifying Rekor bundles, not Rekor itself. **Not in this check:** entries in Rekor under the list anchor key
   that are no kept version's (a list signed but served elsewhere); that
   search is its own task, designed first (the owner's a, GC #12980).
 - **Every proposal** in `index.json` and in the archive's months, from
@@ -665,8 +672,9 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 - **0.2.14 (2026-11-17):** the monitor checks the service list's Rekor
   log (§7, GC #12646 task 4): from the pinned first logged version on,
   every version's bundle verifies under the pinned list anchor key for
-  its bytes; a missing bundle, or one past the current version, is a
-  mismatch. The search for Rekor entries under that key that are no kept
+  its bytes; a missing bundle, one at the next version, or one before the
+  pinned first, is a mismatch; a first past the current version is an
+  error unless pinned pending (the flag day only). The search for Rekor entries under that key that are no kept
   version's is not in it (the owner's a, GC #12980).
 - **0.2.13 (2026-11-17):** each service list is logged in Rekor before
   it is moved (§2, §3; GC #12646 task 3, VOTE-SITE-KEY-COMPROMISE §6
