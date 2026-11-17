@@ -313,7 +313,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
           'kms:ScheduleKeyDeletion', 'kms:CancelKeyDeletion', 'kms:Verify'] },
       { Sid: 'PublishRoleSigns', Effect: 'Allow', Principal: { AWS: roleArn }, Resource: '*', Action: 'kms:Sign',
         Condition: { StringEquals: { 'kms:SigningAlgorithm': algorithm } } },
-      { Sid: 'PublishRoleReads', Effect: 'Allow', Principal: { AWS: roleArn }, Resource: '*', Action: ['kms:GetPublicKey', 'kms:DescribeKey'] },
+      { Sid: 'PublishRoleReads', Effect: 'Allow', Principal: { AWS: roleArn }, Resource: '*', Action: ['kms:GetPublicKey', 'kms:DescribeKey', 'kms:ListResourceTags'] },
       { Sid: 'OnlyThePublishRoleSigns', Effect: 'Deny', Principal: { AWS: '*' }, Resource: '*', Action: 'kms:Sign',
         Condition: { ArnNotEquals: { 'aws:PrincipalArn': roleArn } } },
       { Sid: 'NoGrants', Effect: 'Deny', Principal: { AWS: '*' }, Resource: '*', Action: 'kms:CreateGrant' },
@@ -335,6 +335,18 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     t.hasResourceProperties('AWS::KMS::Alias', { AliasName: 'alias/vettid-votes-staging-site' });
     t.hasResourceProperties('AWS::KMS::Alias', { AliasName: 'alias/vettid-votes-staging-list-anchor' });
     expect(stack('staging', 'staging').terminationProtection).toBe(true);
+  });
+
+  test('the list anchor key names its Sigstore instance in a tag, which votesctl checks', () => {
+    for (const sigstore of ['staging', 'production'] as const) {
+      const tt = synth('staging', sigstore);
+      const ks = Object.values(tt.findResources('AWS::KMS::Key')) as any[];
+      const bySpec = (spec: string): any => ks.find((r) => r.Properties.KeySpec === spec);
+      const anchor = bySpec('ECC_NIST_P256');
+      const site = bySpec('ECC_NIST_EDWARDS25519');
+      expect(anchor.Properties.Tags).toEqual(expect.arrayContaining([{ Key: 'vettid:sigstore', Value: sigstore }]));
+      expect((site.Properties.Tags ?? []).some((tg: any) => tg.Key === 'vettid:sigstore')).toBe(false);
+    }
   });
 
   test('each key policy, whole: only the publish role signs, with its algorithm; no grants; only the root deletes', () => {
@@ -449,7 +461,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
 
   test('watched, exactly: the keys and their aliases, the publish role', () => {
     expect([...KEY_USE_EVENTS]).toEqual(['Sign', 'CreateGrant', 'PutKeyPolicy', 'ScheduleKeyDeletion', 'DisableKey',
-      'CreateAlias', 'UpdateAlias', 'DeleteAlias']);
+      'CreateAlias', 'UpdateAlias', 'DeleteAlias', 'TagResource', 'UntagResource']);
     const kmsArn = (resource: string): any => ({ 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, `:kms:us-east-1:123456789012:${resource}`]] });
     expect(alt('kms.amazonaws.com')).toEqual([{ eventSource: ['kms.amazonaws.com'], eventName: [...KEY_USE_EVENTS], resources: { ARN: [
       { 'Fn::GetAtt': [logical('AWS::KMS::Key', /^SiteSigningKey/), 'Arn'] }, { 'Fn::GetAtt': [logical('AWS::KMS::Key', /^ListAnchorKey/), 'Arn'] },

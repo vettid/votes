@@ -147,7 +147,7 @@ has a default.
    from the service vault's `GET /v1/anchor-key`. Each later list has the
    next `version` and, as `previous`, the base64 SHA-256 of the published
    `v1/services.json`. Publish it with
-   `./votesctl publish-services -kms <SiteSigningKeyArn> -site-key <that key> -watch-topics <KeyWatchTopicArn>,<KeyWatchTopicBArn> -bucket <BucketName> -in services.json`,
+   `./votesctl publish-services -kms <SiteSigningKeyArn> -site-key <that key> -watch-topics <KeyWatchTopicArn>,<KeyWatchTopicBArn> -list-anchor-key <ListAnchorKeyArn> -list-anchor-pub <its pinned key> -sigstore <the stack's sigstore> -bucket <BucketName> -in services.json`,
    as the publish role (until the flag day, with the secret's key:
    `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`).
    With `-kms` it takes the key's ARN only, never an alias, and uses the
@@ -177,6 +177,53 @@ has a default.
    retry: run it again if it fails), `ED25519_SHA_512` over the label
    and the list's SHA-256, checks the signature under `-site-key` before
    anything is written, and gives up after 3 minutes.
+
+   **Each list is logged in Rekor** (VOTES-SITE §3, GC #12646 task 3):
+   once signed, and before it is moved, its SHA-256 is signed with the
+   list anchor key (`-list-anchor-key`, by ARN only, in the site key's
+   account and region; an ECDSA P-256 key, since Rekor takes no pure
+   Ed25519), timestamped and entered in Rekor on the `-sigstore`
+   instance, in the Rekor profile of BALLOT-PROTOCOL §8.5. The bundle is
+   checked under that instance's trusted root and kept write-once as
+   `v1/services/<version>.bundle`, before the signature and the list, so
+   that no list is served without its entry.
+
+   Before anything is signed it checks:
+   - the key's public key is `-list-anchor-pub` (its SubjectPublicKeyInfo,
+     base64). **Take it from an independent pin**, the monitor's
+     configuration (task 4). The first time, print it with
+     `./votesctl list-anchor-key -kms <ListAnchorKeyArn>` (as the publish
+     role) and pin it there, with the owner's go, before the first
+     publish;
+   - `-sigstore` is the stack's: the key's tag `vettid:sigstore`, which
+     the stack sets to its `sigstore` (a change of the tag is watched).
+     **On this refusal, don't change `-sigstore` to match the tag**: an
+     administrator could have retagged the key. Check the stack's
+     `sigstore` (the deploy context) and the key watch's mail for a
+     `TagResource` first;
+   - the published list's own bundle verifies on that instance under that
+     key. Only on the flag day may the published list (the old key's)
+     have none; otherwise it is refused ("version N is current without
+     its bundle"): run the command with that version's list first, which
+     logs it with no new site signature;
+   - a bundle already kept for this version anchors this list. One that
+     anchors anything else is refused (clear it as a stray, below); one
+     that does is used, so a rerun logs nothing again.
+
+   A Rekor entry is public and permanent: a list is logged only after it
+   has passed every check and the site key has signed it. **After a
+   failed publish, run the same command with the same file.** If
+   logging failed, nothing was written, and the site key signs again (so
+   that publish is emailed twice); and if Rekor had already accepted the
+   entry (the failure came after it: a lost answer, the bundle's check,
+   or its write), the list anchor key signs again too, and Rekor holds a
+   second entry for the same list (the monitor is to match entries by
+   the list's SHA-256, so that is no mismatch). `-secret` doesn't log (it
+   goes after the flag day), and it is refused when the file's version,
+   or the version before it, has a bundle; nor can it publish over a
+   list under the KMS key, which doesn't verify under the secret's key.
+   So every version from the first one published with `-kms` on has a
+   bundle.
 
    **On the flag day** (GC #12646), the published list is signed with
    the secret's key: give that key as `-previous-site-key` on the first
@@ -236,7 +283,8 @@ never be exported (VOTE-SITE-KEY-COMPROMISE §6, GC #12646), and the role
 - the **site key** `alias/vettid-votes-<env>-site` (Ed25519, output
   `SiteSigningKeyArn`), which is to sign the service list, and
 - the **list anchor key** `alias/vettid-votes-<env>-list-anchor` (ECDSA
-  P-256, output `ListAnchorKeyArn`), which is to log each list in Rekor.
+  P-256, output `ListAnchorKeyArn`), which logs each list in Rekor
+  (`publish-services -list-anchor-key`).
 
 Their key policies let the publish role alone sign, each key with its
 own algorithm only (`ED25519_SHA_512`, `ECDSA_SHA_256`; `kms:Sign` is
@@ -245,9 +293,12 @@ account's root user schedule their deletion. The account keeps
 administering them: **any administrator of the account** (any principal
 whose IAM policies allow it) may change a key policy, so that the keys
 can't be locked out; no one gets `Sign` that way, and such a change is
-watched (below). The publish role may read and write `v1/services.json`,
-`v1/services.json.sig` and `v1/services/*`, and list the bucket (so that
-a missing copy is a 404; every document is public), and nothing else.
+watched (below). The publish role may read each key's public key, its
+description and its tags (the list anchor key's tag `vettid:sigstore` is
+the stack's `sigstore`, which `publish-services` checks), read and write
+`v1/services.json`, `v1/services.json.sig` and `v1/services/*`, and list
+the bucket (so that a missing copy is a 404; every document is public),
+and nothing else.
 
 **The watch.** Six EventBridge rules, three pairs
 (`vettid-votes-<env>-kw-keys`, `-kw-watch` and `-kw-notify`, each with
@@ -267,7 +318,8 @@ queue policies, the alarms and the queue are not), and the stack has
 termination protection. They match:
 
 - every signature with either key, and every grant, key policy change,
-  alias change, deletion or disabling of either key or its alias;
+  alias change, tag change, deletion or disabling of either key or its
+  alias;
 - every change to the publish role (its trust or permission policies, a
   boundary, its deletion);
 - every change to the watch: its rules and targets, its alarms (enabling
@@ -307,9 +359,16 @@ another.
   confirmation or an unsubscribe by the email's link is not in
   CloudTrail, so the watch can't see it. Keep `keyWatchEmail` in
   `~/.cdk.json`, not the tracked `cdk.json`, and out of shell history.
-- **A publish is two signatures (once the list anchor key is used, task
-  3), each logged twice and emailed four times** (a pair of rules, two
-  topics: four lines and eight emails) and raises the key-use alarm; **a deploy of this stack does
+- **The deploy that brings the `vettid:sigstore` tag** (GC #12646 task
+  3) tags the list anchor key: if the key already exists, expect a
+  `TagResource` mail on both watch topics for it. That is the deploy, not
+  an incident; any other `TagResource` or `UntagResource` on either key
+  is one.
+- **A publish with `-kms` is two signatures (the site key's and the list
+  anchor key's), each logged twice and emailed four times** (a pair of
+  rules, two topics: four lines and eight emails), and raises the key-use
+  alarm; a rerun that finds the list already signed and logged makes
+  none; **a deploy of this stack does
   too** (it updates the watch). **A publish that does not means the feed
   is broken: stop publishing and find out why.**
 - The feed needs CloudTrail's management events (read and write) for
@@ -326,8 +385,8 @@ another.
   keys, so an administrator of the account who cuts every path in one
   CloudFormation update, or in calls quicker than the watch reports (a
   filter policy on a subscription, then disabling the alarms' actions),
-  can sign unseen until the change is noticed. Once tasks 3 and 4 of GC
-  #12646 are in, each list will also be logged in Rekor and checked
+  can sign unseen until the change is noticed. Each list is logged in
+  Rekor (task 3 of GC #12646); once task 4 is in, the log will be checked
   hourly from outside AWS, which will catch a list signed but not
   logged. **Production waits for
   the cross-account forward** (the owner's choice c, GC #12690): every
@@ -388,7 +447,7 @@ with the owner's go for each step:
    `If-None-Match`.
 2. Delete only the stray keys, e.g.
    `aws s3api delete-object --bucket <BucketName> --key v1/services/<n>.json`
-   (and `.sig`). This leaves a delete marker; the stray stays in the
+   (and `.sig`; or `v1/services/<n>.bundle`, for a stray bundle). This leaves a delete marker; the stray stays in the
    bucket's version history. A wrong key hides a good copy, which
    `publish-services` doesn't rewrite unless it is the current version's:
    restore one with `get-object --version-id <its version>` and

@@ -31,6 +31,7 @@ type fakeS3 struct {
 type fakeObject struct {
 	data []byte
 	etag string
+	cc   string // its Cache-Control
 }
 
 func newFakeS3() *fakeS3 { return &fakeS3{objs: map[string]fakeObject{}} }
@@ -45,13 +46,17 @@ func (f *fakeS3) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*
 
 func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
 	k := aws.ToString(in.Key)
+	// As the bucket policy: under v1/services/ a put needs If-None-Match.
+	if strings.HasPrefix(k, "v1/services/") && aws.ToString(in.IfNoneMatch) != "*" {
+		return nil, errors.New("AccessDenied: write-once")
+	}
 	o, exists := f.objs[k]
 	if aws.ToString(in.IfNoneMatch) == "*" && exists || in.IfMatch != nil && (!exists || o.etag != aws.ToString(in.IfMatch)) {
 		return nil, errors.New("PreconditionFailed")
 	}
 	b, _ := io.ReadAll(in.Body)
 	f.n++
-	f.objs[k] = fakeObject{data: b, etag: fmt.Sprintf(`"%d"`, f.n)}
+	f.objs[k] = fakeObject{data: b, etag: fmt.Sprintf(`"%d"`, f.n), cc: aws.ToString(in.CacheControl)}
 	return &s3.PutObjectOutput{}, nil
 }
 
@@ -95,33 +100,33 @@ func TestPublishSignsOnlyWhatItPublishes(t *testing.T) {
 	a, a2 := testService(3, "A"), testService(4, "B")
 
 	// The first list must be version 1 with a zero previous.
-	if err := publishList(ctx, b, "bucket", k, nil, testList(2, make([]byte, 32), a)); err == nil || !strings.Contains(err.Error(), "first list") {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, testList(2, make([]byte, 32), a)); err == nil || !strings.Contains(err.Error(), "first list") {
 		t.Fatalf("a first list at version 2: %v", err)
 	}
 	// A list the site would refuse: an unknown member, a service listed twice.
-	if err := publishList(ctx, b, "bucket", k, nil, []byte(`{"extra":1,"previous":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","services":[],"v":1,"version":1}`)); err == nil {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, []byte(`{"extra":1,"previous":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","services":[],"v":1,"version":1}`)); err == nil {
 		t.Fatal("an unknown member")
 	}
-	if err := publishList(ctx, b, "bucket", k, nil, testList(1, make([]byte, 32), a, a)); err == nil || !strings.Contains(err.Error(), "twice") {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, testList(1, make([]byte, 32), a, a)); err == nil || !strings.Contains(err.Error(), "twice") {
 		t.Fatalf("a service twice: %v", err)
 	}
 	signs(0, "refused first lists")
 
 	v1 := testList(1, make([]byte, 32), a)
-	if err := publishList(ctx, b, "bucket", k, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	signs(1, "the first list")
 	// A rerun of the published list: nothing signed.
-	if err := publishList(ctx, b, "bucket", k, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	signs(1, "a rerun")
 	h1 := sha256.Sum256(v1)
-	if err := publishList(ctx, b, "bucket", k, nil, testList(3, h1[:], a)); err == nil || !strings.Contains(err.Error(), "next version is 2") {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, testList(3, h1[:], a)); err == nil || !strings.Contains(err.Error(), "next version is 2") {
 		t.Fatalf("a gap: %v", err)
 	}
-	if err := publishList(ctx, b, "bucket", k, nil, testList(2, h1[:], a2)); err == nil || !strings.Contains(err.Error(), "dropped") {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, testList(2, h1[:], a2)); err == nil || !strings.Contains(err.Error(), "dropped") {
 		t.Fatalf("a dropped service: %v", err)
 	}
 	signs(1, "refused next lists")
@@ -131,7 +136,7 @@ func TestPublishSignsOnlyWhatItPublishes(t *testing.T) {
 	v2 := testList(2, h1[:], a, a2)
 	sig2, _ := signList(ctx, secretSigner(key), v2)
 	b.set("v1/services.json.sig", sig2)
-	if err := publishList(ctx, b, "bucket", k, nil, v2); err != nil {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, v2); err != nil {
 		t.Fatal(err)
 	}
 	signs(1, "an interrupted publish finished")
@@ -142,7 +147,7 @@ func TestPublishSignsOnlyWhatItPublishes(t *testing.T) {
 	// A published pair that doesn't verify: refused before signing.
 	b.set("v1/services.json.sig", bytes.Repeat([]byte{1}, 64))
 	h2 := sha256.Sum256(v2)
-	if err := publishList(ctx, b, "bucket", k, nil, testList(3, h2[:], a, a2)); err == nil || !strings.Contains(err.Error(), "restore the pair") {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, testList(3, h2[:], a, a2)); err == nil || !strings.Contains(err.Error(), "restore the pair") {
 		t.Fatalf("a broken pair: %v", err)
 	}
 	signs(1, "a broken pair")
@@ -156,7 +161,7 @@ func TestPublishFlagDay(t *testing.T) {
 	old, nw := testKey("old"), testKey("new")
 	b := newFakeS3()
 	v1 := testList(1, make([]byte, 32), testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", secretSigner(old), nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", secretSigner(old), nil, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	f := newFakeKMS(nw)
@@ -166,17 +171,26 @@ func TestPublishFlagDay(t *testing.T) {
 	}
 	h1 := sha256.Sum256(v1)
 	v2 := testList(2, h1[:], testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", k, nil, v2); err == nil || !strings.Contains(err.Error(), "-previous-site-key") {
+	// With the list log, as every -kms publish: the first list under the
+	// new key is logged, the old key's list (from -secret) isn't.
+	lg := &fakeLog{}
+	if err := publishList(ctx, b, "bucket", k, lg, nil, v2); err == nil || !strings.Contains(err.Error(), "-previous-site-key") {
 		t.Fatalf("without the previous key: %v", err)
 	}
-	if len(f.signs) != 0 {
-		t.Fatal("signed a list it then refused")
+	if len(f.signs) != 0 || len(lg.entries) != 0 {
+		t.Fatal("signed or logged a list it then refused")
 	}
-	if err := publishList(ctx, b, "bucket", k, pub(testKey("third")), v2); err == nil || len(f.signs) != 0 {
+	if err := publishList(ctx, b, "bucket", k, lg, pub(testKey("third")), v2); err == nil || len(f.signs) != 0 || len(lg.entries) != 0 {
 		t.Fatalf("another previous key: %v, %d signs", err, len(f.signs))
 	}
-	if err := publishList(ctx, b, "bucket", k, pub(old), v2); err != nil || len(f.signs) != 1 {
+	if err := publishList(ctx, b, "bucket", k, lg, pub(old), v2); err != nil || len(f.signs) != 1 {
 		t.Fatalf("the flag day: %v, %d signs", err, len(f.signs))
+	}
+	if len(lg.entries) != 1 || !bytes.Equal(b.objs["v1/services/2.bundle"].data, fakeBundle(v2)) {
+		t.Fatalf("the flag day's list isn't logged: %d entries", len(lg.entries))
+	}
+	if _, ok := b.objs["v1/services/1.bundle"]; ok {
+		t.Fatal("the old key's list was logged")
 	}
 	if _, err := site.ParseServiceList(b.objs["v1/services/2.json"].data, b.objs["v1/services/2.json.sig"].data, pub(nw)); err != nil {
 		t.Fatalf("v2 isn't under the new key: %v", err)
@@ -185,8 +199,8 @@ func TestPublishFlagDay(t *testing.T) {
 		t.Fatalf("v1's copy isn't the old key's: %v", err)
 	}
 	h2 := sha256.Sum256(v2)
-	if err := publishList(ctx, b, "bucket", k, nil, testList(3, h2[:], testService(3, "A"))); err != nil || len(f.signs) != 2 {
-		t.Fatalf("after the flag day: %v, %d signs", err, len(f.signs))
+	if err := publishList(ctx, b, "bucket", k, lg, nil, testList(3, h2[:], testService(3, "A"))); err != nil || len(f.signs) != 2 || len(lg.entries) != 2 {
+		t.Fatalf("after the flag day: %v, %d signs, %d entries", err, len(f.signs), len(lg.entries))
 	}
 }
 
@@ -227,7 +241,7 @@ func TestKMSPublishBindsTopics(t *testing.T) {
 		}
 	}
 	// The ARN's form, before reading the file or calling AWS.
-	err := publish(ctx, publishArgs{kms: "alias/vettid-votes-staging-site", siteKey: "k", watch: "w", bucket: "b", in: "/nonexistent"})
+	err := publish(ctx, publishArgs{kms: "alias/vettid-votes-staging-site", siteKey: "k", watch: "w", listAnchor: testAnchorARN, listAnchorPub: "cGlu", sigstore: "staging", bucket: "b", in: "/nonexistent"})
 	if err == nil || !strings.Contains(err.Error(), "not an alias") {
 		t.Fatalf("%v", err)
 	}
@@ -246,18 +260,18 @@ func TestPublishCopyBeforeSigning(t *testing.T) {
 	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(key))
 	b := newFakeS3()
 	v1 := testList(1, make([]byte, 32), testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", k, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	h1 := sha256.Sum256(v1)
 	v2 := testList(2, h1[:], testService(3, "A"), testService(4, "B"))
 	b.set("v1/services/2.json", []byte("planted"))
-	if err := publishList(ctx, b, "bucket", k, nil, v2); err == nil || !strings.Contains(err.Error(), "other bytes") || len(f.signs) != 1 {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, v2); err == nil || !strings.Contains(err.Error(), "other bytes") || len(f.signs) != 1 {
 		t.Fatalf("a planted copy: %v, %d signs", err, len(f.signs))
 	}
 	delete(b.objs, "v1/services/2.json")
 	b.set("v1/services/2.json.sig", bytes.Repeat([]byte{7}, 64))
-	if err := publishList(ctx, b, "bucket", k, nil, v2); err == nil || !strings.Contains(err.Error(), "other bytes") || len(f.signs) != 1 {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, v2); err == nil || !strings.Contains(err.Error(), "other bytes") || len(f.signs) != 1 {
 		t.Fatalf("a planted signature copy: %v, %d signs", err, len(f.signs))
 	}
 	// The copy of v2's own signature (a pair rolled back after v2 was
@@ -265,7 +279,7 @@ func TestPublishCopyBeforeSigning(t *testing.T) {
 	sig2, _ := signList(ctx, secretSigner(key), v2)
 	b.set("v1/services/2.json", v2)
 	b.set("v1/services/2.json.sig", sig2)
-	if err := publishList(ctx, b, "bucket", k, nil, v2); err != nil || len(f.signs) != 1 {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, v2); err != nil || len(f.signs) != 1 {
 		t.Fatalf("its own copy: %v, %d signs", err, len(f.signs))
 	}
 	if !bytes.Equal(b.objs["v1/services.json.sig"].data, sig2) || !bytes.Equal(b.objs["v1/services.json"].data, v2) {
@@ -285,45 +299,45 @@ func TestPreviousKeyOnlyOnFlagDay(t *testing.T) {
 	h1 := sha256.Sum256(v1)
 	v2 := testList(2, h1[:], testService(3, "A"))
 
-	if err := publishList(ctx, newFakeS3(), "bucket", k, pub(nw), v1); err == nil || !strings.Contains(err.Error(), "is -site-key") {
+	if err := publishList(ctx, newFakeS3(), "bucket", k, nil, pub(nw), v1); err == nil || !strings.Contains(err.Error(), "is -site-key") {
 		t.Fatalf("previous is the key: %v", err)
 	}
-	if err := publishList(ctx, newFakeS3(), "bucket", k, pub(old), v1); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
+	if err := publishList(ctx, newFakeS3(), "bucket", k, nil, pub(old), v1); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
 		t.Fatalf("a first list: %v", err)
 	}
 	// Already under the new key.
 	b := newFakeS3()
-	if err := publishList(ctx, b, "bucket", k, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	signs := len(f.signs)
-	if err := publishList(ctx, b, "bucket", k, pub(old), v2); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
+	if err := publishList(ctx, b, "bucket", k, nil, pub(old), v2); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
 		t.Fatalf("a list already under the new key: %v", err)
 	}
-	if err := publishList(ctx, b, "bucket", k, pub(old), v1); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
+	if err := publishList(ctx, b, "bucket", k, nil, pub(old), v1); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
 		t.Fatalf("a rerun: %v", err)
 	}
 	// The flag day itself, then a rerun with the flag: refused.
 	ob := newFakeS3()
-	if err := publishList(ctx, ob, "bucket", secretSigner(old), nil, v1); err != nil {
+	if err := publishList(ctx, ob, "bucket", secretSigner(old), nil, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	// The old list again, under the new key, with the old key given: not
 	// the next version (and not "already published" under the old key).
-	if err := publishList(ctx, ob, "bucket", k, pub(old), v1); err == nil {
+	if err := publishList(ctx, ob, "bucket", k, nil, pub(old), v1); err == nil {
 		t.Fatal("the old list again on the flag day")
 	}
 	if len(f.signs) != signs {
 		t.Fatalf("signed for a refusal: %d", len(f.signs)-signs)
 	}
-	if err := publishList(ctx, ob, "bucket", k, pub(old), v2); err != nil || len(f.signs) != signs+1 {
+	if err := publishList(ctx, ob, "bucket", k, nil, pub(old), v2); err != nil || len(f.signs) != signs+1 {
 		t.Fatalf("the flag day: %v", err)
 	}
-	if err := publishList(ctx, ob, "bucket", k, pub(old), v2); err == nil || !strings.Contains(err.Error(), "only for the flag day") || len(f.signs) != signs+1 {
+	if err := publishList(ctx, ob, "bucket", k, nil, pub(old), v2); err == nil || !strings.Contains(err.Error(), "only for the flag day") || len(f.signs) != signs+1 {
 		t.Fatalf("a rerun of the flag day with the flag: %v", err)
 	}
 	// The flag's own decoding, before AWS.
-	if err := publish(ctx, publishArgs{kms: testKeyARN, siteKey: base64Key(pub(nw)), watch: topicA + "," + topicB, previous: "nope", bucket: "b", in: "/nonexistent"}); err == nil ||
+	if err := publish(ctx, publishArgs{kms: testKeyARN, siteKey: base64Key(pub(nw)), watch: topicA + "," + topicB, previous: "nope", listAnchor: testAnchorARN, listAnchorPub: "cGlu", sigstore: "staging", bucket: "b", in: "/nonexistent"}); err == nil ||
 		!strings.HasPrefix(err.Error(), "-previous-site-key: an Ed25519 public key") {
 		t.Fatalf("%v", err)
 	}
@@ -338,14 +352,14 @@ func TestResumeNeedsThePrevious(t *testing.T) {
 	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(key))
 	b := newFakeS3()
 	v1 := testList(1, make([]byte, 32), testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", k, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	// A signature over a list that doesn't extend v1, planted as current.
 	other := testList(2, bytes.Repeat([]byte{9}, 32), testService(3, "A"))
 	sig, _ := signList(ctx, secretSigner(key), other)
 	b.set("v1/services.json.sig", sig)
-	if err := publishList(ctx, b, "bucket", k, nil, other); err == nil || !strings.Contains(err.Error(), "restore the pair") || len(f.signs) != 1 {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, other); err == nil || !strings.Contains(err.Error(), "restore the pair") || len(f.signs) != 1 {
 		t.Fatalf("%v, %d signs", err, len(f.signs))
 	}
 	if !bytes.Equal(b.objs["v1/services.json"].data, v1) {
@@ -363,7 +377,7 @@ func TestFlagDayInterrupted(t *testing.T) {
 	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(nw))
 	b := newFakeS3()
 	v1 := testList(1, make([]byte, 32), testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", secretSigner(old), nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", secretSigner(old), nil, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	h1 := sha256.Sum256(v1)
@@ -372,16 +386,16 @@ func TestFlagDayInterrupted(t *testing.T) {
 	// new key, and the published pair doesn't verify under the old key.
 	oldSig, _ := signList(ctx, secretSigner(old), v2)
 	b.set("v1/services.json.sig", oldSig)
-	if err := publishList(ctx, b, "bucket", k, pub(old), v2); err == nil || !strings.Contains(err.Error(), "restore the pair") || len(f.signs) != 0 {
+	if err := publishList(ctx, b, "bucket", k, nil, pub(old), v2); err == nil || !strings.Contains(err.Error(), "restore the pair") || len(f.signs) != 0 {
 		t.Fatalf("an old-key interrupted publish: %v, %d signs", err, len(f.signs))
 	}
 	// The new key's signature of v2 written, the list not.
 	newSig, _ := signList(ctx, secretSigner(nw), v2)
 	b.set("v1/services.json.sig", newSig)
-	if err := publishList(ctx, b, "bucket", k, pub(old), v2); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
+	if err := publishList(ctx, b, "bucket", k, nil, pub(old), v2); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
 		t.Fatalf("the rerun with the old key: %v", err)
 	}
-	if err := publishList(ctx, b, "bucket", k, nil, v2); err != nil || len(f.signs) != 0 {
+	if err := publishList(ctx, b, "bucket", k, nil, nil, v2); err != nil || len(f.signs) != 0 {
 		t.Fatalf("the rerun: %v, %d signs", err, len(f.signs))
 	}
 	if !bytes.Equal(b.objs["v1/services.json"].data, v2) {
@@ -399,12 +413,12 @@ func TestFlagDayOver(t *testing.T) {
 	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(nw))
 	b := newFakeS3()
 	v1 := testList(1, make([]byte, 32), testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", secretSigner(old), nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", secretSigner(old), nil, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	h1 := sha256.Sum256(v1)
 	v2 := testList(2, h1[:], testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", k, pub(old), v2); err != nil {
+	if err := publishList(ctx, b, "bucket", k, nil, pub(old), v2); err != nil {
 		t.Fatal(err)
 	}
 	// The old key's own v3, put back as current by someone with the old
@@ -416,10 +430,10 @@ func TestFlagDayOver(t *testing.T) {
 	b.set("v1/services.json.sig", ps)
 	next := testList(4, sha256Of(planted), testService(3, "A"), testService(5, "Evil"))
 	signs := len(f.signs)
-	if err := publishList(ctx, b, "bucket", k, pub(old), next); err == nil || !strings.Contains(err.Error(), "flag day is over") {
+	if err := publishList(ctx, b, "bucket", k, nil, pub(old), next); err == nil || !strings.Contains(err.Error(), "flag day is over") {
 		t.Fatalf("the flag after the flag day: %v", err)
 	}
-	err := publishList(ctx, b, "bucket", k, nil, next)
+	err := publishList(ctx, b, "bucket", k, nil, nil, next)
 	if err == nil || !strings.Contains(err.Error(), "restore the pair") || strings.Contains(err.Error(), "-previous-site-key") {
 		t.Fatalf("without the flag: %v", err)
 	}
@@ -442,11 +456,11 @@ func TestFlagDayEdges(t *testing.T) {
 	v2 := testList(2, sha256Of(v1), testService(3, "A"))
 	b := newFakeS3()
 	b.set("v1/services.json", v1) // no signature: a broken pair
-	if err := publishList(ctx, b, "bucket", k, pub(old), v2); err == nil || !strings.Contains(err.Error(), "restore the pair") {
+	if err := publishList(ctx, b, "bucket", k, nil, pub(old), v2); err == nil || !strings.Contains(err.Error(), "restore the pair") {
 		t.Fatalf("a broken pair with the flag: %v", err)
 	}
 	err := publish(ctx, publishArgs{kms: testKeyARN, siteKey: base64Key(pub(nw)), previous: base64Key(pub(nw)),
-		watch: topicA + "," + topicB, bucket: "b", in: "/nonexistent"})
+		watch: topicA + "," + topicB, listAnchor: testAnchorARN, listAnchorPub: "cGlu", sigstore: "staging", bucket: "b", in: "/nonexistent"})
 	if err == nil || !strings.Contains(err.Error(), "is -site-key") {
 		t.Fatalf("the flag equal to -site-key: %v", err)
 	}
@@ -457,7 +471,7 @@ func TestFlagDayEdges(t *testing.T) {
 	ob := newFakeS3()
 	ob.set("v1/services.json", v1)
 	ob.set("v1/services.json.sig", forged)
-	if err := publishList(ctx, ob, "bucket", k, identity, v2); err == nil || !strings.Contains(err.Error(), "restore the pair") || len(f.signs) != 0 {
+	if err := publishList(ctx, ob, "bucket", k, nil, identity, v2); err == nil || !strings.Contains(err.Error(), "restore the pair") || len(f.signs) != 0 {
 		t.Fatalf("a small-order old key: %v, %d signs", err, len(f.signs))
 	}
 }

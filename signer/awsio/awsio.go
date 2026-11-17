@@ -54,6 +54,12 @@ func NewKey(ctx context.Context, c KMSAPI, keyID string) (*Key, error) {
 	if err != nil {
 		return nil, fmt.Errorf("awsio: the anchor key: %w", err)
 	}
+	return NewKeyFrom(c, keyID, out)
+}
+
+// NewKeyFrom is NewKey from a GetPublicKey answer already read (by a
+// caller that checks more of it), with the same checks.
+func NewKeyFrom(c KMSAPI, keyID string, out *kms.GetPublicKeyOutput) (*Key, error) {
 	if out.KeySpec != kmstypes.KeySpecEccNistP256 || out.KeyUsage != kmstypes.KeyUsageTypeSignVerify {
 		return nil, fmt.Errorf("awsio: the anchor key is %s for %s, not ECC_NIST_P256 for SIGN_VERIFY", out.KeySpec, out.KeyUsage)
 	}
