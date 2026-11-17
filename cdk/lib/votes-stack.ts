@@ -706,6 +706,9 @@ export class VotesStack extends cdk.Stack {
         { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stackRefactor] },
         // A change set run later by its ARN alone (no stack name).
         { eventSource: ['cloudformation.amazonaws.com'], eventName: ['ExecuteChangeSet'], requestParameters: { stackName: [{ exists: false }] } },
+        // The watch's dead letters (here, not in watch: that pattern would
+        // pass the quota; every pair watches the others).
+        { eventSource: ['sqs.amazonaws.com'], eventName: [...WATCH_EVENTS.queue], requestParameters: { queueUrl: [deadLetters.queueUrl] } },
       ],
       watch: [
         { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.rules],
@@ -713,12 +716,14 @@ export class VotesStack extends cdk.Stack {
         // The heartbeat's function. Event names by prefix, so that the API
         // version CloudTrail appends doesn't matter (DeleteFunction also
         // matches DeleteFunctionUrlConfig and the like, on this function
-        // only). functionName as the caller gave it: the name, or a full or
-        // partial ARN (both end in :function:<name>). A qualified form
-        // (name:alias, ARN:version) acts only on a version or an alias,
-        // which the tick doesn't invoke.
+        // only). functionName as the caller gave it, or as CloudTrail
+        // records it: the name, the name with any qualifier (name:$LATEST,
+        // name:alias), or a full or partial ARN, unqualified or with
+        // $LATEST (the version the tick invokes). Another version or alias
+        // in an ARN isn't matched: the tick never invokes one.
         { eventSource: ['lambda.amazonaws.com'], eventName: WATCH_EVENTS.heartbeatFunction.map((e) => ({ prefix: e })),
-          requestParameters: { functionName: [heartbeatFunctionName, { suffix: `:function:${heartbeatFunctionName}` }] } },
+          requestParameters: { functionName: [heartbeatFunctionName, { prefix: `${heartbeatFunctionName}:` },
+            { suffix: `:function:${heartbeatFunctionName}` }, { suffix: `:function:${heartbeatFunctionName}:$LATEST` }] } },
         // Any bus: a bus's key change can stop its rules.
         { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.buses] },
         // (The watch's alarms are in notify, below: with the heartbeat's
@@ -731,7 +736,6 @@ export class VotesStack extends cdk.Stack {
         // A metric filter on any log group that feeds the watch's metrics.
         { eventSource: ['logs.amazonaws.com'], eventName: ['PutMetricFilter'],
           requestParameters: { metricTransformations: { metricNamespace: [keysNamespace] } } },
-        { eventSource: ['sqs.amazonaws.com'], eventName: [...WATCH_EVENTS.queue], requestParameters: { queueUrl: [deadLetters.queueUrl] } },
       ],
       notify: [
         // PutDataProtectionPolicy names its topic as resourceArn.
@@ -808,6 +812,9 @@ export class VotesStack extends cdk.Stack {
         detail: {
           eventSource: ['kms.amazonaws.com'], eventName: ['DescribeKey'], resources: { ARN: [site.keyArn] },
           userIdentity: { sessionContext: { sessionIssuer: { arn: [heartbeatRole.roleArn] } } },
+          // A refused call (AccessDenied) may still name the key: only a
+          // successful one is a heartbeat.
+          errorCode: [{ exists: false }],
         },
       },
     });

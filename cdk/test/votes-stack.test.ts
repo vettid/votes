@@ -505,8 +505,8 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       // Prefixes: CloudTrail's names carry an API version (UpdateFunctionCode20150331v2).
       eventName: [{ prefix: 'UpdateFunctionCode' }, { prefix: 'UpdateFunctionConfiguration' }, { prefix: 'DeleteFunction' }, { prefix: 'AddPermission' },
         { prefix: 'RemovePermission' }, { prefix: 'PutFunctionConcurrency' }, { prefix: 'DeleteFunctionConcurrency' }],
-      // The name, or a full or partial ARN.
-      requestParameters: { functionName: [fn, { suffix: `:function:${fn}` }] } }];
+      // The name, the name with a qualifier, a full or partial ARN, unqualified or $LATEST.
+      requestParameters: { functionName: [fn, { prefix: `${fn}:` }, { suffix: `:function:${fn}` }, { suffix: `:function:${fn}:$LATEST` }] } }];
     expect(alt('lambda.amazonaws.com')).toEqual(lambdaAlt);
     const watchPair = rules().find((r) => r.Properties.Name === 'vettid-votes-staging-kw-watch').Properties.EventPattern.detail.$or;
     expect(watchPair.filter((x: any) => x.eventSource[0] === 'lambda.amazonaws.com')).toEqual(lambdaAlt);
@@ -753,6 +753,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       detail: {
         eventSource: ['kms.amazonaws.com'], eventName: ['DescribeKey'], resources: { ARN: [{ 'Fn::GetAtt': [siteLogical, 'Arn'] }] },
         userIdentity: { sessionContext: { sessionIssuer: { arn: [{ 'Fn::GetAtt': [heartbeatRoleLogical, 'Arn'] }] } } },
+        errorCode: [{ exists: false }],
       },
     });
   });

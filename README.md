@@ -297,8 +297,9 @@ has a default.
    `MonitorRoleArn`) and the heartbeat alarm. Then set the repository
    variables (Settings, Variables: not secrets)
    `VOTES_<STAGING|PROD>_MONITOR_ROLE_ARN` to that output and
-   `VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN` to the topic. The alarm fires 3
-   hours after the deploy until the first run that puts a heartbeat.
+   `VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN` to the topic. The alarm can go
+   to ALARM within minutes of its creation (missing data counts as
+   breaching), and stays there until the first run that puts a heartbeat.
    The deploy also makes the key watch's heartbeat (below, "The
    heartbeat"): the function and role `vettid-votes-<env>-key-watch-heartbeat`,
    the rules `vettid-votes-<env>-kw-heartbeat-tick` and
@@ -368,7 +369,11 @@ termination protection. They match:
   configuration, who may invoke it, its concurrency (a concurrency of 0
   would silence it) and its deletion, by its name or ARN (CloudTrail
   names these events with an API version, `UpdateFunctionCode20150331v2`,
-  so they are matched by prefix);
+  so they are matched by prefix; unqualified, `:$LATEST` or with an alias
+  name). Not watched, each failing closed (no heartbeat line, so its
+  alarm fires): the function's event-invoke configuration (its retries
+  and failure destinations), a specific version or alias (the tick
+  invokes neither), and the function's own log group;
 - every change to the watch: its rules (the six and the heartbeat's two,
   matched by their names' prefix `vettid-votes-<env>-kw-`) and targets,
   its alarms (enabling or disabling their actions too), any alarm mute
