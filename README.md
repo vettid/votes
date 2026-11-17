@@ -248,11 +248,18 @@ another.
   goes to the dead letters, so the feed alarm can come that late. While
   any dead letter remains, the feed alarm stays in ALARM: read them, then
   purge the queue (a watched call).
-- **What is not covered:** an administrator of the account who cuts
-  every path in one CloudFormation update, or in calls quicker than the
-  watch reports, can sign unseen until the change is noticed (the
-  owner's question, GC #12690). A heartbeat that proves the feed is alive
-  comes with the monitor (GC #12646, task 4).
+- **A known limit (staging):** the watch is in the same account as the
+  keys, so an administrator of the account who cuts every path in one
+  CloudFormation update, or in calls quicker than the watch reports (a
+  filter policy on a subscription, then disabling the alarms' actions),
+  can sign unseen until the change is noticed. Each list is still logged
+  in Rekor and checked hourly from outside AWS (GC #12646, tasks 3 and
+  4), which catches a list signed but not logged. **Production waits for
+  the cross-account forward** (the owner's choice c, GC #12690): every
+  watched event also sent to the management account, where the staging
+  or production account's administrators can't silence it, before a
+  production key signs anything. A heartbeat that proves the feed is
+  alive comes with the monitor (task 4).
 - **The publisher is a permission set of its own** (GC #12713). Before
   the first deploy, the owner creates in IAM Identity Center a permission
   set (for example `VettIDVotesPublisher`) whose only permission is an
