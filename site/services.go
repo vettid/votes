@@ -62,6 +62,16 @@ func ParseServiceList(data, sig []byte, siteKey ed25519.PublicKey) (*ServiceList
 	if vote.Verify(siteKey, vote.LabelServiceList, sha(data), sig) != nil {
 		return nil, errors.New("site: the service list's signature fails")
 	}
+	return ParseUnsignedServiceList(data)
+}
+
+// ParseUnsignedServiceList makes every check of ParseServiceList but the
+// signature's: for a list about to be signed (votesctl), so that one the
+// site would refuse is never signed.
+func ParseUnsignedServiceList(data []byte) (*ServiceList, error) {
+	if len(data) > MaxServiceList {
+		return nil, errors.New("site: the service list is too large")
+	}
 	canon, err := vote.Canonicalize(data)
 	if err != nil || !bytes.Equal(canon, data) {
 		return nil, errors.New("site: the service list isn't canonical")

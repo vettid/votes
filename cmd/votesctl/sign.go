@@ -111,13 +111,17 @@ func newKMSSigner(ctx context.Context, c kmsAPI, key string, expect ed25519.Publ
 
 func (k *kmsSigner) Public() ed25519.PublicKey { return k.pub }
 
+// noRetry makes one attempt: each signature is emailed (README "The
+// watch"), so a publish signs once, or fails and is run again.
+func noRetry(o *kms.Options) { o.RetryMaxAttempts = 1 }
+
 func (k *kmsSigner) Sign(ctx context.Context, msg []byte) ([]byte, error) {
 	out, err := k.c.Sign(ctx, &kms.SignInput{
 		KeyId:            aws.String(k.key),
 		Message:          msg,
 		MessageType:      kmstypes.MessageTypeRaw, // pure Ed25519 over msg, as suite.Sign
 		SigningAlgorithm: kmstypes.SigningAlgorithmSpecEd25519Sha512,
-	})
+	}, noRetry)
 	if err != nil {
 		return nil, fmt.Errorf("signing with the site key: %w", err)
 	}

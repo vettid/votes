@@ -144,17 +144,31 @@ environment. None has a default.
    `./votesctl publish-services -kms <SiteSigningKeyArn> -site-key <that key> -watch-topics <KeyWatchTopicArn>,<KeyWatchTopicBArn> -bucket <BucketName> -in services.json`,
    as the publish role (until the flag day, with the secret's key:
    `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`).
-   With `-kms` it takes the key's ARN only, never an alias; it refuses a
-   key that isn't an Ed25519 signing key whose public key is
-   `-site-key`; it signs through KMS (`ED25519_SHA_512` over the label
-   and the list's SHA-256) and checks every signature under `-site-key`
-   before anything is written; and first it refuses to publish unless
-   `-watch-topics` names the stack's two key watch topics (in that
-   order) and each has exactly one email subscription, confirmed
-   (README "The watch"), since nobody would be told of the signature. A
-   list the published one refuses (a version gap, a dropped service) is
-   refused before it is signed, so no signature is made, or emailed, for
-   it. To act as the publish role, add a profile and set
+   With `-kms` it takes the key's ARN only, never an alias, and uses the
+   ARN's region; it refuses a key that isn't an Ed25519 signing key
+   whose public key is `-site-key`. **Take `-site-key` from an
+   independent pin** (the stack's deployed `siteKey`, or `vote_site_key`
+   in the member vaults' release config), never from `site-key -kms`
+   itself, which would only compare the key with itself. It refuses to
+   publish unless `-watch-topics` names the stack's two key watch
+   topics (in that order, in the key's account and region) and each has
+   exactly one email subscription, confirmed (README "The watch"),
+   since nobody would be told of the signature. Every check that can
+   refuse the list (its form, the first-list rule, that it extends the
+   published list by one version) runs before it is signed, so no
+   signature is made, or emailed, for a list that is refused; a rerun of
+   a list already signed (published, or interrupted half-way) uses the
+   bucket's signature and signs nothing. It signs through KMS once (no
+   retry: run it again if it fails), `ED25519_SHA_512` over the label
+   and the list's SHA-256, checks the signature under `-site-key` before
+   anything is written, and gives up after 3 minutes.
+
+   **On the flag day** (GC #12646), the published list is signed with
+   the secret's key: give that key as `-previous-site-key` on the first
+   `-kms` publish (the next version, the same services), which checks
+   the published list under it; later publishes don't need it.
+
+   To act as the publish role, add a profile and set
    `AWS_PROFILE` to it:
 
    ```ini

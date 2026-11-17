@@ -60,10 +60,10 @@ func TestPublishServices(t *testing.T) {
 			}
 		}
 	}
-	if err := publishList(ctx, c, bucket, secretSigner(key), list(2, make([]byte, 32), svc)); err == nil {
+	if err := publishList(ctx, c, bucket, secretSigner(key), nil, list(2, make([]byte, 32), svc)); err == nil {
 		t.Fatal("a first list that isn't version 1")
 	}
-	if err := publishList(ctx, c, bucket, secretSigner(key), v1); err != nil {
+	if err := publishList(ctx, c, bucket, secretSigner(key), nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	// Both written by publishList: the current pair is cached briefly, so
@@ -83,7 +83,7 @@ func TestPublishServices(t *testing.T) {
 	h := sha256.Sum256(v1)
 	ik2 := bytes.Repeat([]byte{4}, 32)
 	v2 := list(2, h[:], svc, site.Service{ServiceID: site.ServiceID(ik2), Name: "B", IKs: [][]byte{ik2}, AnchorKeys: []site.AnchorKey{}})
-	if err := publishList(ctx, c, bucket, secretSigner(key), list(2, h[:])); err == nil || !strings.Contains(err.Error(), "dropped") {
+	if err := publishList(ctx, c, bucket, secretSigner(key), nil, list(2, h[:])); err == nil || !strings.Contains(err.Error(), "dropped") {
 		t.Fatalf("a list that drops a service: %v", err)
 	}
 	noCopy(2, "a list refused by Extends")
@@ -98,11 +98,11 @@ func TestPublishServices(t *testing.T) {
 	// Another list over the interrupted one is refused: the pair doesn't
 	// verify, and neither list gets a copy.
 	other := list(2, h[:], svc, site.Service{ServiceID: site.ServiceID(ik2), Name: "C", IKs: [][]byte{ik2}, AnchorKeys: []site.AnchorKey{}})
-	if err := publishList(ctx, c, bucket, secretSigner(key), other); err == nil || !strings.Contains(err.Error(), "doesn't verify") {
+	if err := publishList(ctx, c, bucket, secretSigner(key), nil, other); err == nil || !strings.Contains(err.Error(), "doesn't verify") {
 		t.Fatalf("another list over an interrupted publish: %v", err)
 	}
 	noCopy(2, "another list over an interrupted publish")
-	if err := publishList(ctx, c, bucket, secretSigner(key), v2); err != nil {
+	if err := publishList(ctx, c, bucket, secretSigner(key), nil, v2); err != nil {
 		t.Fatalf("finishing the interrupted publish: %v", err)
 	}
 	got, _ := get(ctx, c, bucket, "v1/services.json")
@@ -132,7 +132,7 @@ func TestPublishServices(t *testing.T) {
 	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("v1/services/2.json")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := publishList(ctx, c, bucket, secretSigner(key), v2); err != nil {
+	if err := publishList(ctx, c, bucket, secretSigner(key), nil, v2); err != nil {
 		t.Fatalf("the current list again: %v", err)
 	}
 	kept(2, data)
@@ -143,7 +143,7 @@ func TestPublishServices(t *testing.T) {
 	if err := put(ctx, c, bucket, "v1/services/3.json.sig", []byte("other"), "application/octet-stream", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := publishList(ctx, c, bucket, secretSigner(key), v3); err == nil || !strings.Contains(err.Error(), "other bytes") {
+	if err := publishList(ctx, c, bucket, secretSigner(key), nil, v3); err == nil || !strings.Contains(err.Error(), "other bytes") {
 		t.Fatalf("over another version 3: %v", err)
 	}
 	if got, _ := get(ctx, c, bucket, "v1/services.json"); !bytes.Equal(got.data, data) {
@@ -154,7 +154,7 @@ func TestPublishServices(t *testing.T) {
 	}
 	// Versions are consecutive.
 	v4 := list(4, h2[:], svc, site.Service{ServiceID: site.ServiceID(ik2), Name: "B2", IKs: [][]byte{ik2}, AnchorKeys: []site.AnchorKey{}})
-	if err := publishList(ctx, c, bucket, secretSigner(key), v4); err == nil || !strings.Contains(err.Error(), "next version is 3") {
+	if err := publishList(ctx, c, bucket, secretSigner(key), nil, v4); err == nil || !strings.Contains(err.Error(), "next version is 3") {
 		t.Fatalf("a version gap: %v", err)
 	}
 	noCopy(4, "a version gap")
@@ -174,7 +174,7 @@ func TestPublishServices(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	err := publishList(ctx, c, bucket, secretSigner(key), v3ok)
+	err := publishList(ctx, c, bucket, secretSigner(key), nil, v3ok)
 	beforeMove = func() {}
 	if !ran || err == nil || !strings.Contains(err.Error(), "changed while publishing") {
 		t.Fatalf("a move over a signature that changed (hook ran: %v): %v", ran, err)
@@ -192,7 +192,7 @@ func TestPublishServices(t *testing.T) {
 	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("v1/services/2.json.sig")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := publishList(ctx, c, bucket, secretSigner(key), v2); err != nil {
+	if err := publishList(ctx, c, bucket, secretSigner(key), nil, v2); err != nil {
 		t.Fatal(err)
 	}
 	kept(2, data)
@@ -206,7 +206,7 @@ func TestPublishServices(t *testing.T) {
 	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("v1/services.json.sig")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := publishList(ctx, c, bucket, secretSigner(key), v1); err == nil || !strings.Contains(err.Error(), "without the other") {
+	if err := publishList(ctx, c, bucket, secretSigner(key), nil, v1); err == nil || !strings.Contains(err.Error(), "without the other") {
 		t.Fatalf("a list without its signature: %v", err)
 	}
 }
@@ -240,7 +240,7 @@ func TestPublishServicesKMS(t *testing.T) {
 		return b
 	}
 	v1 := list(1, make([]byte, 32))
-	if err := publishList(ctx, c, bucket, k, v1); err != nil {
+	if err := publishList(ctx, c, bucket, k, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.signs) != 1 {
@@ -251,16 +251,16 @@ func TestPublishServicesKMS(t *testing.T) {
 		t.Fatal("the KMS signature differs from the key's own")
 	}
 	h := sha256.Sum256(v1)
-	if err := publishList(ctx, c, bucket, k, list(3, h[:])); err == nil || !strings.Contains(err.Error(), "next version is 2") {
+	if err := publishList(ctx, c, bucket, k, nil, list(3, h[:])); err == nil || !strings.Contains(err.Error(), "next version is 2") {
 		t.Fatalf("a version gap: %v", err)
 	}
 	if len(f.signs) != 1 {
 		t.Fatalf("a refused list was signed: %d signs", len(f.signs))
 	}
-	if err := publishList(ctx, c, bucket, k, v1); err != nil {
+	if err := publishList(ctx, c, bucket, k, nil, v1); err != nil {
 		t.Fatalf("a rerun of the published list: %v", err)
 	}
-	if err := publishList(ctx, c, bucket, k, list(2, h[:])); err != nil {
+	if err := publishList(ctx, c, bucket, k, nil, list(2, h[:])); err != nil {
 		t.Fatal(err)
 	}
 }

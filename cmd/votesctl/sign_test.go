@@ -10,7 +10,6 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -23,7 +22,6 @@ import (
 
 	"github.com/vettid/service-vault/vote"
 	"github.com/vettid/vettid-vault/vms/suite"
-	"github.com/vettid/votes/site"
 )
 
 // Fixed test values: no real account or key.
@@ -47,6 +45,7 @@ type fakeKMS struct {
 	signErr     error
 	badSig      bool
 	signs       []*kms.SignInput
+	retries     []int // RetryMaxAttempts each Sign was made with
 	publicReads int
 }
 
@@ -72,10 +71,20 @@ func (f *fakeKMS) GetPublicKey(_ context.Context, in *kms.GetPublicKeyInput, _ .
 	return &kms.GetPublicKeyOutput{KeyId: f.id(in.KeyId), KeySpec: f.spec, KeyUsage: f.usage, SigningAlgorithms: f.algs, PublicKey: spki}, nil
 }
 
-func (f *fakeKMS) Sign(_ context.Context, in *kms.SignInput, _ ...func(*kms.Options)) (*kms.SignOutput, error) {
+func (f *fakeKMS) Sign(_ context.Context, in *kms.SignInput, opts ...func(*kms.Options)) (*kms.SignOutput, error) {
 	f.signs = append(f.signs, in)
+	var o kms.Options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	f.retries = append(f.retries, o.RetryMaxAttempts)
 	if f.signErr != nil {
 		return nil, f.signErr
+	}
+	// As KMS: an Ed25519 key signs RAW with ED25519_SHA_512 (or DIGEST
+	// with ED25519_PH_SHA_512, which this signer never asks for).
+	if in.MessageType != kmstypes.MessageTypeRaw || in.SigningAlgorithm != kmstypes.SigningAlgorithmSpecEd25519Sha512 {
+		return nil, errors.New("ValidationException: unsupported message type or algorithm")
 	}
 	sig := ed25519.Sign(f.priv, in.Message)
 	if f.badSig {
@@ -390,56 +399,3 @@ func TestKMSPublishOrder(t *testing.T) {
 }
 
 func base64Key(k ed25519.PublicKey) string { return base64.StdEncoding.EncodeToString(k) }
-
-// preCheck refuses, before signing, a new list that the published one
-// refuses; it leaves every other case to the checks after signing.
-func TestPreCheck(t *testing.T) {
-	ctx := context.Background()
-	key := testKey("site")
-	ik := bytes.Repeat([]byte{3}, 32)
-	svc := site.Service{ServiceID: site.ServiceID(ik), Name: "A", IKs: [][]byte{ik}, AnchorKeys: []site.AnchorKey{}}
-	list := func(version int64, previous []byte, services ...site.Service) []byte {
-		if services == nil {
-			services = []site.Service{}
-		}
-		b, _ := json.Marshal(&site.ServiceList{V: 1, Version: version, Previous: previous, Services: services})
-		b, _ = vote.Canonicalize(b)
-		return b
-	}
-	v1 := list(1, make([]byte, 32), svc)
-	sig1, err := signList(ctx, secretSigner(key), v1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cur, curSig := object{data: v1, tag: "t"}, object{data: sig1, tag: "s"}
-	h := sha256.Sum256(v1)
-	for _, c := range []struct {
-		name string
-		data []byte
-		want string
-	}{
-		{"skips a version", list(3, h[:], svc), "next version is 2"},
-		{"drops a service", list(2, h[:]), "dropped"},
-		{"another previous", list(2, make([]byte, 32), svc), ""},
-	} {
-		err := preCheck(cur, curSig, c.data, pub(key))
-		if c.want == "" && err == nil || c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)) {
-			t.Errorf("%s: %v, want %q", c.name, err, c.want)
-		}
-	}
-	for _, c := range []struct {
-		name        string
-		cur, curSig object
-		data        []byte
-	}{
-		{"the next version", cur, curSig, list(2, h[:], svc)},
-		{"the first list", object{}, object{}, v1},
-		{"the published list again", cur, curSig, v1},
-		{"a pair that doesn't verify (an interrupted publish)", cur, object{data: bytes.Repeat([]byte{1}, 64)}, list(5, h[:])},
-		{"only a signature", object{}, curSig, list(5, h[:])},
-	} {
-		if err := preCheck(c.cur, c.curSig, c.data, pub(key)); err != nil {
-			t.Errorf("%s: %v", c.name, err)
-		}
-	}
-}
