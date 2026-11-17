@@ -95,10 +95,12 @@ export interface VotesStackProps extends cdk.StackProps {
    * confirms once (from the email AWS sends). It is in the deployed
    * template, never in the repository. */
   readonly keyWatchEmail: string;
-  /** The IAM role the operator signs in as (the owner's IAM Identity
-   * Center role, whose sign-in requires MFA): the only principal that may
-   * assume the publish role, which alone may sign with the site's KMS keys
-   * (VOTE-SITE-KEY-COMPROMISE §6, GC #12646). */
+  /** The role of the IAM Identity Center permission set the operator
+   * signs in with to publish (its own set, assigned to the owner alone,
+   * whose only permission is assuming the publish role; sign-in requires
+   * MFA): the only principal that may assume the publish role, which alone
+   * may sign with the site's KMS keys (VOTE-SITE-KEY-COMPROMISE §6, GC
+   * #12646, #12713). */
   readonly publisherPrincipalArn: string;
   /** The function's code; by default `cmd/votes-api` built for arm64. */
   readonly lambdaCode?: lambda.Code;
@@ -164,9 +166,12 @@ export const WATCH_EVENTS = {
     'UpdateTerminationProtection', 'ContinueUpdateRollback', 'CancelUpdateStack'],
 } as const;
 
-/** An IAM role ARN, as publisherPrincipalArn must be. */
+/** The role of an IAM Identity Center permission set, as
+ * publisherPrincipalArn must be (GC #12713: a set of its own, assigned to
+ * the owner alone, whose assignment list is the access list):
+ * arn:aws:iam::<account>:role/aws-reserved/sso.amazonaws.com/[<region>/]AWSReservedSSO_<set>_<16 hex>. */
 export function validRoleArn(a: string): boolean {
-  return /^arn:aws[a-z-]*:iam::[0-9]{12}:role\/[\w+=,.@\/-]{1,512}$/.test(a);
+  return /^arn:aws[a-z-]*:iam::[0-9]{12}:role\/aws-reserved\/sso\.amazonaws\.com\/([a-z0-9-]+\/)?AWSReservedSSO_[\w+=,.@-]{1,32}_[0-9a-f]{16}$/.test(a);
 }
 
 /** A base64 Ed25519 public key: 32 bytes. */
@@ -192,7 +197,7 @@ export class VotesStack extends cdk.Stack {
       throw new Error('siteKey must be a base64 Ed25519 public key (votesctl site-key)');
     }
     if (!validRoleArn(props.publisherPrincipalArn)) {
-      throw new Error(`publisherPrincipalArn must be an IAM role ARN (got "${props.publisherPrincipalArn}")`);
+      throw new Error(`publisherPrincipalArn must be the role of an IAM Identity Center permission set (…:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_<set>_<hash>; got "${props.publisherPrincipalArn}")`);
     }
     const publisherAccount = props.publisherPrincipalArn.split(':')[4];
     if (!cdk.Token.isUnresolved(this.account) && publisherAccount !== this.account) {

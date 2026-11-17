@@ -364,8 +364,15 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     expect(validRoleArn(PUBLISHER)).toBe(true);
     expect(validRoleArn('arn:aws:iam::123456789012:user/alice')).toBe(false);
     expect(validRoleArn('arn:aws:iam::123456789012:root')).toBe(false);
+    // An Identity Center permission set's role only (GC #12713), with or without its region.
+    expect(validRoleArn('arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/us-east-1/AWSReservedSSO_VettIDVotesPublisher_0123456789abcdef')).toBe(true);
+    expect(validRoleArn('arn:aws:iam::123456789012:role/admin')).toBe(false);
+    expect(validRoleArn('arn:aws:iam::123456789012:role/vettid-votes-staging-publish')).toBe(false);
+    expect(validRoleArn('arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Operator_0123')).toBe(false);
+    expect(validRoleArn('arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Operator_0123456789abcdef/x')).toBe(false);
+    expect(() => stack('x', 'staging', { publisherPrincipalArn: 'arn:aws:iam::123456789012:role/admin' })).toThrow(/permission set/);
     expect(() => stack('x', 'staging', { publisherPrincipalArn: '*' })).toThrow(/publisherPrincipalArn/);
-    expect(() => stack('x', 'staging', { publisherPrincipalArn: 'arn:aws:iam::210987654321:role/r' })).toThrow(/this account/);
+    expect(() => stack('x', 'staging', { publisherPrincipalArn: 'arn:aws:iam::210987654321:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Operator_0123456789abcdef' })).toThrow(/this account/);
     expect(() => stack('x', 'staging', { alarmTopicArn: undefined, githubOidcProviderArn: undefined })).toThrow(/alarmTopicArn/);
     expect(() => stack('x', 'staging', { keyWatchEmail: '' })).toThrow(/keyWatchEmail/);
     expect(() => stack('x', 'staging', { keyWatchEmail: 'not an address' })).toThrow(/keyWatchEmail/);

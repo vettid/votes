@@ -114,10 +114,10 @@ synth by `scripts/build-api.sh`, the build CI hashes.
 Every deploy passes, from `cdk/` after `npm ci`:
 `-c envName=<staging|prod> -c hostName=<name> -c hostedZoneId=<id> -c zoneName=vettid.org -c sigstore=<staging|production> -c publisherPrincipalArn=<role ARN> -c alarmTopicArn=<SNS topic ARN> -c githubOidcProviderArn=<ARN> -c keyWatchEmail=<address>`,
 where `sigstore` matches the service vaults' `SV_SIGSTORE` for that
-environment; `publisherPrincipalArn` is the IAM role, in this account,
-that the operator signs in as (their IAM Identity Center role, whose
-sign-in requires MFA): the only principal that may assume the publish
-role (below); `alarmTopicArn` and `githubOidcProviderArn` are step 6's;
+environment; `publisherPrincipalArn` is the role, in this account, of
+the publisher's own IAM Identity Center permission set (below, "The
+publisher is a permission set of its own"): the only principal that may
+assume the publish role; `alarmTopicArn` and `githubOidcProviderArn` are step 6's;
 and `keyWatchEmail` is where the key watch sends each event directly
 (below; it is in the deployed template, never in this repository). None
 has a default.
@@ -253,12 +253,21 @@ another.
   watch reports, can sign unseen until the change is noticed (the
   owner's question, GC #12690). A heartbeat that proves the feed is alive
   comes with the monitor (GC #12646, task 4).
-- The trust names one Identity Center role, which every user assigned
-  its permission set shares (the owner's choice of set is pending, GC
-  #12678). If the set is reprovisioned, the trust no longer matches (the
-  publish role can't be assumed, which fails closed): deploy again with
-  the new role's ARN. MFA is enforced by Identity Center at sign-in; the
-  trust policy can't test it for those sessions.
+- **The publisher is a permission set of its own** (GC #12713). Before
+  the first deploy, the owner creates in IAM Identity Center a permission
+  set (for example `VettIDVotesPublisher`) whose only permission is an
+  inline policy allowing `sts:AssumeRole` on
+  `arn:aws:iam::<account>:role/vettid-votes-<env>-publish`, and assigns it
+  in this account to their own user alone: **its assignment list is the
+  access list** (every user or group assigned it shares its role).
+  `publisherPrincipalArn` is that set's role in this account
+  (`aws iam list-roles --path-prefix /aws-reserved/sso.amazonaws.com/`,
+  the role named `AWSReservedSSO_VettIDVotesPublisher_<hash>`); the stack
+  refuses any other kind of role. No name or address of the owner goes
+  in the template. If the set is reprovisioned, the trust no longer
+  matches (the publish role can't be assumed, which fails closed): deploy
+  again with the new role's ARN. MFA is enforced by Identity Center at
+  sign-in; the trust policy can't test it for those sessions.
 - **A first deploy that rolls back** leaves the two keys (they are
   retained) with their aliases gone: schedule their deletion as the root
   user, or leave them, disabled, before deploying again.
