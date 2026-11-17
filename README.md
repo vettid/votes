@@ -152,14 +152,17 @@ environment. None has a default.
    itself, which would only compare the key with itself. It refuses to
    publish unless `-watch-topics` names the stack's two key watch
    topics (in that order, in the key's account and region) and each has
-   exactly one email subscription, confirmed (README "The watch"),
-   since nobody would be told of the signature. Every check that can
+   exactly one email subscription, confirmed by a signed-in call
+   (`ConfirmationWasAuthenticated`) and with no filter policy (README
+   "The watch"), since nobody would be told of the signature. Every check that can
    refuse the list (its form, the first-list rule, that it extends the
    published list by one version, and that no other bytes sit at its
    version's copy) runs before it is signed, so no signature is made, or
    emailed, for a list that is refused; a rerun of a list already signed
    (published, interrupted half-way, or with its copy kept) uses the
-   bucket's signature and signs nothing. A signature can still go
+   bucket's signature and signs nothing (so republishing a version
+   rolled back, whose signature is kept, makes no KMS call and no email:
+   it was emailed when it was made). A signature can still go
    unpublished, and so be emailed for nothing, only when something fails
    after it is made: a transient S3 error, another publish winning the
    conditional write, the 3-minute deadline passing, or KMS's answer
@@ -176,8 +179,12 @@ environment. None has a default.
    independent pin: `vote_site_key` in the member vaults' release config
    before the flag day (the publish role can't read the secret, on
    purpose). It is refused anywhere else: when it is `-site-key`, on a
-   first list, on a rerun or a resume (which need no old key), and once
-   the published list is under the new key.
+   first list, on a rerun or a resume (which need no old key), once the
+   published list is under the new key, and for good once any kept
+   version is: the flag day is then over, and a list under the old key
+   put back as current is a planted history, not the flag day. After the
+   flag day, destroy the old secret (the plan's step 5 schedules it) and
+   never give the flag again.
 
    To act as the publish role, add a profile and set
    `AWS_PROFILE` to it:

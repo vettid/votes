@@ -154,6 +154,7 @@ func signList(ctx context.Context, s listSigner, data []byte) ([]byte, error) {
 // snsAPI is the part of the SNS client the watch check uses.
 type snsAPI interface {
 	ListSubscriptionsByTopic(context.Context, *sns.ListSubscriptionsByTopicInput, ...func(*sns.Options)) (*sns.ListSubscriptionsByTopicOutput, error)
+	GetSubscriptionAttributes(context.Context, *sns.GetSubscriptionAttributesInput, ...func(*sns.Options)) (*sns.GetSubscriptionAttributesOutput, error)
 }
 
 var (
@@ -199,8 +200,22 @@ func checkWatch(ctx context.Context, c snsAPI, topics []string) error {
 				}
 				// A confirmed subscription's ARN is the topic's and an id; one
 				// waiting is "PendingConfirmation" (or "Deleted").
-				if arn := aws.ToString(s.SubscriptionArn); !confirmedSub(t, arn) {
+				arn := aws.ToString(s.SubscriptionArn)
+				if !confirmedSub(t, arn) {
 					return fmt.Errorf("the key watch's email on %s is not confirmed (%s): confirm it before publishing (README \"The watch\")", t, arn)
+				}
+				// Confirmed by a signed-in call, so that only a signed-in
+				// (watched) call can unsubscribe it, not the email's link;
+				// and no filter policy, which could drop every notice.
+				attrs, err := c.GetSubscriptionAttributes(ctx, &sns.GetSubscriptionAttributesInput{SubscriptionArn: aws.String(arn)})
+				if err != nil {
+					return fmt.Errorf("reading the key watch's subscription %s: %w", arn, err)
+				}
+				if attrs.Attributes["ConfirmationWasAuthenticated"] != "true" {
+					return fmt.Errorf("the key watch's email on %s was confirmed by its link, not by a signed-in call: confirm it with --authenticate-on-unsubscribe true (README \"The watch\")", t)
+				}
+				if attrs.Attributes["FilterPolicy"] != "" {
+					return fmt.Errorf("the key watch's email on %s has a filter policy: remove it (README \"The watch\")", t)
 				}
 			}
 			if next = out.NextToken; next == nil {

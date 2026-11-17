@@ -173,6 +173,9 @@ func publish(ctx context.Context, a publishArgs) error {
 		if previous, err = decodeKeyFlag("-previous-site-key", a.previous); err != nil {
 			return err
 		}
+		if expect, err := decodeKeyFlag("-site-key", a.siteKey); err == nil && bytes.Equal(expect, previous) {
+			return errors.New("-previous-site-key is -site-key: it is only for the flag day, when the published list is under the old key")
+		}
 	}
 	raw, err := os.ReadFile(a.in)
 	if err != nil {
@@ -295,10 +298,10 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, pr
 	}
 	resuming := sig != nil
 	switch {
-	case flagDay && (resuming || cur.data == nil || curSig.data == nil ||
-		vote.Verify(pub, vote.LabelServiceList, sum(cur.data), curSig.data) == nil):
-		// A rerun, a first list, a broken pair or a list already under the
-		// new key: the old key has nothing to do here.
+	case flagDay && (resuming || cur.data == nil && curSig.data == nil ||
+		cur.data != nil && curSig.data != nil && vote.Verify(pub, vote.LabelServiceList, sum(cur.data), curSig.data) == nil):
+		// A rerun, a first list or a list already under the new key: the
+		// old key has nothing to do here. (A broken pair is refused below.)
 		return notFlagDay
 	case resuming && bytes.Equal(cur.data, data):
 		// Already the current list: only its history is checked, and
@@ -317,10 +320,23 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, pr
 	case cur.data == nil || curSig.data == nil:
 		return errors.New("the bucket holds a service list or a signature without the other: restore the pair from the bucket's object versions")
 	default:
+		// The flag day is over once any kept version is signed with the new
+		// key: the old key is then never taken again (a pair under it put
+		// back as current is a planted history, not the flag day).
+		over, err := keptUnder(ctx, c, bucket, pub)
+		if err != nil {
+			return err
+		}
+		if flagDay && over {
+			return errors.New("the flag day is over (a kept version is signed with -site-key): -previous-site-key is refused; restore the pair from the bucket's object versions")
+		}
 		prev, err := site.ParseServiceList(cur.data, curSig.data, previous)
 		if err != nil {
-			return fmt.Errorf("the published list doesn't verify (%w): restore the pair from the bucket's object versions, "+
-				"or, on the flag day, give the key it is signed with as -previous-site-key", err)
+			hint := ""
+			if !flagDay && !over {
+				hint = ", or, on the flag day, give the key it is signed with as -previous-site-key"
+			}
+			return fmt.Errorf("the published list doesn't verify (%w): restore the pair from the bucket's object versions%s", err, hint)
 		}
 		if err := site.Extends(prev, cur.data, next); err != nil {
 			return err
@@ -379,6 +395,25 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, pr
 	}
 	fmt.Printf("published service list version %d (%d services)\n", next.Version, len(next.Services))
 	return nil
+}
+
+// keptUnder reports whether any kept version's copy (v1/services/1.json
+// on, up to the first missing) is signed with pub.
+func keptUnder(ctx context.Context, c s3API, bucket string, pub ed25519.PublicKey) (bool, error) {
+	for v := 1; ; v++ {
+		base := fmt.Sprintf("v1/services/%d.json", v)
+		d, err := get(ctx, c, bucket, base)
+		if err != nil || d.data == nil {
+			return false, err
+		}
+		sg, err := get(ctx, c, bucket, base+".sig")
+		if err != nil {
+			return false, err
+		}
+		if sg.data != nil && vote.Verify(pub, vote.LabelServiceList, sum(d.data), sg.data) == nil {
+			return true, nil
+		}
+	}
 }
 
 // beforeMove runs just before publishList moves the current list; a

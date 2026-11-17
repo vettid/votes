@@ -242,10 +242,20 @@ func TestSignListChecks(t *testing.T) {
 	}
 }
 
-// fakeSNS lists each topic's subscriptions, a page at a time.
+// fakeSNS lists each topic's subscriptions, a page at a time, and their
+// attributes (by default confirmed by a signed-in call, with no filter
+// policy).
 type fakeSNS struct {
 	pages map[string][][]snstypes.Subscription
+	attrs map[string]map[string]string
 	err   error
+}
+
+func (f *fakeSNS) GetSubscriptionAttributes(_ context.Context, in *sns.GetSubscriptionAttributesInput, _ ...func(*sns.Options)) (*sns.GetSubscriptionAttributesOutput, error) {
+	if a, ok := f.attrs[aws.ToString(in.SubscriptionArn)]; ok {
+		return &sns.GetSubscriptionAttributesOutput{Attributes: a}, nil
+	}
+	return &sns.GetSubscriptionAttributesOutput{Attributes: map[string]string{"ConfirmationWasAuthenticated": "true"}}, nil
 }
 
 func (f *fakeSNS) ListSubscriptionsByTopic(_ context.Context, in *sns.ListSubscriptionsByTopicInput, _ ...func(*sns.Options)) (*sns.ListSubscriptionsByTopicOutput, error) {
@@ -335,6 +345,21 @@ func TestCheckWatch(t *testing.T) {
 		err := checkWatch(ctx, &fakeSNS{pages: m, err: c.err}, c.topics)
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: %v, want %q", c.name, err, c.want)
+		}
+	}
+	// Confirmed by its link, or with a filter policy: refused.
+	confirmedA := topicA + ":0123abcd-4567-89ab-cdef-0123456789ab"
+	for _, c := range []struct {
+		attrs map[string]string
+		want  string
+	}{
+		{map[string]string{"ConfirmationWasAuthenticated": "false"}, "confirmed by its link"},
+		{map[string]string{}, "confirmed by its link"},
+		{map[string]string{"ConfirmationWasAuthenticated": "true", "FilterPolicy": `{"x":["y"]}`}, "filter policy"},
+	} {
+		err := checkWatch(ctx, &fakeSNS{pages: ok(), attrs: map[string]map[string]string{confirmedA: c.attrs}}, []string{topicA, topicB})
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%v: %v, want %q", c.attrs, err, c.want)
 		}
 	}
 }

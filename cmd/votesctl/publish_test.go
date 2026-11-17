@@ -388,3 +388,76 @@ func TestFlagDayInterrupted(t *testing.T) {
 		t.Fatal("v2 not published")
 	}
 }
+
+// After the flag day the old key is never taken again: a pair under it put
+// back as current (a planted history) is refused with the flag, and its
+// error no longer suggests the flag.
+func TestFlagDayOver(t *testing.T) {
+	ctx := context.Background()
+	old, nw := testKey("old"), testKey("new")
+	f := newFakeKMS(nw)
+	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(nw))
+	b := newFakeS3()
+	v1 := testList(1, make([]byte, 32), testService(3, "A"))
+	if err := publishList(ctx, b, "bucket", secretSigner(old), nil, v1); err != nil {
+		t.Fatal(err)
+	}
+	h1 := sha256.Sum256(v1)
+	v2 := testList(2, h1[:], testService(3, "A"))
+	if err := publishList(ctx, b, "bucket", k, pub(old), v2); err != nil {
+		t.Fatal(err)
+	}
+	// The old key's own v3, put back as current by someone with the old
+	// secret and bucket write.
+	h2 := sha256.Sum256(v2)
+	planted := testList(3, h2[:], testService(3, "A"), testService(5, "Evil"))
+	ps, _ := signList(ctx, secretSigner(old), planted)
+	b.set("v1/services.json", planted)
+	b.set("v1/services.json.sig", ps)
+	next := testList(4, sha256Of(planted), testService(3, "A"), testService(5, "Evil"))
+	signs := len(f.signs)
+	if err := publishList(ctx, b, "bucket", k, pub(old), next); err == nil || !strings.Contains(err.Error(), "flag day is over") {
+		t.Fatalf("the flag after the flag day: %v", err)
+	}
+	err := publishList(ctx, b, "bucket", k, nil, next)
+	if err == nil || !strings.Contains(err.Error(), "restore the pair") || strings.Contains(err.Error(), "-previous-site-key") {
+		t.Fatalf("without the flag: %v", err)
+	}
+	if len(f.signs) != signs {
+		t.Fatal("signed for a refusal")
+	}
+}
+
+func sha256Of(b []byte) []byte { h := sha256.Sum256(b); return h[:] }
+
+// A broken pair with the flag is "restore the pair"; the flag equal to
+// -site-key is refused before any AWS call; a small-order key given as
+// the old key verifies nothing.
+func TestFlagDayEdges(t *testing.T) {
+	ctx := context.Background()
+	old, nw := testKey("old"), testKey("new")
+	f := newFakeKMS(nw)
+	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(nw))
+	v1 := testList(1, make([]byte, 32), testService(3, "A"))
+	v2 := testList(2, sha256Of(v1), testService(3, "A"))
+	b := newFakeS3()
+	b.set("v1/services.json", v1) // no signature: a broken pair
+	if err := publishList(ctx, b, "bucket", k, pub(old), v2); err == nil || !strings.Contains(err.Error(), "restore the pair") {
+		t.Fatalf("a broken pair with the flag: %v", err)
+	}
+	err := publish(ctx, publishArgs{kms: testKeyARN, siteKey: base64Key(pub(nw)), previous: base64Key(pub(nw)),
+		watch: topicA + "," + topicB, bucket: "b", in: "/nonexistent"})
+	if err == nil || !strings.Contains(err.Error(), "is -site-key") {
+		t.Fatalf("the flag equal to -site-key: %v", err)
+	}
+	// The identity point as the old key, with a pair forged for it (R the
+	// identity, S = 0, which plain ed25519.Verify accepts under it).
+	identity := append([]byte{1}, make([]byte, 31)...)
+	forged := append(append([]byte{1}, make([]byte, 31)...), make([]byte, 32)...)
+	ob := newFakeS3()
+	ob.set("v1/services.json", v1)
+	ob.set("v1/services.json.sig", forged)
+	if err := publishList(ctx, ob, "bucket", k, identity, v2); err == nil || !strings.Contains(err.Error(), "restore the pair") || len(f.signs) != 0 {
+		t.Fatalf("a small-order old key: %v, %d signs", err, len(f.signs))
+	}
+}
