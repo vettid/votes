@@ -1,7 +1,9 @@
 // Command votesctl is the operator's tool for votes.vettid.org:
 //
-//	votesctl site-key -secret <arn>
-//	    prints the site's Ed25519 public key (base64) from its secret
+//	votesctl site-key -kms <key arn> | -secret <arn>
+//	    prints the site's Ed25519 public key (base64), from its KMS key or
+//	    its secret
+//	votesctl publish-services -kms <key arn> -site-key <base64> -watch-topics <arn>,<arn> -bucket <name> -in services.json
 //	votesctl publish-services -secret <arn> -bucket <name> -in services.json
 //	    signs the service list and publishes it, if it extends the one
 //	    published: a higher version, the previous one's hash, and every
@@ -21,8 +23,12 @@
 // 2 for a usage error; 3 when the checks held but the report has ok false:
 // a mismatch (docs/VOTES-SITE.md §7).
 //
-// The site's key is derived from its Secrets Manager secret as
-// Ed25519(seed = SHA-256(secret string)).
+// The site's key is the stack's KMS key (SiteSigningKeyArn), which only
+// its publish role may sign with (README "The site's signing keys"); with
+// -kms, publish-services signs through KMS, checks every signature under
+// -site-key, and first checks that the key watch's emails are confirmed.
+// Until the staging flag day it can still be derived from the Secrets
+// Manager secret as Ed25519(seed = SHA-256(secret string)) (-secret).
 package main
 
 import (
@@ -35,14 +41,17 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/sns"
 
 	"github.com/vettid/service-vault/vote"
-	"github.com/vettid/vettid-vault/vms/suite"
 	"github.com/vettid/votes/site"
 )
 
@@ -55,19 +64,24 @@ func main() {
 	switch os.Args[1] {
 	case "site-key":
 		fs := flag.NewFlagSet("site-key", flag.ExitOnError)
-		secret := fs.String("secret", "", "the site key's Secrets Manager secret")
+		kmsKey := fs.String("kms", "", "the site key's KMS key ARN (the stack's SiteSigningKeyArn)")
+		secret := fs.String("secret", "", "the site key's Secrets Manager secret (until the flag day)")
 		_ = fs.Parse(os.Args[2:])
-		var k ed25519.PrivateKey
-		if k, err = siteKey(ctx, *secret); err == nil {
-			fmt.Println(base64.StdEncoding.EncodeToString(k.Public().(ed25519.PublicKey)))
+		var pub ed25519.PublicKey
+		if pub, err = sitePublicKey(ctx, *kmsKey, *secret); err == nil {
+			fmt.Println(base64.StdEncoding.EncodeToString(pub))
 		}
 	case "publish-services":
 		fs := flag.NewFlagSet("publish-services", flag.ExitOnError)
-		secret := fs.String("secret", "", "the site key's Secrets Manager secret")
+		kmsKey := fs.String("kms", "", "the site key's KMS key ARN (the stack's SiteSigningKeyArn)")
+		expect := fs.String("site-key", "", "with -kms: the site's public key (base64) the vaults and the site pin")
+		watch := fs.String("watch-topics", "", "with -kms: the key watch's topics, comma-separated (KeyWatchTopicArn,KeyWatchTopicBArn)")
+		previous := fs.String("previous-site-key", "", "with -kms, on the flag day only: the key (base64) the published list is signed with")
+		secret := fs.String("secret", "", "the site key's Secrets Manager secret (until the flag day)")
 		bucket := fs.String("bucket", "", "the site's bucket")
 		in := fs.String("in", "services.json", "the service list")
 		_ = fs.Parse(os.Args[2:])
-		err = publish(ctx, *secret, *bucket, *in)
+		err = publish(ctx, publishArgs{kms: *kmsKey, siteKey: *expect, watch: *watch, previous: *previous, secret: *secret, bucket: *bucket, in: *in})
 	case "check":
 		os.Exit(runCheck(ctx, os.Args[2:], os.Stdout, os.Stderr))
 	default:
@@ -80,7 +94,9 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: votesctl site-key -secret <arn> | publish-services -secret <arn> -bucket <name> -in <file>\n"+
+	fmt.Fprintln(os.Stderr, "usage: votesctl site-key -kms <key arn> | -secret <arn>\n"+
+		"       votesctl publish-services -kms <key arn> -site-key <base64> -watch-topics <arn>,<arn> -bucket <name> -in <file>\n"+
+		"       votesctl publish-services -secret <arn> -bucket <name> -in <file>\n"+
 		"       votesctl check -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] <proposal_id>\n"+
 		"       votesctl check -all [-since YYYY-MM] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>]")
 	os.Exit(2)
@@ -106,41 +122,160 @@ func siteKey(ctx context.Context, secret string) (ed25519.PrivateKey, error) {
 	return ed25519.NewKeyFromSeed(seed[:]), nil
 }
 
-func publish(ctx context.Context, secret, bucket, in string) error {
-	if bucket == "" {
+// sitePublicKey is site-key's work: the public key from KMS (-kms) or
+// from the secret (-secret), exactly one of them.
+func sitePublicKey(ctx context.Context, kmsKey, secret string) (ed25519.PublicKey, error) {
+	if (kmsKey == "") == (secret == "") {
+		return nil, errors.New("give exactly one of -kms and -secret")
+	}
+	if secret != "" {
+		k, err := siteKey(ctx, secret)
+		if err != nil {
+			return nil, err
+		}
+		return secretSigner(k).Public(), nil
+	}
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return kmsPublicKey(ctx, kms.NewFromConfig(cfg), kmsKey)
+}
+
+type publishArgs struct {
+	kms, siteKey, watch, previous, secret, bucket, in string
+}
+
+func publish(ctx context.Context, a publishArgs) error {
+	if a.bucket == "" {
 		return errors.New("-bucket is required")
 	}
-	key, err := siteKey(ctx, secret)
+	if (a.kms == "") == (a.secret == "") {
+		return errors.New("give exactly one of -kms and -secret")
+	}
+	if a.kms == "" && (a.siteKey != "" || a.watch != "" || a.previous != "") {
+		return errors.New("-site-key, -watch-topics and -previous-site-key go with -kms")
+	}
+	if a.kms != "" && (a.siteKey == "" || a.watch == "") {
+		return errors.New("-kms needs -site-key (the site's public key) and -watch-topics (the key watch's two topics)")
+	}
+	var region string
+	if a.kms != "" {
+		m := kmsKeyARN.FindStringSubmatch(a.kms)
+		if m == nil {
+			return errors.New("-kms takes the site key's ARN (arn:aws:kms:<region>:<account>:key/<id>, the stack's SiteSigningKeyArn), not an alias or a key id")
+		}
+		region = strings.Split(a.kms, ":")[3]
+	}
+	var previous ed25519.PublicKey
+	if a.previous != "" {
+		var err error
+		if previous, err = decodeKeyFlag("-previous-site-key", a.previous); err != nil {
+			return err
+		}
+		if expect, err := decodeKeyFlag("-site-key", a.siteKey); err == nil && bytes.Equal(expect, previous) {
+			return errors.New("-previous-site-key is -site-key: it is only for the flag day, when the published list is under the old key")
+		}
+	}
+	raw, err := os.ReadFile(a.in)
 	if err != nil {
 		return err
 	}
-	raw, err := os.ReadFile(in)
-	if err != nil {
-		return err
-	}
+	// One publish is a few calls: bounded, so that a hung one doesn't
+	// leave the operator waiting (and a retry, below, is never made).
+	ctx, cancel := context.WithTimeout(ctx, publishTimeout)
+	defer cancel()
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		return err
 	}
-	return publishList(ctx, s3.NewFromConfig(cfg), bucket, key, raw)
+	if a.secret != "" {
+		k, err := siteKey(ctx, a.secret)
+		if err != nil {
+			return err
+		}
+		return publishList(ctx, s3.NewFromConfig(cfg), a.bucket, secretSigner(k), nil, raw)
+	}
+	// The key's region, from its ARN (the watch topics are bound to it).
+	inRegion := func(o *kms.Options) { o.Region = region }
+	signer, err := kmsPublishSigner(ctx, a, kms.NewFromConfig(cfg, inRegion), sns.NewFromConfig(cfg, func(o *sns.Options) { o.Region = region }))
+	if err != nil {
+		return err
+	}
+	return publishList(ctx, s3.NewFromConfig(cfg), a.bucket, signer, previous, raw)
+}
+
+// decodeKeyFlag decodes a base64 Ed25519 public key given as flag.
+func decodeKeyFlag(flag, b64 string) (ed25519.PublicKey, error) {
+	k, err := base64.StdEncoding.Strict().DecodeString(b64)
+	if err != nil || len(k) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("%s: an Ed25519 public key, base64 of 32 bytes", flag)
+	}
+	return ed25519.PublicKey(k), nil
+}
+
+// publishTimeout bounds one publish.
+const publishTimeout = 3 * time.Minute
+
+// kmsPublishSigner checks the key watch, then the KMS key: a publish
+// nobody would be told of is refused before anything is signed. The watch
+// topics must be in the key's partition, region and account.
+func kmsPublishSigner(ctx context.Context, a publishArgs, k kmsAPI, n snsAPI) (listSigner, error) {
+	expect, err := decodeSiteKey(a.siteKey)
+	if err != nil {
+		return nil, err
+	}
+	if !kmsKeyARN.MatchString(a.kms) {
+		return nil, errors.New("-kms takes the site key's ARN, not an alias or a key id")
+	}
+	topics := strings.Split(a.watch, ",")
+	key := strings.Split(a.kms, ":")
+	for _, t := range topics {
+		if f := strings.Split(t, ":"); len(f) < 6 || f[1] != key[1] || f[3] != key[3] || f[4] != key[4] {
+			return nil, fmt.Errorf("-watch-topics: %s is not in the key's partition, region and account", t)
+		}
+	}
+	if err := checkWatch(ctx, n, topics); err != nil {
+		return nil, err
+	}
+	return newKMSSigner(ctx, k, a.kms, expect)
+}
+
+// s3API is the part of the S3 client a publish uses.
+type s3API interface {
+	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 }
 
 // publishList signs raw and publishes it on c's bucket (publish's work,
-// apart from the key and the client).
-func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.PrivateKey, raw []byte) error {
+// apart from the key and the client). Every check that can refuse the
+// list runs before it is signed, since a signature with the site key is
+// emailed and alarmed (README "The watch"): its shape, the first-list
+// rule, that it extends the published list, and that no other bytes sit
+// at its version's copy. A rerun of a list already signed (published,
+// interrupted half-way, or with its copy kept) uses the bucket's
+// signature and signs nothing. previous is given only on the flag day:
+// the key the published list is signed with when it isn't key's (the
+// last list under the secret's key, the first under KMS's); it is
+// refused anywhere else.
+func publishList(ctx context.Context, c s3API, bucket string, key listSigner, previous ed25519.PublicKey, raw []byte) error {
 	data, err := vote.Canonicalize(raw)
 	if err != nil {
 		return err
 	}
-	sig, err := signList(key, data)
+	next, err := site.ParseUnsignedServiceList(data)
 	if err != nil {
 		return err
 	}
-	next, err := site.ParseServiceList(data, sig, key.Public().(ed25519.PublicKey))
-	if err != nil {
-		return err
+	pub := key.Public()
+	flagDay := previous != nil
+	if flagDay && bytes.Equal(previous, pub) {
+		return errors.New("-previous-site-key is -site-key: it is only for the flag day, when the published list is under the old key")
 	}
-	pub := key.Public().(ed25519.PublicKey)
+	if !flagDay {
+		previous = pub
+	}
+	notFlagDay := errors.New("-previous-site-key is only for the flag day, the next version after a list under the old key: leave it out")
 	cur, err := get(ctx, c, bucket, "v1/services.json")
 	if err != nil {
 		return err
@@ -157,8 +292,17 @@ func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.P
 	// version's copy is written only once it has been the current list
 	// (after the move; the previous one's again before it), so the copies
 	// never hold a list that wasn't served.
-	resuming := curSig.data != nil && bytes.Equal(curSig.data, sig)
+	var sig []byte // this list's signature: the bucket's, on a rerun
+	if curSig.data != nil && vote.Verify(pub, vote.LabelServiceList, sum(data), curSig.data) == nil {
+		sig = curSig.data
+	}
+	resuming := sig != nil
 	switch {
+	case flagDay && (resuming || cur.data == nil && curSig.data == nil ||
+		cur.data != nil && curSig.data != nil && vote.Verify(pub, vote.LabelServiceList, sum(cur.data), curSig.data) == nil):
+		// A rerun, a first list or a list already under the new key: the
+		// old key has nothing to do here. (A broken pair is refused below.)
+		return notFlagDay
 	case resuming && bytes.Equal(cur.data, data):
 		// Already the current list: only its history is checked, and
 		// written if missing (the list published before history was kept).
@@ -176,9 +320,23 @@ func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.P
 	case cur.data == nil || curSig.data == nil:
 		return errors.New("the bucket holds a service list or a signature without the other: restore the pair from the bucket's object versions")
 	default:
-		prev, err := site.ParseServiceList(cur.data, curSig.data, pub)
+		// The flag day is over once any kept version is signed with the new
+		// key: the old key is then never taken again (a pair under it put
+		// back as current is a planted history, not the flag day).
+		over, err := keptUnder(ctx, c, bucket, pub)
 		if err != nil {
-			return fmt.Errorf("the published list doesn't verify (%w): restore the pair from the bucket's object versions", err)
+			return err
+		}
+		if flagDay && over {
+			return errors.New("the flag day is over (a kept version is signed with -site-key): -previous-site-key is refused; restore the pair from the bucket's object versions")
+		}
+		prev, err := site.ParseServiceList(cur.data, curSig.data, previous)
+		if err != nil {
+			hint := ""
+			if !flagDay && !over {
+				hint = ", or, on the flag day, give the key it is signed with as -previous-site-key"
+			}
+			return fmt.Errorf("the published list doesn't verify (%w): restore the pair from the bucket's object versions%s", err, hint)
 		}
 		if err := site.Extends(prev, cur.data, next); err != nil {
 			return err
@@ -192,10 +350,34 @@ func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.P
 			return err
 		}
 	}
-	// Nothing else may already sit at this version's copy: checked, not
-	// written, before the move.
-	if err := checkVersion(ctx, c, bucket, next.Version, data, sig); err != nil {
+	// Nothing else may already sit at this version's copy (a pair rolled
+	// back past it, or a stray): checked before signing. A copy of this
+	// list's own signature is used, not signed again.
+	base := fmt.Sprintf("v1/services/%d.json", next.Version)
+	copyData, err := get(ctx, c, bucket, base)
+	if err != nil {
 		return err
+	}
+	copySig, err := get(ctx, c, bucket, base+".sig")
+	if err != nil {
+		return err
+	}
+	if copyData.data != nil && !bytes.Equal(copyData.data, data) {
+		return fmt.Errorf("%s holds other bytes: a version is never rewritten", base)
+	}
+	if copySig.data != nil {
+		if vote.Verify(pub, vote.LabelServiceList, sum(data), copySig.data) != nil || sig != nil && !bytes.Equal(copySig.data, sig) {
+			return fmt.Errorf("%s.sig holds other bytes: a version is never rewritten", base)
+		}
+		sig = copySig.data
+	}
+	if sig == nil {
+		if sig, err = signList(ctx, key, data); err != nil {
+			return err
+		}
+		if _, err := site.ParseServiceList(data, sig, pub); err != nil {
+			return err
+		}
 	}
 	beforeMove()
 	if !resuming {
@@ -215,23 +397,36 @@ func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.P
 	return nil
 }
 
+// keptUnder reports whether any kept version's copy (v1/services/1.json
+// on, up to the first missing) is signed with pub.
+func keptUnder(ctx context.Context, c s3API, bucket string, pub ed25519.PublicKey) (bool, error) {
+	for v := 1; ; v++ {
+		base := fmt.Sprintf("v1/services/%d.json", v)
+		d, err := get(ctx, c, bucket, base)
+		if err != nil || d.data == nil {
+			return false, err
+		}
+		sg, err := get(ctx, c, bucket, base+".sig")
+		if err != nil {
+			return false, err
+		}
+		if sg.data != nil && vote.Verify(pub, vote.LabelServiceList, sum(d.data), sg.data) == nil {
+			return true, nil
+		}
+	}
+}
+
 // beforeMove runs just before publishList moves the current list; a
 // test sets it to make the move lose a race.
 var beforeMove = func() {}
 
 // keepVersion writes a list version's copy, write-once: an object
 // already there must hold the same bytes.
-func keepVersion(ctx context.Context, c *s3.Client, bucket string, version int64, data, sig []byte) error {
+func keepVersion(ctx context.Context, c s3API, bucket string, version int64, data, sig []byte) error {
 	return versionCopy(ctx, c, bucket, version, data, sig, true)
 }
 
-// checkVersion reports whether a version's copy is absent or holds the
-// same bytes, writing nothing.
-func checkVersion(ctx context.Context, c *s3.Client, bucket string, version int64, data, sig []byte) error {
-	return versionCopy(ctx, c, bucket, version, data, sig, false)
-}
-
-func versionCopy(ctx context.Context, c *s3.Client, bucket string, version int64, data, sig []byte, write bool) error {
+func versionCopy(ctx context.Context, c s3API, bucket string, version int64, data, sig []byte, write bool) error {
 	base := fmt.Sprintf("v1/services/%d.json", version)
 	for _, o := range []struct {
 		key, ct string
@@ -265,7 +460,7 @@ type object struct {
 	tag  string // its ETag, or "" when absent
 }
 
-func get(ctx context.Context, c *s3.Client, bucket, key string) (object, error) {
+func get(ctx context.Context, c s3API, bucket, key string) (object, error) {
 	o, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
 	if err != nil {
 		var nf interface{ ErrorCode() string }
@@ -284,7 +479,7 @@ func get(ctx context.Context, c *s3.Client, bucket, key string) (object, error) 
 
 // put replaces an object only if it is still the version read (tag), or
 // writes it only if there was none ("").
-func put(ctx context.Context, c *s3.Client, bucket, key string, data []byte, ct, tag string) error {
+func put(ctx context.Context, c s3API, bucket, key string, data []byte, ct, tag string) error {
 	in := &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(data),
 		// Short: a reader may meet the new list beside the old signature
 		// for this long, and retries.
@@ -298,12 +493,6 @@ func put(ctx context.Context, c *s3.Client, bucket, key string, data []byte, ct,
 		return fmt.Errorf("%s changed while publishing (another publish?): %w", key, err)
 	}
 	return nil
-}
-
-// signList is the site's signature of a list's bytes (BALLOT-PROTOCOL
-// §3.3).
-func signList(key ed25519.PrivateKey, data []byte) ([]byte, error) {
-	return suite.Sign(key, vote.LabelServiceList, sum(data))
 }
 
 func sum(b []byte) []byte { h := sha256.Sum256(b); return h[:] }

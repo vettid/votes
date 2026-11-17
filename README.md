@@ -128,9 +128,11 @@ has a default.
    CloudFront distribution, the name's records and the site key's
    secret (output `SiteKeySecret`). Uploads are refused until step 4.
 3. **The site key:** build votesctl (`go build -o votesctl ./cmd/votesctl`
-   at the root), then `./votesctl site-key -secret <SiteKeySecret>`
-   prints its public key. It also goes in the member vaults' release
-   config (BALLOT-PROTOCOL §3.3).
+   at the root), then `./votesctl site-key -kms <SiteSigningKeyArn>`
+   (as the publish role, below) prints its public key; until the staging
+   flag day (GC #12646) the key is the secret's,
+   `./votesctl site-key -secret <SiteKeySecret>`. It also goes in the
+   member vaults' release config (BALLOT-PROTOCOL §3.3).
 4. **Deploy again** with `-c siteKey=<that key>`, and pass it on every
    deploy from then on (a deploy without it is refused).
 5. **The service list:** `services.json` holds
@@ -145,7 +147,62 @@ has a default.
    from the service vault's `GET /v1/anchor-key`. Each later list has the
    next `version` and, as `previous`, the base64 SHA-256 of the published
    `v1/services.json`. Publish it with
-   `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`.
+   `./votesctl publish-services -kms <SiteSigningKeyArn> -site-key <that key> -watch-topics <KeyWatchTopicArn>,<KeyWatchTopicBArn> -bucket <BucketName> -in services.json`,
+   as the publish role (until the flag day, with the secret's key:
+   `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`).
+   With `-kms` it takes the key's ARN only, never an alias, and uses the
+   ARN's region; it refuses a key that isn't an Ed25519 signing key
+   whose public key is `-site-key`. **Take `-site-key` from an
+   independent pin** (the stack's deployed `siteKey`, or `vote_site_key`
+   in the member vaults' release config), never from `site-key -kms`
+   itself, which would only compare the key with itself. It refuses to
+   publish unless `-watch-topics` names the stack's two key watch
+   topics (in that order, in the key's account and region) and each has
+   exactly one email subscription, confirmed by a signed-in call
+   (`ConfirmationWasAuthenticated`) and with no filter policy (README
+   "The watch"), since nobody would be told of the signature. Every check that can
+   refuse the list (its form, the first-list rule, that it extends the
+   published list by one version, and that no other bytes sit at its
+   version's copy) runs before it is signed, so no signature is made, or
+   emailed, for a list that is refused; a rerun of a list already signed
+   (published, interrupted half-way, or with its copy kept) uses the
+   bucket's signature and signs nothing (so republishing a version
+   rolled back, whose signature is kept, makes no KMS call and no email:
+   it was emailed when it was made). A signature can still go
+   unpublished, and so be emailed for nothing, only when something fails
+   after it is made: a transient S3 error, another publish winning the
+   conditional write, the 3-minute deadline passing, or KMS's answer
+   being lost. Each costs an email, never a wrong publish; run the same
+   command again. It signs through KMS once (no
+   retry: run it again if it fails), `ED25519_SHA_512` over the label
+   and the list's SHA-256, checks the signature under `-site-key` before
+   anything is written, and gives up after 3 minutes.
+
+   **On the flag day** (GC #12646), the published list is signed with
+   the secret's key: give that key as `-previous-site-key` on the first
+   `-kms` publish (the next version, the same services), which checks
+   the published list under it. Take it, like `-site-key`, from an
+   independent pin: `vote_site_key` in the member vaults' release config
+   before the flag day (the publish role can't read the secret, on
+   purpose). It is refused anywhere else: when it is `-site-key`, on a
+   first list, on a rerun or a resume (which need no old key), once the
+   published list is under the new key, and for good once any kept
+   version is: the flag day is then over, and a list under the old key
+   put back as current is a planted history, not the flag day. After the
+   flag day, destroy the old secret (the plan's step 5 schedules it) and
+   never give the flag again.
+
+   To act as the publish role, add a profile and set
+   `AWS_PROFILE` to it:
+
+   ```ini
+   [profile votes-publish-<env>]
+   role_arn = <PublishRoleArn>
+   source_profile = <your Identity Center profile>
+   ```
+
+   Each publish is emailed (twice) and raises the key-use alarm: that is
+   the watch working.
    Each version is also kept, write-once, as `v1/services/<version>.json`
    and `.sig`, for vaults that missed versions; running the command again
    with the list that is already published writes its copy if it is
