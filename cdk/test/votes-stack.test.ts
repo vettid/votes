@@ -117,10 +117,12 @@ describe('upload function', () => {
   });
 
   test('its own role: no managed policy, logs only to its log group', () => {
-    // The function's, and the publish role (site keys, below); no other,
-    // and none with a managed policy (no helper Lambda either).
+    // The function's, the monitor's, the publish role and the key watch
+    // heartbeat's (site keys, below); no other, and none with a managed
+    // policy (no helper Lambda either).
     const roles = Object.values(t.findResources('AWS::IAM::Role')) as any[];
-    expect(roles.map((r) => r.Properties.RoleName).sort()).toEqual(['vettid-votes-staging-api', 'vettid-votes-staging-monitor', 'vettid-votes-staging-publish']);
+    expect(roles.map((r) => r.Properties.RoleName).sort()).toEqual(['vettid-votes-staging-api', 'vettid-votes-staging-key-watch-heartbeat',
+      'vettid-votes-staging-monitor', 'vettid-votes-staging-publish']);
     for (const r of roles) expect(r.Properties.ManagedPolicyArns).toBeUndefined();
     t.resourceCountIs('AWS::Lambda::Function', 1);
     const res = fnStatements().flatMap((s) => asList(s.Resource));
@@ -255,16 +257,15 @@ describe('monitor alerts', () => {
     expect(monitorRole().Properties.ManagedPolicyArns).toBeUndefined();
   });
 
-  test('the role may publish to the topic, put the heartbeat and describe the site key (the key watch\'s heartbeat), nothing else', () => {
+  test('the role may publish to the topic and put the heartbeat, nothing else', () => {
     const st = monitorStatements();
-    expect(st).toHaveLength(3);
+    expect(st).toHaveLength(2);
     expect(st.find((x) => x.Sid === 'Alert')).toEqual({ Sid: 'Alert', Effect: 'Allow', Action: 'sns:Publish', Resource: TOPIC });
     expect(st.find((x) => x.Sid === 'Heartbeat')).toEqual({ Sid: 'Heartbeat', Effect: 'Allow', Action: 'cloudwatch:PutMetricData', Resource: '*',
       Condition: { StringEquals: { 'cloudwatch:namespace': 'VettID/Votes/staging' } } });
-    const site = Object.keys(m.findResources('AWS::KMS::Key')).filter((k) => /^SiteSigningKey/.test(k));
-    expect(site).toHaveLength(1);
-    expect(st.find((x) => x.Sid === 'KeyWatchHeartbeat')).toEqual({ Sid: 'KeyWatchHeartbeat', Effect: 'Allow', Action: 'kms:DescribeKey',
-      Resource: { 'Fn::GetAtt': [site[0], 'Arn'] } });
+    // The key watch's heartbeat is the schedule's role's, not this one's.
+    expect(JSON.stringify(st)).not.toContain('kms:');
+    expect(monitorRole().Properties.Policies).toBeUndefined();
   });
 
   test('the heartbeat alarm: three hours without a successful run, missing data breaching, to the topic', () => {
@@ -304,7 +305,8 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
   const heartbeatRule = logical('AWS::Events::Rule', /^KeyWatchHeartbeat/);
   const heartbeatLogs = logical('AWS::Logs::LogGroup', /^KeyWatchHeartbeatLogs/);
   const siteLogical = logical('AWS::KMS::Key', /^SiteSigningKey/);
-  const monitorLogical = Object.keys(t.findResources('AWS::IAM::Role', { Properties: { RoleName: 'vettid-votes-staging-monitor' } }))[0];
+  const heartbeatRoleLogical = logical('AWS::IAM::Role', /^KeyWatchHeartbeatRole/);
+  const scheduleLogical = logical('AWS::Scheduler::Schedule', /^KeyWatchHeartbeatSchedule/);
   const topicA = logical('AWS::SNS::Topic', /^KeyWatchTopic(?!B)/);
   const topicB = logical('AWS::SNS::Topic', /^KeyWatchTopicB/);
   const queue = logical('AWS::SQS::Queue', /^KeyUseDeadLetters/);
@@ -427,7 +429,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       expect(x.DeletionPolicy).toBe('Retain');
       expect(x.Properties.EventPattern['detail-type']).toEqual(['AWS API Call via CloudTrail']);
     }
-    expect(alts()).toHaveLength(15); // 14, plus a metric filter into the watch's namespace
+    expect(alts()).toHaveLength(16); // 14, plus a metric filter into the watch's namespace and the schedules
   });
 
   // Each pattern, its ARNs resolved at realistic lengths, stays under
@@ -485,8 +487,17 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       kmsArn('alias/vettid-votes-staging-site'), kmsArn('alias/vettid-votes-staging-list-anchor')] } }]);
     expect([...PUBLISH_ROLE_EVENTS]).toEqual(['UpdateAssumeRolePolicy', 'PutRolePolicy', 'DeleteRolePolicy', 'AttachRolePolicy',
       'DetachRolePolicy', 'PutRolePermissionsBoundary', 'DeleteRolePermissionsBoundary', 'UpdateRole', 'DeleteRole']);
+    // The publish role and the key watch heartbeat's.
     expect(alt('iam.amazonaws.com')).toEqual([{ eventSource: ['iam.amazonaws.com'], eventName: [...PUBLISH_ROLE_EVENTS],
-      requestParameters: { roleName: [{ Ref: publishLogical }] } }]);
+      requestParameters: { roleName: [{ Ref: publishLogical }, { Ref: heartbeatRoleLogical }] } }]);
+  });
+
+  test('watched: any EventBridge Scheduler schedule change (the heartbeat\'s among them), in the keys pair', () => {
+    expect(WATCH_EVENTS.schedules).toEqual(['UpdateSchedule', 'DeleteSchedule', 'CreateSchedule', 'DeleteScheduleGroup']);
+    const schedules = [{ eventSource: ['scheduler.amazonaws.com'], eventName: [...WATCH_EVENTS.schedules] }]; // any schedule, no name
+    expect(alt('scheduler.amazonaws.com')).toEqual(schedules);
+    const keysPair = rules().find((r) => r.Properties.Name === 'vettid-votes-staging-kw-keys').Properties.EventPattern.detail.$or;
+    expect(keysPair.filter((x: any) => x.eventSource[0] === 'scheduler.amazonaws.com')).toEqual(schedules);
   });
 
   test('watched, exactly: the watch itself, the trail, the topics, the dead letters, mute rules and this stack', () => {
@@ -505,6 +516,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
         'UpdateTerminationProtection', 'ContinueUpdateRollback', 'CancelUpdateStack', 'RollbackStack'],
       stackRefactor: ['CreateStackRefactor', 'ExecuteStackRefactor'],
       buses: ['UpdateEventBus'],
+      schedules: ['UpdateSchedule', 'DeleteSchedule', 'CreateSchedule', 'DeleteScheduleGroup'],
     });
     // The six rules and the heartbeat's.
     const watched = [...ruleNames, 'vettid-votes-staging-kw-heartbeat'];
@@ -651,7 +663,49 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     });
   });
 
-  test('the key watch\'s heartbeat: the monitor\'s DescribeKey of the site key, its own rule, in the read-only state, retained', () => {
+  test('the key watch\'s heartbeat: an hourly schedule from AWS describes the site key as its own role, retained', () => {
+    const ss = t.findResources('AWS::Scheduler::Schedule');
+    expect(Object.keys(ss)).toEqual([scheduleLogical]);
+    const s = ss[scheduleLogical] as any;
+    expect(s.DeletionPolicy).toBe('Retain');
+    expect(s.Properties).toEqual({
+      Name: 'vettid-votes-staging-key-watch-heartbeat',
+      Description: s.Properties.Description,
+      ScheduleExpression: 'rate(1 hour)',
+      FlexibleTimeWindow: { Mode: 'OFF' },
+      State: 'ENABLED',
+      Target: {
+        Arn: 'arn:aws:scheduler:::aws-sdk:kms:describeKey',
+        RoleArn: { 'Fn::GetAtt': [heartbeatRoleLogical, 'Arn'] },
+        Input: { 'Fn::Join': ['', ['{"KeyId":"', { 'Fn::GetAtt': [siteLogical, 'Arn'] }, '"}']] },
+        RetryPolicy: { MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 3 },
+      },
+    });
+  });
+
+  test('its role: assumed only by the scheduler, for this schedule of this account; only DescribeKey on the site key', () => {
+    const role = t.findResources('AWS::IAM::Role')[heartbeatRoleLogical] as any;
+    expect(role.DeletionPolicy).toBe('Retain');
+    expect(role.Properties.RoleName).toBe('vettid-votes-staging-key-watch-heartbeat');
+    expect(role.Properties.ManagedPolicyArns).toBeUndefined();
+    expect(role.Properties.PermissionsBoundary).toBeUndefined();
+    expect(role.Properties.AssumeRolePolicyDocument).toEqual({ Version: '2012-10-17', Statement: [{
+      Effect: 'Allow', Action: 'sts:AssumeRole', Principal: { Service: 'scheduler.amazonaws.com' },
+      Condition: { StringEquals: {
+        'aws:SourceAccount': '123456789012',
+        'aws:SourceArn': { 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, ':scheduler:us-east-1:123456789012:schedule/default/vettid-votes-staging-key-watch-heartbeat']] },
+      } },
+    }] });
+    expect(role.Properties.Policies).toEqual([{ PolicyName: 'KeyWatchHeartbeat', PolicyDocument: { Version: '2012-10-17', Statement: [{
+      Sid: 'DescribeSiteKey', Effect: 'Allow', Action: 'kms:DescribeKey', Resource: { 'Fn::GetAtt': [siteLogical, 'Arn'] },
+    }] } }]);
+    // No other policy names it.
+    const others = (Object.values(t.findResources('AWS::IAM::Policy')) as any[])
+      .filter((p) => JSON.stringify(p.Properties.Roles).includes(heartbeatRoleLogical));
+    expect(others).toEqual([]);
+  });
+
+  test('its rule: that role\'s DescribeKey of the site key, in the read-only state, retained', () => {
     const r = t.findResources('AWS::Events::Rule')[heartbeatRule] as any;
     expect(r.DeletionPolicy).toBe('Retain');
     expect(r.Properties.Name).toBe('vettid-votes-staging-kw-heartbeat');
@@ -660,7 +714,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       'detail-type': ['AWS API Call via CloudTrail'],
       detail: {
         eventSource: ['kms.amazonaws.com'], eventName: ['DescribeKey'], resources: { ARN: [{ 'Fn::GetAtt': [siteLogical, 'Arn'] }] },
-        userIdentity: { sessionContext: { sessionIssuer: { arn: [{ 'Fn::GetAtt': [monitorLogical, 'Arn'] }] } } },
+        userIdentity: { sessionContext: { sessionIssuer: { arn: [{ 'Fn::GetAtt': [heartbeatRoleLogical, 'Arn'] }] } } },
       },
     });
   });
@@ -678,7 +732,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     expect(lg.Properties).toEqual({ LogGroupName: '/vettid/votes/staging/key-watch-heartbeat', RetentionInDays: 30 });
   });
 
-  test('its alarm: three hours without a line (SampleCount), missing data breaching, to every topic', () => {
+  test('its alarm: three hours without a line (SampleCount), missing data breaching, to every topic; its recovery to the alarm topic', () => {
     const filters = Object.values(t.findResources('AWS::Logs::MetricFilter')) as any[];
     expect(filters.find((f) => f.Properties.FilterName === 'vettid-votes-staging-key-watch-heartbeat').Properties).toEqual({
       FilterName: 'vettid-votes-staging-key-watch-heartbeat', LogGroupName: { Ref: heartbeatLogs }, FilterPattern: '',
@@ -688,11 +742,13 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     expect(a).toHaveLength(1);
     expect(a[0].Properties).toEqual({
       AlarmName: 'vettid-votes-staging-key-watch-heartbeat',
-      AlarmDescription: { 'Fn::Join': ['', ['No monitor DescribeKey of the votes site key of staging reached ', { Ref: heartbeatLogs },
-        ' in 3 hours: the key watch\'s feed may be broken (the trail, the default bus, the rule, the log policy), or the monitor did not run (README "The watch").']] },
+      AlarmDescription: { 'Fn::Join': ['', ['No scheduled DescribeKey of the votes site key of staging reached ', { Ref: heartbeatLogs },
+        ' in 3 hours: the key watch\'s feed may be broken (the trail, the default bus, the rule, the log policy), ' +
+        'or the schedule vettid-votes-staging-key-watch-heartbeat did not run (README "The heartbeat").']] },
       Namespace: 'VettID/VotesKeys/staging', MetricName: 'KeyWatchHeartbeat', Statistic: 'SampleCount', Period: 3600,
       Threshold: 1, ComparisonOperator: 'LessThanThreshold', EvaluationPeriods: 3, DatapointsToAlarm: 3, TreatMissingData: 'breaching',
       AlarmActions: [TOPIC, { Ref: topicA }, { Ref: topicB }],
+      OKActions: [TOPIC],
     });
     expect(HEARTBEAT.hours).toBe(3);
   });

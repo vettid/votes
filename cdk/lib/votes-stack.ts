@@ -16,6 +16,7 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as scheduler from 'aws-cdk-lib/aws-scheduler';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
@@ -169,6 +170,9 @@ export const WATCH_EVENTS = {
   stackRefactor: ['CreateStackRefactor', 'ExecuteStackRefactor'],
   // Any event bus: a key change on the default bus can stop its rules.
   buses: ['UpdateEventBus'],
+  // Any EventBridge Scheduler schedule or group (the key watch's
+  // heartbeat is one).
+  schedules: ['UpdateSchedule', 'DeleteSchedule', 'CreateSchedule', 'DeleteScheduleGroup'],
 } as const;
 
 /** EventBridge's default quota on an event pattern's length; each of the
@@ -438,11 +442,11 @@ export class VotesStack extends cdk.Stack {
     new route53.ARecord(this, 'AliasA', { zone, recordName: props.hostName, target: alias });
     new route53.AaaaRecord(this, 'AliasAAAA', { zone, recordName: props.hostName, target: alias });
 
-    // alarmTopicArn is required (above), so the monitor's role always
-    // exists: the key watch's heartbeat is its call.
-    const monitor = this.monitorAlerts(prefix, props);
+    if (props.alarmTopicArn !== undefined || props.githubOidcProviderArn !== undefined) {
+      this.monitorAlerts(prefix, props);
+    }
     // After monitorAlerts, which checks alarmTopicArn.
-    this.siteKeys(prefix, props, monitor);
+    this.siteKeys(prefix, props);
 
     new cdk.CfnOutput(this, 'BucketName', { value: this.bucket.bucketName });
     new cdk.CfnOutput(this, 'SiteKeySecret', { value: siteKeySecret.secretArn });
@@ -458,12 +462,12 @@ export class VotesStack extends cdk.Stack {
    * sign with them, and only publisherPrincipalArn may assume it. Every
    * signature, and every change that could let anyone else sign or
    * silence the watch, goes directly to two watch topics (emailed) and to
-   * a log group, and raises an alarm on the alarm topic and both. The
-   * monitor's hourly DescribeKey of the site key goes through the same
-   * feed to a log group of its own: three hours without one raise the
-   * key watch's heartbeat alarm.
+   * a log group, and raises an alarm on the alarm topic and both. An
+   * EventBridge Scheduler schedule's hourly DescribeKey of the site key
+   * goes through the same feed to a log group of its own: three hours
+   * without one raise the key watch's heartbeat alarm.
    */
-  private siteKeys(prefix: string, props: VotesStackProps, monitor: iam.Role): void {
+  private siteKeys(prefix: string, props: VotesStackProps): void {
     const publish = new iam.Role(this, 'PublishRole', {
       roleName: `${prefix}-publish`,
       description: 'votesctl publish-services: signs the service list with the site keys and writes it',
@@ -617,11 +621,60 @@ export class VotesStack extends cdk.Stack {
     const policyName = `${prefix}-key-use`;
     const topicArns = [alarmTopicArn, ...watchTopics.map((t) => t.topicArn)];
     const stackArnPrefix = `arn:${this.partition}:cloudformation:${this.region}:${this.account}:stack/${this.stackName}/`;
+
+    // The key watch's heartbeat: an EventBridge Scheduler schedule, every
+    // hour from AWS (not GitHub, whose schedule runs every 4 to 11 hours),
+    // describes the site key as a role of its own, a read-only call that
+    // goes through the same feed (CloudTrail's management events, the
+    // default bus, a rule in the same state) to a log group of its own.
+    // Its alarm (below) fires when three hours pass without a line, so a
+    // feed that stopped is seen without waiting for a publish. Not to the
+    // key-use log group, its alarm or the watch topics: it is no use of
+    // the key. The key policy's Administer lets IAM grant DescribeKey.
+    const heartbeatScheduleName = `${prefix}-key-watch-heartbeat`;
+    const heartbeatScheduleArn = this.formatArn({ service: 'scheduler', resource: 'schedule',
+      arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME, resourceName: `default/${heartbeatScheduleName}` });
+    const heartbeatRole = new iam.Role(this, 'KeyWatchHeartbeatRole', {
+      roleName: `${prefix}-key-watch-heartbeat`,
+      description: 'The key watch\'s heartbeat: the schedule\'s hourly DescribeKey of the votes site key, and nothing else',
+      maxSessionDuration: cdk.Duration.hours(1),
+      assumedBy: new iam.PrincipalWithConditions(new iam.ServicePrincipal('scheduler.amazonaws.com'), {
+        StringEquals: { 'aws:SourceAccount': this.account, 'aws:SourceArn': heartbeatScheduleArn },
+      }),
+      inlinePolicies: {
+        KeyWatchHeartbeat: new iam.PolicyDocument({ statements: [new iam.PolicyStatement({
+          sid: 'DescribeSiteKey', actions: ['kms:DescribeKey'], resources: [site.keyArn],
+        })] }),
+      },
+    });
+    heartbeatRole.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+    const heartbeatSchedule = new scheduler.CfnSchedule(this, 'KeyWatchHeartbeatSchedule', {
+      name: heartbeatScheduleName,
+      description: 'The key watch\'s heartbeat: describes the votes site key hourly, through the feed the key watch reads',
+      scheduleExpression: 'rate(1 hour)',
+      flexibleTimeWindow: { mode: 'OFF' },
+      state: 'ENABLED',
+      target: {
+        arn: 'arn:aws:scheduler:::aws-sdk:kms:describeKey',
+        roleArn: heartbeatRole.roleArn,
+        input: cdk.Stack.of(this).toJsonString({ KeyId: site.keyArn }),
+        // A missed hour is told by the alarm; no use retrying past the next.
+        retryPolicy: { maximumEventAgeInSeconds: 3600, maximumRetryAttempts: 3 },
+      },
+    });
+    heartbeatSchedule.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+
     const detail: Record<(typeof groups)[number], any[]> = {
       keys: [
         { eventSource: ['kms.amazonaws.com'], eventName: [...KEY_USE_EVENTS],
           resources: { ARN: [site.keyArn, listAnchor.keyArn, aliasArn(siteAlias), aliasArn(anchorAlias)] } },
-        { eventSource: ['iam.amazonaws.com'], eventName: [...PUBLISH_ROLE_EVENTS], requestParameters: { roleName: [publish.roleName] } },
+        // The publish role and the heartbeat's.
+        { eventSource: ['iam.amazonaws.com'], eventName: [...PUBLISH_ROLE_EVENTS],
+          requestParameters: { roleName: [publish.roleName, heartbeatRole.roleName] } },
+        // Any schedule (the heartbeat's among them): where CloudTrail puts
+        // a schedule's name (name or Name) is not confirmed, so these are
+        // not matched by name.
+        { eventSource: ['scheduler.amazonaws.com'], eventName: [...WATCH_EVENTS.schedules] },
         // This stack: one update can change every part of the watch.
         { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stack],
           requestParameters: { stackName: [this.stackName, { prefix: stackArnPrefix }] } },
@@ -705,17 +758,8 @@ export class VotesStack extends cdk.Stack {
     });
     const fromRules = { ArnEquals: { 'aws:SourceArn': rules.map((r) => r.ruleArn) } };
 
-    // The key watch's heartbeat: each hourly monitor run
-    // (.github/workflows/monitor.yml), as the monitor's role, describes the
-    // site key, a read-only call that goes through the same feed
-    // (CloudTrail's management events, the default bus, a rule in the same
-    // state) to a log group of its own. Its alarm (below) fires when three
-    // hours pass without a line, so a feed that stopped is seen without
-    // waiting for a publish. Not to the key-use log group, its alarm or
-    // the watch topics: it is no use of the key.
-    monitor.addToPolicy(new iam.PolicyStatement({
-      sid: 'KeyWatchHeartbeat', actions: ['kms:DescribeKey'], resources: [site.keyArn],
-    }));
+    // The heartbeat's rule: the schedule's call (above), by its role, on
+    // the site key.
     const heartbeatLogs = new logs.LogGroup(this, 'KeyWatchHeartbeatLogs', {
       logGroupName: heartbeatLogName,
       retention: logs.RetentionDays.ONE_MONTH,
@@ -723,17 +767,17 @@ export class VotesStack extends cdk.Stack {
     });
     const heartbeatRule = new events.Rule(this, 'KeyWatchHeartbeat', {
       ruleName: heartbeatRuleName,
-      description: 'The key watch\'s heartbeat: the monitor\'s hourly DescribeKey of the votes site key, through the same feed as the watch',
+      description: 'The key watch\'s heartbeat: the schedule\'s hourly DescribeKey of the votes site key, through the same feed as the watch',
       eventPattern: {
         detailType: ['AWS API Call via CloudTrail'],
         detail: {
           eventSource: ['kms.amazonaws.com'], eventName: ['DescribeKey'], resources: { ARN: [site.keyArn] },
-          userIdentity: { sessionContext: { sessionIssuer: { arn: [monitor.roleArn] } } },
+          userIdentity: { sessionContext: { sessionIssuer: { arn: [heartbeatRole.roleArn] } } },
         },
       },
     });
-    // The whole event: the monitor's session name is its own
-    // (votes-monitor-<env>), never an email address.
+    // The whole event: the role is only ever assumed by the scheduler,
+    // whose session name is never an email address.
     heartbeatRule.addTarget({
       bind: () => ({
         arn: this.formatArn({ service: 'logs', resource: 'log-group', arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME, resourceName: heartbeatLogs.logGroupName }),
@@ -821,16 +865,16 @@ export class VotesStack extends cdk.Stack {
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
     // The heartbeat's: three hours without a line (missing data breaches),
-    // as the monitor's own heartbeat, so a run GitHub delayed or skipped
-    // raises it too.
+    // so a schedule that stopped or failed raises it too. Its recovery is
+    // mailed to the alarm topic.
     new logs.MetricFilter(this, 'KeyWatchHeartbeatMetric', {
       filterName: heartbeatAlarmName, logGroup: heartbeatLogs, filterPattern: logs.FilterPattern.allEvents(),
       metricNamespace: namespace, metricName: 'KeyWatchHeartbeat', metricValue: '1',
     });
     const beat = new cloudwatch.Alarm(this, 'KeyWatchHeartbeatAlarm', {
       alarmName: heartbeatAlarmName,
-      alarmDescription: `No monitor DescribeKey of the votes site key of ${props.envName} reached ${heartbeatLogs.logGroupName} in ${HEARTBEAT.hours} hours: ` +
-        'the key watch\'s feed may be broken (the trail, the default bus, the rule, the log policy), or the monitor did not run (README "The watch").',
+      alarmDescription: `No scheduled DescribeKey of the votes site key of ${props.envName} reached ${heartbeatLogs.logGroupName} in ${HEARTBEAT.hours} hours: ` +
+        `the key watch's feed may be broken (the trail, the default bus, the rule, the log policy), or the schedule ${heartbeatScheduleName} did not run (README "The heartbeat").`,
       metric: new cloudwatch.Metric({ namespace, metricName: 'KeyWatchHeartbeat', statistic: cloudwatch.Stats.SAMPLE_COUNT, period: cdk.Duration.hours(1) }),
       threshold: 1,
       comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
@@ -842,6 +886,7 @@ export class VotesStack extends cdk.Stack {
       a.addAlarmAction(new cwactions.SnsAction(alarmTopic));
       for (const topic of watchTopics) a.addAlarmAction(new cwactions.SnsAction(topic));
     }
+    beat.addOkAction(new cwactions.SnsAction(alarmTopic));
 
     new cdk.CfnOutput(this, 'SiteSigningKeyArn', { value: site.keyArn });
     new cdk.CfnOutput(this, 'ListAnchorKeyArn', { value: listAnchor.keyArn });
@@ -851,7 +896,7 @@ export class VotesStack extends cdk.Stack {
   }
 
   /** The monitor's role and its heartbeat alarm (docs/VOTES-SITE.md §7). */
-  private monitorAlerts(prefix: string, props: VotesStackProps): iam.Role {
+  private monitorAlerts(prefix: string, props: VotesStackProps): void {
     const topicArn = props.alarmTopicArn;
     const providerArn = props.githubOidcProviderArn;
     if (topicArn === undefined || providerArn === undefined) {
@@ -905,6 +950,5 @@ export class VotesStack extends cdk.Stack {
     alarm.addAlarmAction(new cwactions.SnsAction(topic));
     alarm.addOkAction(new cwactions.SnsAction(topic));
     new cdk.CfnOutput(this, 'MonitorRoleArn', { value: role.roleArn });
-    return role;
   }
 }

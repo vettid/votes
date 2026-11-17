@@ -299,13 +299,17 @@ has a default.
    `VOTES_<STAGING|PROD>_MONITOR_ROLE_ARN` to that output and
    `VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN` to the topic. The alarm fires 3
    hours after the deploy until the first run that puts a heartbeat.
-   The deploy also makes the key watch's heartbeat (below, "The watch"):
+   The deploy also makes the key watch's heartbeat (below, "The
+   heartbeat"): the schedule and role `vettid-votes-<env>-key-watch-heartbeat`,
    the rule `vettid-votes-<env>-kw-heartbeat`, the log group
    `/vettid/votes/<env>/key-watch-heartbeat` and the alarm
-   `vettid-votes-<env>-key-watch-heartbeat`. Check that the first hourly
-   run after the variables are set puts a line in that log group (its
-   step "key watch heartbeat" succeeds); until one does, that alarm too
-   fires 3 hours after the deploy.
+   `vettid-votes-<env>-key-watch-heartbeat`; it needs no repository
+   variable. Check that within an hour of the deploy a line appears in
+   that log group, a `DescribeKey` whose
+   `userIdentity.sessionContext.sessionIssuer.arn` is the schedule's role.
+   A newly created alarm whose missing data breaches can go to ALARM
+   within minutes of its creation, before the first line: expect one
+   heartbeat alarm, and its OK, right after the first deploy.
 
 ### The site's signing keys
 
@@ -354,8 +358,12 @@ termination protection. They match:
 - every signature with either key, and every grant, key policy change,
   alias change, tag change, deletion or disabling of either key or its
   alias;
-- every change to the publish role (its trust or permission policies, a
-  boundary, its deletion);
+- every change to the publish role or the heartbeat's role (below; their
+  trust or permission policies, a boundary, their deletion);
+- every change to any EventBridge Scheduler schedule (created, updated or
+  deleted, or a schedule group deleted), the heartbeat's among them: any
+  schedule, because which field of CloudTrail's `requestParameters`
+  carries a schedule's name (`name` or `Name`) isn't confirmed;
 - every change to the watch: its rules and targets, its alarms (enabling
   or disabling their actions too), any alarm mute rule, its log group,
   streams, metric filter and key, any log group resource policy, its dead
@@ -384,33 +392,43 @@ alarm topic and both watch topics, so silencing one path is told on
 another.
 
 **The heartbeat.** A feed that stops silently (a trail stopped, the bus
-or a rule changed, the log policy gone) would look like no use until a
-publish. So each hourly monitor run (`.github/workflows/monitor.yml`),
-as the monitor role, also calls
-`aws kms describe-key --key-id alias/vettid-votes-<env>-site` (read-only;
-the role may make that call on the site key and no other). A seventh
-rule, `vettid-votes-<env>-kw-heartbeat`, in the same state as the six,
-matches only that call by that role on that key and sends the whole
-event to the log group `/vettid/votes/<env>/key-watch-heartbeat` (kept a
-month; failures go to the same dead letters), not to the key-use log
-group or the watch topics: it is no use of the key. Three hours without
-a line there raise `vettid-votes-<env>-key-watch-heartbeat`, which
-notifies the alarm topic and both watch topics. The rule, the alarm, the
-heartbeat log group and any metric filter into the watch's metric
-namespace (`VettID/VotesKeys/<env>`) are watched like the watch's own (a
-change to any is emailed). **It proves honest failures, not an
-administrator faking it:** `PutMetricData` into that namespace, or
-`PutLogEvents` into the heartbeat group, are data-plane calls no trail
-shows, and either could keep the alarm quiet while the feed is cut. The
-cross-account forward (below) is what covers an administrator. Like
-the monitor's own heartbeat, **3 missed hours raise it whatever the
-cause**, including GitHub delaying or skipping scheduled runs, or a
-GitHub outage. When it fires alone (no `monitor-heartbeat` alarm with
-it), check, in order:
+or its rule changed, the log policy gone) would look like no use until a
+publish. So an EventBridge Scheduler schedule,
+`vettid-votes-<env>-key-watch-heartbeat` (`rate(1 hour)`, no flexible
+window), calls KMS `DescribeKey` on the site key every hour, from AWS,
+as a role of its own, `vettid-votes-<env>-key-watch-heartbeat`, which
+only the scheduler may assume, for that schedule in this account, and
+which may make that read-only call on the site key and nothing else.
+GitHub's schedule no longer matters for it (GitHub runs the hourly
+monitor every 4 to 11 hours); the monitor workflow is unchanged. A
+seventh rule, `vettid-votes-<env>-kw-heartbeat`, in the same state as
+the six, matches only that call by that role on that key and sends the
+whole event to the log group `/vettid/votes/<env>/key-watch-heartbeat`
+(kept a month; failures go to the same dead letters), not to the
+key-use log group or the watch topics: it is no use of the key. Three
+hours without a line there raise `vettid-votes-<env>-key-watch-heartbeat`,
+which notifies the alarm topic and both watch topics; its recovery
+(OK) is mailed to the alarm topic. The six rules watch each other and
+this one; the schedule, its role, the alarm, the heartbeat log group
+and any metric filter into the watch's metric namespace
+(`VettID/VotesKeys/<env>`) are watched like the watch's own (a change to
+any is emailed; for schedules, a change to any schedule, above). **What
+it proves, and what not:** it proves the path of a read-only management
+event through the trail, the default bus and a rule in that state, to a
+log group. Write events go through the same trail's selector, and a
+change to any trail is watched. **It proves honest failures, not an
+administrator faking it:** `PutMetricData` into the watch's namespace,
+or `PutLogEvents` into the heartbeat group, are data-plane calls no
+trail shows, and either could keep the alarm quiet while the feed is
+cut. The cross-account forward (below) is what covers an
+administrator. **3 missed hours raise it whatever the cause**, the
+schedule's too. When it fires, check, in order:
 
-- the monitor's runs: did they run, and did their step "key watch
-  heartbeat" (`describe-key`) succeed? A failed call also fails the run,
-  which alerts;
+- the schedule: is it there and `ENABLED`
+  (`aws scheduler get-schedule --name vettid-votes-<env>-key-watch-heartbeat`),
+  with its role and target the stack's, and does its role still exist
+  with its one permission (`aws iam get-role-policy`)? Its failed
+  invocations show in CloudWatch (`AWS/Scheduler`);
 - the trail: is it logging (`aws cloudtrail get-trail-status`), with
   management events (read and write), and homed in `us-east-1` or an
   organization trail (below)?
