@@ -134,6 +134,8 @@ service's identity and anchor keys, which the new list keeps. From here
 until step 9, uploads are refused (there is no list), and the hourly
 monitor fails, alerting the alarm topic (expected).
 
+The monitor is red from step 3 until step 9: expected.
+
 ## 4. Redeploy: no repair, the new site key (go 3)
 
 As the publish role (`AWS_PROFILE=votes-publish-staging`):
@@ -218,9 +220,9 @@ pin:
 As the publish role (`AWS_PROFILE=votes-publish-staging`):
 
 ```sh
-./votesctl publish-services -kms <SiteSigningKeyArn> -site-key $NEW_KEY \
+./votesctl publish-services -kms <SiteSigningKeyArn> -site-key "${NEW_KEY:?}" \
   -watch-topics <KeyWatchTopicArn>,<KeyWatchTopicBArn> -list-anchor-key <ListAnchorKeyArn> \
-  -list-anchor-pub $SPKI -sigstore staging -bucket $BUCKET -in services.json
+  -list-anchor-pub "${SPKI:?}" -sigstore staging -bucket $BUCKET -in services.json
 ```
 
 It writes `v1/services/1.bundle`, then `v1/services.json.sig` and
@@ -241,7 +243,7 @@ else needs it (Rule 3).
 ## 11. After
 
 The `-secret` and migration-only paths, including the stack's retained
-secret construct, go in their own PR (GC #12657).
+secret construct, are removed in their own PR (GC #12657).
 
 ## Done when
 

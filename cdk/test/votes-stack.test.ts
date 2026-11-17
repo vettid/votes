@@ -214,8 +214,8 @@ describe('edge', () => {
     expect(d.Properties.DistributionConfig.WebACLId).toEqual({ 'Fn::GetAtt': [acls[0], 'Arn'] });
   });
 
-  test('the site key secret is retained', () => {
-    t.hasResource('AWS::SecretsManager::Secret', { DeletionPolicy: 'Retain' });
+  test('the site key is not a secret', () => {
+    t.resourceCountIs('AWS::SecretsManager::Secret', 0);
   });
 });
 

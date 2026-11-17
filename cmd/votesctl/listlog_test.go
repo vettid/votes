@@ -88,7 +88,7 @@ func TestPublishLogsTheList(t *testing.T) {
 	lg := &fakeLog{}
 	a := testService(3, "A")
 	v1 := testList(1, make([]byte, 32), a)
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, lg, v1); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.signs) != 1 || len(lg.entries) != 1 || !bytes.Equal(lg.entries[0], v1) {
@@ -102,7 +102,7 @@ func TestPublishLogsTheList(t *testing.T) {
 	if n := func(o fakeObject) int { v, _ := strconv.Atoi(strings.Trim(o.etag, `"`)); return v }; !(n(bundle) < n(sig) && n(sig) < n(list)) {
 		t.Fatalf("put order: bundle %s, sig %s, list %s", bundle.etag, sig.etag, list.etag)
 	}
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, lg, v1); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.signs) != 1 || len(lg.entries) != 1 {
@@ -110,7 +110,7 @@ func TestPublishLogsTheList(t *testing.T) {
 	}
 	h1 := sha256.Sum256(v1)
 	v2 := testList(2, h1[:], a, testService(4, "B"))
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v2); err != nil {
+	if err := publishList(ctx, b, "bucket", k, lg, v2); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.signs) != 2 || len(lg.entries) != 2 || !bytes.Equal(b.objs["v1/services/2.bundle"].data, fakeBundle(v2)) {
@@ -129,12 +129,12 @@ func TestRefusedListNotLogged(t *testing.T) {
 	lg := &fakeLog{}
 	a := testService(3, "A")
 	b := newFakeS3()
-	if err := publishList(ctx, b, "bucket", k, lg, nil, testList(2, make([]byte, 32), a)); err == nil {
+	if err := publishList(ctx, b, "bucket", k, lg, testList(2, make([]byte, 32), a)); err == nil {
 		t.Fatal("a first list at version 2")
 	}
 	v1 := testList(1, make([]byte, 32), a)
 	b.set("v1/services/1.bundle", fakeBundle(testList(1, make([]byte, 32))))
-	err := publishList(ctx, b, "bucket", k, lg, nil, v1)
+	err := publishList(ctx, b, "bucket", k, lg, v1)
 	if err == nil || !strings.Contains(err.Error(), "never rewritten") {
 		t.Fatalf("a stray bundle: %v", err)
 	}
@@ -154,14 +154,14 @@ func TestLogFailsNothingWritten(t *testing.T) {
 	lg := &fakeLog{err: errors.New("rekor: 503")}
 	b := newFakeS3()
 	v1 := testList(1, make([]byte, 32), testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err == nil || !strings.Contains(err.Error(), "503") {
+	if err := publishList(ctx, b, "bucket", k, lg, v1); err == nil || !strings.Contains(err.Error(), "503") {
 		t.Fatalf("%v", err)
 	}
 	if len(b.objs) != 0 {
 		t.Fatalf("written: %v", b.objs)
 	}
 	lg.err = nil
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, lg, v1); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.signs) != 2 || len(lg.entries) != 1 {
@@ -179,10 +179,10 @@ func TestKeptBundleUsed(t *testing.T) {
 	lg := &fakeLog{}
 	b := &failOnce{fakeS3: newFakeS3(), key: "v1/services.json.sig"}
 	v1 := testList(1, make([]byte, 32), testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err == nil {
+	if err := publishList(ctx, b, "bucket", k, lg, v1); err == nil {
 		t.Fatal("the move should fail")
 	}
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, lg, v1); err != nil {
 		t.Fatal(err)
 	}
 	if len(lg.entries) != 1 || !bytes.Equal(b.objs["v1/services.json"].data, v1) {
@@ -200,26 +200,26 @@ func TestPublishedListLoggedLater(t *testing.T) {
 	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(key))
 	b := newFakeS3()
 	v1 := testList(1, make([]byte, 32), testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", k, nil, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := b.objs["v1/services/1.bundle"]; ok {
 		t.Fatal("logged with no log")
 	}
 	lg := &fakeLog{}
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, lg, v1); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.signs) != 1 || len(lg.entries) != 1 || !bytes.Equal(b.objs["v1/services/1.bundle"].data, fakeBundle(v1)) {
 		t.Fatalf("%d signs, %d entries", len(f.signs), len(lg.entries))
 	}
 	// Run again: the kept bundle is checked and used.
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err != nil || len(lg.entries) != 1 {
+	if err := publishList(ctx, b, "bucket", k, lg, v1); err != nil || len(lg.entries) != 1 {
 		t.Fatalf("%v, %d entries", err, len(lg.entries))
 	}
 	// A kept bundle for other bytes is refused here too.
 	b.set("v1/services/1.bundle", []byte("bundle:other"))
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err == nil || !strings.Contains(err.Error(), "never rewritten") {
+	if err := publishList(ctx, b, "bucket", k, lg, v1); err == nil || !strings.Contains(err.Error(), "never rewritten") {
 		t.Fatalf("%v", err)
 	}
 }
@@ -364,55 +364,21 @@ func TestPreviousBundleRequired(t *testing.T) {
 	b := newFakeS3()
 	a := testService(3, "A")
 	v1 := testList(1, make([]byte, 32), a)
-	if err := publishList(ctx, b, "bucket", k, nil, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	lg := &fakeLog{}
 	h1 := sha256.Sum256(v1)
 	v2 := testList(2, h1[:], a)
-	err := publishList(ctx, b, "bucket", k, lg, nil, v2)
+	err := publishList(ctx, b, "bucket", k, lg, v2)
 	if err == nil || !strings.Contains(err.Error(), "version 1 is current without its bundle") || len(f.signs) != 1 || len(lg.entries) != 0 {
 		t.Fatalf("%v, %d signs, %d entries", err, len(f.signs), len(lg.entries))
 	}
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, lg, v1); err != nil {
 		t.Fatal(err)
 	}
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v2); err != nil || len(lg.entries) != 2 {
+	if err := publishList(ctx, b, "bucket", k, lg, v2); err != nil || len(lg.entries) != 2 {
 		t.Fatalf("%v, %d entries", err, len(lg.entries))
-	}
-}
-
-// -secret is refused once a list is logged, at the current version or the
-// next, with its own message, before anything is signed.
-func TestSecretRefusedOnceLogged(t *testing.T) {
-	ctx := context.Background()
-	old, nw := testKey("old"), testKey("new")
-	b := newFakeS3()
-	a := testService(3, "A")
-	v1 := testList(1, make([]byte, 32), a)
-	if err := publishList(ctx, b, "bucket", secretSigner(old), nil, nil, v1); err != nil {
-		t.Fatal(err)
-	}
-	f := newFakeKMS(nw)
-	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(nw))
-	h1 := sha256.Sum256(v1)
-	v2 := testList(2, h1[:], a)
-	if err := publishList(ctx, b, "bucket", k, &fakeLog{}, pub(old), v2); err != nil {
-		t.Fatal(err)
-	}
-	h2 := sha256.Sum256(v2)
-	err := publishList(ctx, b, "bucket", secretSigner(old), nil, nil, testList(3, h2[:], a))
-	if err == nil || !strings.Contains(err.Error(), "-secret is refused: v1/services/2.bundle exists") {
-		t.Fatalf("%v", err)
-	}
-	// A bundle at the next version only (a lost race): refused too.
-	c := newFakeS3()
-	if err := publishList(ctx, c, "bucket", secretSigner(old), nil, nil, v1); err != nil {
-		t.Fatal(err)
-	}
-	c.set("v1/services/2.bundle", []byte("x"))
-	if err := publishList(ctx, c, "bucket", secretSigner(old), nil, nil, v2); err == nil || !strings.Contains(err.Error(), "2.bundle exists") {
-		t.Fatalf("%v", err)
 	}
 }
 
@@ -427,12 +393,12 @@ func TestWrongInstanceRefused(t *testing.T) {
 	b := newFakeS3()
 	a := testService(3, "A")
 	v1 := testList(1, make([]byte, 32), a)
-	if err := publishList(ctx, b, "bucket", k, &fakeLog{}, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, &fakeLog{}, v1); err != nil {
 		t.Fatal(err)
 	}
 	other := &otherLog{}
 	h1 := sha256.Sum256(v1)
-	err := publishList(ctx, b, "bucket", k, other, nil, testList(2, h1[:], a))
+	err := publishList(ctx, b, "bucket", k, other, testList(2, h1[:], a))
 	if err == nil || !strings.Contains(err.Error(), "-sigstore") || !strings.Contains(err.Error(), "1.bundle") {
 		t.Fatalf("%v", err)
 	}
@@ -459,14 +425,14 @@ func TestStrayBundleBeforeHistory(t *testing.T) {
 	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(key))
 	b := newFakeS3()
 	v1 := testList(1, make([]byte, 32), testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", k, nil, nil, v1); err != nil {
+	if err := publishList(ctx, b, "bucket", k, nil, v1); err != nil {
 		t.Fatal(err)
 	}
 	delete(b.objs, "v1/services/1.json")
 	delete(b.objs, "v1/services/1.json.sig")
 	b.set("v1/services/1.bundle", []byte("bundle:other"))
 	lg := &fakeLog{}
-	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err == nil || !strings.Contains(err.Error(), "never rewritten") {
+	if err := publishList(ctx, b, "bucket", k, lg, v1); err == nil || !strings.Contains(err.Error(), "never rewritten") {
 		t.Fatalf("%v", err)
 	}
 	if _, ok := b.objs["v1/services/1.json"]; ok || len(lg.entries) != 0 {
