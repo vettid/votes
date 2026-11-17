@@ -278,6 +278,7 @@ type anchorFake struct {
 	*fakeKMS
 	ec       *ecdsa.PrivateKey
 	tags     []kmstypes.Tag
+	pages    [][]kmstypes.Tag // overrides tags: one page each
 	tagReads int
 }
 
@@ -291,9 +292,33 @@ func (a *anchorFake) GetPublicKey(ctx context.Context, in *kms.GetPublicKeyInput
 		SigningAlgorithms: []kmstypes.SigningAlgorithmSpec{kmstypes.SigningAlgorithmSpecEcdsaSha256}, PublicKey: spki}, nil
 }
 
-func (a *anchorFake) ListResourceTags(_ context.Context, _ *kms.ListResourceTagsInput, _ ...func(*kms.Options)) (*kms.ListResourceTagsOutput, error) {
+func (a *anchorFake) ListResourceTags(_ context.Context, in *kms.ListResourceTagsInput, _ ...func(*kms.Options)) (*kms.ListResourceTagsOutput, error) {
 	a.tagReads++
-	return &kms.ListResourceTagsOutput{Tags: a.tags}, nil
+	if a.pages == nil {
+		return &kms.ListResourceTagsOutput{Tags: a.tags}, nil
+	}
+	// Pages: the marker is the next page's index.
+	i, _ := strconv.Atoi(aws.ToString(in.Marker))
+	out := &kms.ListResourceTagsOutput{Tags: a.pages[i]}
+	if i+1 < len(a.pages) {
+		out.Truncated, out.NextMarker = true, aws.String(strconv.Itoa(i+1))
+	}
+	return out, nil
+}
+
+// The tag is found on any page of the key's tags, and its absence only
+// after the last.
+func TestKeySigstorePages(t *testing.T) {
+	ctx := context.Background()
+	tag := func(k, v string) kmstypes.Tag { return kmstypes.Tag{TagKey: aws.String(k), TagValue: aws.String(v)} }
+	f := &anchorFake{fakeKMS: newFakeKMS(testKey("site")), pages: [][]kmstypes.Tag{{tag("a", "1"), tag("b", "2")}, {tag(sigstoreTag, "production")}}}
+	if s, err := keySigstore(ctx, f, testAnchorARN); err != nil || s != "production" || f.tagReads != 2 {
+		t.Fatalf("%q %v, %d reads", s, err, f.tagReads)
+	}
+	f = &anchorFake{fakeKMS: newFakeKMS(testKey("site")), pages: [][]kmstypes.Tag{{tag("a", "1")}, {tag("b", "2")}}}
+	if _, err := keySigstore(ctx, f, testAnchorARN); err == nil || !strings.Contains(err.Error(), "no vettid:sigstore tag") || f.tagReads != 2 {
+		t.Fatalf("%v, %d reads", err, f.tagReads)
+	}
 }
 
 // A P-256 key is checked against the pin, then its tag against -sigstore,
@@ -312,7 +337,7 @@ func TestRekorLogPinAndTag(t *testing.T) {
 		t.Fatalf("no tag: %v", err)
 	}
 	f.tags = []kmstypes.Tag{{TagKey: aws.String("other"), TagValue: aws.String("staging")}, {TagKey: aws.String(sigstoreTag), TagValue: aws.String("production")}}
-	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging", spki); err == nil || !strings.Contains(err.Error(), "the stack's is production") {
+	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging", spki); err == nil || !strings.Contains(err.Error(), "tag says production, -sigstore says staging") {
 		t.Fatalf("another instance's tag: %v", err)
 	}
 	if len(f.signs) != 0 {

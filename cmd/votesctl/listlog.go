@@ -174,12 +174,15 @@ func newRekorLog(ctx context.Context, k anchorKeyAPI, keyARN, siteKeyARN, instan
 		return nil, err
 	}
 	if tagged != instance {
-		return nil, fmt.Errorf("-sigstore is %s, but the stack's is %s (the list anchor key's %s tag): refusing to log", instance, tagged, sigstoreTag)
+		// Not "use the tag's": an administrator could have retagged the key.
+		return nil, fmt.Errorf("the list anchor key's %s tag says %s, -sigstore says %s: refusing to log. Don't change -sigstore to match the tag: check the stack's sigstore and the key watch's mail for a TagResource (README)", sigstoreTag, tagged, instance)
 	}
 	anch, err := anchor.NewSigner(instance, key)
 	if err != nil {
 		return nil, err
 	}
+	// Defense in depth: unreachable while the Anchorer re-marshals the
+	// same key, whose KMS bytes were compared above.
 	if !bytes.Equal(anch.PublicKeyDER(), pin) {
 		return nil, errors.New("the list anchor key's public key is not -list-anchor-pub: refusing to log")
 	}

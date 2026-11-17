@@ -196,7 +196,11 @@ has a default.
      role) and pin it there, with the owner's go, before the first
      publish;
    - `-sigstore` is the stack's: the key's tag `vettid:sigstore`, which
-     the stack sets to its `sigstore` (a change of the tag is watched);
+     the stack sets to its `sigstore` (a change of the tag is watched).
+     **On this refusal, don't change `-sigstore` to match the tag**: an
+     administrator could have retagged the key. Check the stack's
+     `sigstore` (the deploy context) and the key watch's mail for a
+     `TagResource` first;
    - the published list's own bundle verifies on that instance under that
      key. Only on the flag day may the published list (the old key's)
      have none; otherwise it is refused ("version N is current without
@@ -215,9 +219,11 @@ has a default.
    or its write), the list anchor key signs again too, and Rekor holds a
    second entry for the same list (the monitor is to match entries by
    the list's SHA-256, so that is no mismatch). `-secret` doesn't log (it
-   goes after the flag day), and it is refused once the current or the
-   next version has a bundle, so every version from the first one
-   published with `-kms` on has a bundle.
+   goes after the flag day), and it is refused when the file's version,
+   or the version before it, has a bundle; nor can it publish over a
+   list under the KMS key, which doesn't verify under the secret's key.
+   So every version from the first one published with `-kms` on has a
+   bundle.
 
    **On the flag day** (GC #12646), the published list is signed with
    the secret's key: give that key as `-previous-site-key` on the first
@@ -353,6 +359,11 @@ another.
   confirmation or an unsubscribe by the email's link is not in
   CloudTrail, so the watch can't see it. Keep `keyWatchEmail` in
   `~/.cdk.json`, not the tracked `cdk.json`, and out of shell history.
+- **The deploy that brings the `vettid:sigstore` tag** (GC #12646 task
+  3) tags the list anchor key: if the key already exists, expect a
+  `TagResource` mail on both watch topics for it. That is the deploy, not
+  an incident; any other `TagResource` or `UntagResource` on either key
+  is one.
 - **A publish with `-kms` is two signatures (the site key's and the list
   anchor key's), each logged twice and emailed four times** (a pair of
   rules, two topics: four lines and eight emails), and raises the key-use
