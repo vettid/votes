@@ -167,6 +167,13 @@ func publish(ctx context.Context, a publishArgs) error {
 		}
 		region = strings.Split(a.kms, ":")[3]
 	}
+	var previous ed25519.PublicKey
+	if a.previous != "" {
+		var err error
+		if previous, err = decodeKeyFlag("-previous-site-key", a.previous); err != nil {
+			return err
+		}
+	}
 	raw, err := os.ReadFile(a.in)
 	if err != nil {
 		return err
@@ -192,13 +199,16 @@ func publish(ctx context.Context, a publishArgs) error {
 	if err != nil {
 		return err
 	}
-	var previous ed25519.PublicKey
-	if a.previous != "" {
-		if previous, err = decodeSiteKey(a.previous); err != nil {
-			return fmt.Errorf("-previous-site-key: %w", err)
-		}
-	}
 	return publishList(ctx, s3.NewFromConfig(cfg), a.bucket, signer, previous, raw)
+}
+
+// decodeKeyFlag decodes a base64 Ed25519 public key given as flag.
+func decodeKeyFlag(flag, b64 string) (ed25519.PublicKey, error) {
+	k, err := base64.StdEncoding.Strict().DecodeString(b64)
+	if err != nil || len(k) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("%s: an Ed25519 public key, base64 of 32 bytes", flag)
+	}
+	return ed25519.PublicKey(k), nil
 }
 
 // publishTimeout bounds one publish.
@@ -238,11 +248,13 @@ type s3API interface {
 // apart from the key and the client). Every check that can refuse the
 // list runs before it is signed, since a signature with the site key is
 // emailed and alarmed (README "The watch"): its shape, the first-list
-// rule, and that it extends the published list. A rerun of a list already
-// signed (published, or interrupted half-way) uses the signature in the
-// bucket and signs nothing. previous, when given, is the key the
-// published list is signed with, when it isn't key's (the flag day: the
-// last list under the secret's key, the first under KMS's).
+// rule, that it extends the published list, and that no other bytes sit
+// at its version's copy. A rerun of a list already signed (published,
+// interrupted half-way, or with its copy kept) uses the bucket's
+// signature and signs nothing. previous is given only on the flag day:
+// the key the published list is signed with when it isn't key's (the
+// last list under the secret's key, the first under KMS's); it is
+// refused anywhere else.
 func publishList(ctx context.Context, c s3API, bucket string, key listSigner, previous ed25519.PublicKey, raw []byte) error {
 	data, err := vote.Canonicalize(raw)
 	if err != nil {
@@ -253,9 +265,14 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, pr
 		return err
 	}
 	pub := key.Public()
-	if previous == nil {
+	flagDay := previous != nil
+	if flagDay && bytes.Equal(previous, pub) {
+		return errors.New("-previous-site-key is -site-key: it is only for the flag day, when the published list is under the old key")
+	}
+	if !flagDay {
 		previous = pub
 	}
+	notFlagDay := errors.New("-previous-site-key is only for the flag day, the next version after a list under the old key: leave it out")
 	cur, err := get(ctx, c, bucket, "v1/services.json")
 	if err != nil {
 		return err
@@ -278,6 +295,11 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, pr
 	}
 	resuming := sig != nil
 	switch {
+	case flagDay && (resuming || cur.data == nil || curSig.data == nil ||
+		vote.Verify(pub, vote.LabelServiceList, sum(cur.data), curSig.data) == nil):
+		// A rerun, a first list, a broken pair or a list already under the
+		// new key: the old key has nothing to do here.
+		return notFlagDay
 	case resuming && bytes.Equal(cur.data, data):
 		// Already the current list: only its history is checked, and
 		// written if missing (the list published before history was kept).
@@ -312,6 +334,27 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, pr
 			return err
 		}
 	}
+	// Nothing else may already sit at this version's copy (a pair rolled
+	// back past it, or a stray): checked before signing. A copy of this
+	// list's own signature is used, not signed again.
+	base := fmt.Sprintf("v1/services/%d.json", next.Version)
+	copyData, err := get(ctx, c, bucket, base)
+	if err != nil {
+		return err
+	}
+	copySig, err := get(ctx, c, bucket, base+".sig")
+	if err != nil {
+		return err
+	}
+	if copyData.data != nil && !bytes.Equal(copyData.data, data) {
+		return fmt.Errorf("%s holds other bytes: a version is never rewritten", base)
+	}
+	if copySig.data != nil {
+		if vote.Verify(pub, vote.LabelServiceList, sum(data), copySig.data) != nil || sig != nil && !bytes.Equal(copySig.data, sig) {
+			return fmt.Errorf("%s.sig holds other bytes: a version is never rewritten", base)
+		}
+		sig = copySig.data
+	}
 	if sig == nil {
 		if sig, err = signList(ctx, key, data); err != nil {
 			return err
@@ -319,11 +362,6 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, pr
 		if _, err := site.ParseServiceList(data, sig, pub); err != nil {
 			return err
 		}
-	}
-	// Nothing else may already sit at this version's copy: checked, not
-	// written, before the move.
-	if err := checkVersion(ctx, c, bucket, next.Version, data, sig); err != nil {
-		return err
 	}
 	beforeMove()
 	if !resuming {
@@ -351,12 +389,6 @@ var beforeMove = func() {}
 // already there must hold the same bytes.
 func keepVersion(ctx context.Context, c s3API, bucket string, version int64, data, sig []byte) error {
 	return versionCopy(ctx, c, bucket, version, data, sig, true)
-}
-
-// checkVersion reports whether a version's copy is absent or holds the
-// same bytes, writing nothing.
-func checkVersion(ctx context.Context, c s3API, bucket string, version int64, data, sig []byte) error {
-	return versionCopy(ctx, c, bucket, version, data, sig, false)
 }
 
 func versionCopy(ctx context.Context, c s3API, bucket string, version int64, data, sig []byte, write bool) error {

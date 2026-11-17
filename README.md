@@ -155,10 +155,16 @@ environment. None has a default.
    exactly one email subscription, confirmed (README "The watch"),
    since nobody would be told of the signature. Every check that can
    refuse the list (its form, the first-list rule, that it extends the
-   published list by one version) runs before it is signed, so no
-   signature is made, or emailed, for a list that is refused; a rerun of
-   a list already signed (published, or interrupted half-way) uses the
-   bucket's signature and signs nothing. It signs through KMS once (no
+   published list by one version, and that no other bytes sit at its
+   version's copy) runs before it is signed, so no signature is made, or
+   emailed, for a list that is refused; a rerun of a list already signed
+   (published, interrupted half-way, or with its copy kept) uses the
+   bucket's signature and signs nothing. A signature can still go
+   unpublished, and so be emailed for nothing, only when something fails
+   after it is made: a transient S3 error, another publish winning the
+   conditional write, the 3-minute deadline passing, or KMS's answer
+   being lost. Each costs an email, never a wrong publish; run the same
+   command again. It signs through KMS once (no
    retry: run it again if it fails), `ED25519_SHA_512` over the label
    and the list's SHA-256, checks the signature under `-site-key` before
    anything is written, and gives up after 3 minutes.
@@ -166,7 +172,12 @@ environment. None has a default.
    **On the flag day** (GC #12646), the published list is signed with
    the secret's key: give that key as `-previous-site-key` on the first
    `-kms` publish (the next version, the same services), which checks
-   the published list under it; later publishes don't need it.
+   the published list under it. Take it, like `-site-key`, from an
+   independent pin: `vote_site_key` in the member vaults' release config
+   before the flag day (the publish role can't read the secret, on
+   purpose). It is refused anywhere else: when it is `-site-key`, on a
+   first list, on a rerun or a resume (which need no old key), and once
+   the published list is under the new key.
 
    To act as the publish role, add a profile and set
    `AWS_PROFILE` to it:

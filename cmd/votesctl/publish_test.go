@@ -235,3 +235,156 @@ func TestKMSPublishBindsTopics(t *testing.T) {
 		t.Fatalf("-previous-site-key with -secret: %v", err)
 	}
 }
+
+// A copy already at the next version's key is checked before signing: other
+// bytes (a planted copy, or a pair rolled back past it) are refused with
+// no signature; a copy of this list's own signature is used, not signed.
+func TestPublishCopyBeforeSigning(t *testing.T) {
+	ctx := context.Background()
+	key := testKey("site")
+	f := newFakeKMS(key)
+	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(key))
+	b := newFakeS3()
+	v1 := testList(1, make([]byte, 32), testService(3, "A"))
+	if err := publishList(ctx, b, "bucket", k, nil, v1); err != nil {
+		t.Fatal(err)
+	}
+	h1 := sha256.Sum256(v1)
+	v2 := testList(2, h1[:], testService(3, "A"), testService(4, "B"))
+	b.set("v1/services/2.json", []byte("planted"))
+	if err := publishList(ctx, b, "bucket", k, nil, v2); err == nil || !strings.Contains(err.Error(), "other bytes") || len(f.signs) != 1 {
+		t.Fatalf("a planted copy: %v, %d signs", err, len(f.signs))
+	}
+	delete(b.objs, "v1/services/2.json")
+	b.set("v1/services/2.json.sig", bytes.Repeat([]byte{7}, 64))
+	if err := publishList(ctx, b, "bucket", k, nil, v2); err == nil || !strings.Contains(err.Error(), "other bytes") || len(f.signs) != 1 {
+		t.Fatalf("a planted signature copy: %v, %d signs", err, len(f.signs))
+	}
+	// The copy of v2's own signature (a pair rolled back after v2 was
+	// current): used as v2's signature, nothing signed.
+	sig2, _ := signList(ctx, secretSigner(key), v2)
+	b.set("v1/services/2.json", v2)
+	b.set("v1/services/2.json.sig", sig2)
+	if err := publishList(ctx, b, "bucket", k, nil, v2); err != nil || len(f.signs) != 1 {
+		t.Fatalf("its own copy: %v, %d signs", err, len(f.signs))
+	}
+	if !bytes.Equal(b.objs["v1/services.json.sig"].data, sig2) || !bytes.Equal(b.objs["v1/services.json"].data, v2) {
+		t.Fatal("v2 not published from its copy")
+	}
+}
+
+// -previous-site-key only on the flag day: refused when it is -site-key,
+// on a first list, a rerun, a resume, or a published list already under
+// the new key; never a signature for any of them.
+func TestPreviousKeyOnlyOnFlagDay(t *testing.T) {
+	ctx := context.Background()
+	old, nw := testKey("old"), testKey("new")
+	f := newFakeKMS(nw)
+	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(nw))
+	v1 := testList(1, make([]byte, 32), testService(3, "A"))
+	h1 := sha256.Sum256(v1)
+	v2 := testList(2, h1[:], testService(3, "A"))
+
+	if err := publishList(ctx, newFakeS3(), "bucket", k, pub(nw), v1); err == nil || !strings.Contains(err.Error(), "is -site-key") {
+		t.Fatalf("previous is the key: %v", err)
+	}
+	if err := publishList(ctx, newFakeS3(), "bucket", k, pub(old), v1); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
+		t.Fatalf("a first list: %v", err)
+	}
+	// Already under the new key.
+	b := newFakeS3()
+	if err := publishList(ctx, b, "bucket", k, nil, v1); err != nil {
+		t.Fatal(err)
+	}
+	signs := len(f.signs)
+	if err := publishList(ctx, b, "bucket", k, pub(old), v2); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
+		t.Fatalf("a list already under the new key: %v", err)
+	}
+	if err := publishList(ctx, b, "bucket", k, pub(old), v1); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
+		t.Fatalf("a rerun: %v", err)
+	}
+	// The flag day itself, then a rerun with the flag: refused.
+	ob := newFakeS3()
+	if err := publishList(ctx, ob, "bucket", secretSigner(old), nil, v1); err != nil {
+		t.Fatal(err)
+	}
+	// The old list again, under the new key, with the old key given: not
+	// the next version (and not "already published" under the old key).
+	if err := publishList(ctx, ob, "bucket", k, pub(old), v1); err == nil {
+		t.Fatal("the old list again on the flag day")
+	}
+	if len(f.signs) != signs {
+		t.Fatalf("signed for a refusal: %d", len(f.signs)-signs)
+	}
+	if err := publishList(ctx, ob, "bucket", k, pub(old), v2); err != nil || len(f.signs) != signs+1 {
+		t.Fatalf("the flag day: %v", err)
+	}
+	if err := publishList(ctx, ob, "bucket", k, pub(old), v2); err == nil || !strings.Contains(err.Error(), "only for the flag day") || len(f.signs) != signs+1 {
+		t.Fatalf("a rerun of the flag day with the flag: %v", err)
+	}
+	// The flag's own decoding, before AWS.
+	if err := publish(ctx, publishArgs{kms: testKeyARN, siteKey: base64Key(pub(nw)), watch: topicA + "," + topicB, previous: "nope", bucket: "b", in: "/nonexistent"}); err == nil ||
+		!strings.HasPrefix(err.Error(), "-previous-site-key: an Ed25519 public key") {
+		t.Fatalf("%v", err)
+	}
+}
+
+// A signature in the bucket over this list is a resume only if the list
+// it would replace is the one this list extends.
+func TestResumeNeedsThePrevious(t *testing.T) {
+	ctx := context.Background()
+	key := testKey("site")
+	f := newFakeKMS(key)
+	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(key))
+	b := newFakeS3()
+	v1 := testList(1, make([]byte, 32), testService(3, "A"))
+	if err := publishList(ctx, b, "bucket", k, nil, v1); err != nil {
+		t.Fatal(err)
+	}
+	// A signature over a list that doesn't extend v1, planted as current.
+	other := testList(2, bytes.Repeat([]byte{9}, 32), testService(3, "A"))
+	sig, _ := signList(ctx, secretSigner(key), other)
+	b.set("v1/services.json.sig", sig)
+	if err := publishList(ctx, b, "bucket", k, nil, other); err == nil || !strings.Contains(err.Error(), "restore the pair") || len(f.signs) != 1 {
+		t.Fatalf("%v, %d signs", err, len(f.signs))
+	}
+	if !bytes.Equal(b.objs["v1/services.json"].data, v1) {
+		t.Fatal("the current list moved")
+	}
+}
+
+// An interrupted flag day (the new key's signature written, the list
+// not): the rerun needs no old key, and is refused with it; resuming is
+// judged under the new key only.
+func TestFlagDayInterrupted(t *testing.T) {
+	ctx := context.Background()
+	old, nw := testKey("old"), testKey("new")
+	f := newFakeKMS(nw)
+	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(nw))
+	b := newFakeS3()
+	v1 := testList(1, make([]byte, 32), testService(3, "A"))
+	if err := publishList(ctx, b, "bucket", secretSigner(old), nil, v1); err != nil {
+		t.Fatal(err)
+	}
+	h1 := sha256.Sum256(v1)
+	v2 := testList(2, h1[:], testService(3, "A"))
+	// The old key's own interrupted publish of v2: not a resume under the
+	// new key, and the published pair doesn't verify under the old key.
+	oldSig, _ := signList(ctx, secretSigner(old), v2)
+	b.set("v1/services.json.sig", oldSig)
+	if err := publishList(ctx, b, "bucket", k, pub(old), v2); err == nil || !strings.Contains(err.Error(), "restore the pair") || len(f.signs) != 0 {
+		t.Fatalf("an old-key interrupted publish: %v, %d signs", err, len(f.signs))
+	}
+	// The new key's signature of v2 written, the list not.
+	newSig, _ := signList(ctx, secretSigner(nw), v2)
+	b.set("v1/services.json.sig", newSig)
+	if err := publishList(ctx, b, "bucket", k, pub(old), v2); err == nil || !strings.Contains(err.Error(), "only for the flag day") {
+		t.Fatalf("the rerun with the old key: %v", err)
+	}
+	if err := publishList(ctx, b, "bucket", k, nil, v2); err != nil || len(f.signs) != 0 {
+		t.Fatalf("the rerun: %v, %d signs", err, len(f.signs))
+	}
+	if !bytes.Equal(b.objs["v1/services.json"].data, v2) {
+		t.Fatal("v2 not published")
+	}
+}
