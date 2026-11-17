@@ -96,6 +96,34 @@ A failed run is published to the alert topic, and a successful one puts
 a heartbeat whose alarm fires after 3 hours without one ("Deployment",
 step 6).
 
+**The service list's Rekor log:** with `-all`,
+`-list-anchor-pub <base64 SPKI> -first-logged <version>` (both, or
+neither) also check that every version from the first logged one on has
+a bundle that verifies under that key for its bytes, and that no bundle
+sits past the current version (VOTES-SITE §7). The report's
+`services.log` says `from version <n>` and `services.logged` how many
+bundles verified, or `not pinned`. The `monitor` workflow takes both from
+`list_anchor_pub` and `first_logged` in its own matrix, pinned by PR on
+each environment's first publish with `-kms`; until then it warns on
+staging and fails on production once its site key is set
+(`log_required`). `-list-anchor-pub` must
+be a P-256 key's SubjectPublicKeyInfo and `-first-logged` a decimal
+version from 1; a pin past the real first logged version (the version
+before it has a bundle) is a mismatch. A `-first-logged` past the current
+version is an error unless `-first-logged-pending` is given (the
+workflow's `log_pending`), which is only for the flag day: its pin PR,
+merged before the publish, sets `first_logged` to the version about to be
+published with `log_pending: true` and staging's `log_required: true`;
+the next PR, after the publish, removes `log_pending`. Between the
+publish and that PR's merge, each hourly run fails with "is published,
+but the pin is still pending": expected, and the reason to merge the
+follow-up promptly.
+
+**Production's site key** is a repository variable today
+(`VOTES_PROD_SITE_KEY`); at production's launch, pin it in the workflow's
+matrix (`default_key`) instead, by PR, as staging's is, along with its
+list anchor key.
+
 **The trusted root:** Sigstore's, for `-sigstore` (`production` by
 default), fetched through its TUF repository, or, if that fails, the one
 embedded in the build, provided it is at most 90 days old
@@ -191,10 +219,12 @@ has a default.
    Before anything is signed it checks:
    - the key's public key is `-list-anchor-pub` (its SubjectPublicKeyInfo,
      base64). **Take it from an independent pin**, the monitor's
-     configuration (task 4). The first time, print it with
+     `list_anchor_pub` in `.github/workflows/monitor.yml`. The first
+     time, print it with
      `./votesctl list-anchor-key -kms <ListAnchorKeyArn>` (as the publish
-     role) and pin it there, with the owner's go, before the first
-     publish;
+     role) and pin it there by PR, with `first_logged` set to the version
+     about to be published and `log_pending: true` (removed by a PR after
+     the publish), with the owner's go, before the first publish;
    - `-sigstore` is the stack's: the key's tag `vettid:sigstore`, which
      the stack sets to its `sigstore` (a change of the tag is watched).
      **On this refusal, don't change `-sigstore` to match the tag**: an
@@ -217,7 +247,7 @@ has a default.
    that publish is emailed twice); and if Rekor had already accepted the
    entry (the failure came after it: a lost answer, the bundle's check,
    or its write), the list anchor key signs again too, and Rekor holds a
-   second entry for the same list (the monitor is to match entries by
+   second entry for the same list (a search of entries is to match them by
    the list's SHA-256, so that is no mismatch). `-secret` doesn't log (it
    goes after the flag day), and it is refused when the file's version,
    or the version before it, has a bundle; nor can it publish over a
@@ -386,14 +416,21 @@ another.
   CloudFormation update, or in calls quicker than the watch reports (a
   filter policy on a subscription, then disabling the alarms' actions),
   can sign unseen until the change is noticed. Each list is logged in
-  Rekor (task 3 of GC #12646); once task 4 is in, the log will be checked
-  hourly from outside AWS, which will catch a list signed but not
-  logged. **Production waits for
+  Rekor (task 3 of GC #12646), and the monitor checks hourly, from
+  outside AWS, that the current list and every kept version from the
+  first logged one on have their entries at the time of the check
+  (VOTES-SITE §7). It doesn't catch a list served between two runs and
+  then removed with no kept copy, nor a bundle made after the fact by
+  someone who can sign with the list anchor key (its Rekor time isn't
+  compared with when the list was served). A list signed and logged but served somewhere other than
+  this site needs a search of Rekor under the list anchor key, which is
+  its own task, designed first (GC #12980). **Production waits for
   the cross-account forward** (the owner's choice c, GC #12690): every
   watched event also sent to the management account, where the staging
   or production account's administrators can't silence it, before a
   production key signs anything. A heartbeat that proves the feed is
-  alive comes with the monitor (task 4).
+  alive (a scheduled watched call, and an alarm when its line is
+  missing) is its own task, not yet built.
 - **The publisher is a permission set of its own** (GC #12713). Before
   the first deploy, the owner creates in IAM Identity Center a permission
   set (for example `VettIDVotesPublisher`) whose only permission is an

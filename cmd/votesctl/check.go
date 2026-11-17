@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,9 +45,24 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	all := fs.Bool("all", false, "check the service list's chain and every proposal the index and the archive list")
 	since := fs.String("since", firstMonth, "with -all: the first archive month read (YYYY-MM)")
 	ackFile := fs.String("acknowledged", "", "a file of acknowledged partial uploads (docs/VOTES-SITE.md §7)")
-	if fs.Parse(args) != nil || *all != (fs.NArg() == 0) || fs.NArg() > 1 {
-		fmt.Fprintln(stderr, "usage: votesctl check [-all [-since YYYY-MM] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] [-acknowledged <file>]")
+	anchorPub := fs.String("list-anchor-pub", "", "with -all: the list anchor key's SubjectPublicKeyInfo (base64), pinned; with -first-logged, every version from it on must have its Rekor bundle")
+	firstLogged := fs.String("first-logged", "", "with -all and -list-anchor-pub: the first version of the service list that was logged in Rekor (decimal), pinned")
+	pending := fs.Bool("first-logged-pending", false, "with -first-logged: it isn't published yet (only between the flag day's pin and its publish): it may be the next version")
+	usageLine := "usage: votesctl check [-all [-since YYYY-MM] [-list-anchor-pub <base64> -first-logged <version> [-first-logged-pending]] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] [-acknowledged <file>]"
+	if fs.Parse(args) != nil || *all != (fs.NArg() == 0) || fs.NArg() > 1 ||
+		(*anchorPub == "") != (*firstLogged == "") || (*anchorPub != "" && !*all) || (*pending && *anchorPub == "") {
+		fmt.Fprintln(stderr, usageLine)
 		return exitUsage
+	}
+	var logPin *listLogPin
+	if *anchorPub != "" {
+		pin, err := parseLogPin(*anchorPub, *firstLogged)
+		if err != nil {
+			fmt.Fprintln(stderr, "votesctl:", err)
+			return exitUsage
+		}
+		pin.pending = *pending
+		logPin = pin
 	}
 	var acks []site.Acknowledgement
 	anchors, err := anchorsFor(*instance, *rootFile)
@@ -58,7 +77,7 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		c := noRedirects()
 		fetch := httpFetcher(*base, c)
 		if *all {
-			ok, err = checkAll(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, *since, acks, time.Now())
+			ok, err = checkAll(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, *since, acks, logPin, time.Now())
 		} else {
 			ok, err = checkVote(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, fs.Arg(0), acks, time.Now())
 		}
@@ -296,10 +315,60 @@ type allReport struct {
 }
 
 type servicesOut struct {
-	Version    int64    `json:"version"`
-	Checked    int      `json:"checked"`
+	Version int64 `json:"version"`
+	Checked int   `json:"checked"`
+	// Log is the list's Rekor log: "not pinned" when check ran without
+	// -list-anchor-pub and -first-logged, else "from version <n>", with
+	// " (pending: not published yet)" while pinned pending and ", none
+	// logged yet" when no bundle was checked; Logged is the bundles
+	// verified.
+	Log        string   `json:"log"`
+	Logged     int      `json:"logged"`
 	Mismatches []string `json:"mismatches,omitempty"`
 	Error      string   `json:"error,omitempty"`
+}
+
+// listLogPin is check -all's pins for the list's Rekor log.
+type listLogPin struct {
+	spki    []byte
+	first   int64
+	pending bool
+}
+
+// listLogFor is the chain walk's list log for the pins, on anchors (the
+// run's trusted root), and how the report names it.
+func listLogFor(anchors site.BundleVerifier, pin *listLogPin) (*site.ListLog, string) {
+	if pin == nil {
+		return nil, "not pinned"
+	}
+	desc := fmt.Sprintf("from version %d", pin.first)
+	if pin.pending {
+		desc += " (pending: not published yet)"
+	}
+	return &site.ListLog{Anchors: anchors, SPKI: pin.spki, First: pin.first, Pending: pin.pending}, desc
+}
+
+// parseLogPin checks the pins as given, so that a typo fails at once, not
+// only once a bundle is checked: the key an ECDSA P-256
+// SubjectPublicKeyInfo in strict base64, the version decimal, from 1.
+func parseLogPin(spkiB64, first string) (*listLogPin, error) {
+	spki, err := base64.StdEncoding.Strict().DecodeString(spkiB64)
+	if err == nil {
+		var k any
+		if k, err = x509.ParsePKIXPublicKey(spki); err == nil {
+			if ec, ok := k.(*ecdsa.PublicKey); !ok || ec.Curve != elliptic.P256() {
+				err = errors.New("not P-256")
+			}
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("-list-anchor-pub is the list anchor key's SubjectPublicKeyInfo, an ECDSA P-256 key in base64, as votesctl list-anchor-key prints it (%v)", err)
+	}
+	v, err := strconv.ParseInt(first, 10, 64)
+	if err != nil || v < 1 {
+		return nil, errors.New("-first-logged is a version, in decimal, from 1")
+	}
+	return &listLogPin{spki: spki, first: v}, nil
 }
 
 // errChecksFailed is check -all's error when a check failed somewhere;
@@ -313,7 +382,7 @@ var errChecksFailed = errors.New("checks failed: see the report's errors")
 // failed, or the index or an archive month couldn't be read (the
 // report is still written, naming each).
 func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, modified func(context.Context, string) (time.Time, error),
-	anchors *site.Anchors, siteKeyB64, since string, acks []site.Acknowledgement, now time.Time) (ok bool, err error) {
+	anchors *site.Anchors, siteKeyB64, since string, acks []site.Acknowledgement, pin *listLogPin, now time.Time) (ok bool, err error) {
 	key, err := decodeSiteKey(siteKeyB64)
 	if err != nil {
 		return false, err
@@ -323,11 +392,16 @@ func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, modified fun
 		return false, errors.New("-since: a month, YYYY-MM")
 	}
 	out := allReport{TrustedRoot: anchors.RootSource(), Months: []string{}, Proposals: []report{}}
-	if c, err := site.CheckServiceChain(ctx, fetch, key, now, modified); err != nil {
+	lg, logDesc := listLogFor(anchors, pin)
+	out.Services.Log = logDesc
+	if c, err := site.CheckServiceChainLogged(ctx, fetch, key, now, modified, lg); err != nil {
 		out.Services.Error = err.Error()
 		out.Errors++
 	} else {
-		out.Services = servicesOut{Version: c.Version, Checked: c.Checked, Mismatches: c.Mismatches}
+		if lg != nil && c.Logged == 0 {
+			logDesc += ", none logged yet"
+		}
+		out.Services = servicesOut{Version: c.Version, Checked: c.Checked, Log: logDesc, Logged: c.Logged, Mismatches: c.Mismatches}
 	}
 
 	// The proposals: the index's, then each month's archive.
