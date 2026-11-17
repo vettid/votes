@@ -37,6 +37,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -157,6 +158,9 @@ func publish(ctx context.Context, a publishArgs) error {
 	if a.kms != "" && (a.siteKey == "" || a.watch == "") {
 		return errors.New("-kms needs -site-key (the site's public key) and -watch-topics (the key watch's two topics)")
 	}
+	if a.kms != "" && !kmsKeyARN.MatchString(a.kms) {
+		return errors.New("-kms takes the site key's ARN (arn:aws:kms:<region>:<account>:key/<id>, the stack's SiteSigningKeyArn), not an alias or a key id")
+	}
 	raw, err := os.ReadFile(a.in)
 	if err != nil {
 		return err
@@ -165,34 +169,31 @@ func publish(ctx context.Context, a publishArgs) error {
 	if err != nil {
 		return err
 	}
-	var signer listSigner
 	if a.secret != "" {
 		k, err := siteKey(ctx, a.secret)
 		if err != nil {
 			return err
 		}
-		signer = secretSigner(k)
-	} else {
-		var expect ed25519.PublicKey
-		if a.siteKey != "" {
-			if expect, err = decodeSiteKey(a.siteKey); err != nil {
-				return err
-			}
-		}
-		// The watch first: a publish nobody would be told of is refused
-		// before anything is signed.
-		var topics []string
-		if a.watch != "" {
-			topics = strings.Split(a.watch, ",")
-		}
-		if err := checkWatch(ctx, sns.NewFromConfig(cfg), topics); err != nil {
-			return err
-		}
-		if signer, err = newKMSSigner(ctx, kms.NewFromConfig(cfg), a.kms, expect); err != nil {
-			return err
-		}
+		return publishList(ctx, s3.NewFromConfig(cfg), a.bucket, secretSigner(k), raw)
+	}
+	signer, err := kmsPublishSigner(ctx, a, kms.NewFromConfig(cfg), sns.NewFromConfig(cfg))
+	if err != nil {
+		return err
 	}
 	return publishList(ctx, s3.NewFromConfig(cfg), a.bucket, signer, raw)
+}
+
+// kmsPublishSigner checks the key watch, then the KMS key: a publish
+// nobody would be told of is refused before anything is signed.
+func kmsPublishSigner(ctx context.Context, a publishArgs, k kmsAPI, n snsAPI) (listSigner, error) {
+	expect, err := decodeSiteKey(a.siteKey)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkWatch(ctx, n, strings.Split(a.watch, ",")); err != nil {
+		return nil, err
+	}
+	return newKMSSigner(ctx, k, a.kms, expect)
 }
 
 // publishList signs raw and publishes it on c's bucket (publish's work,
@@ -202,20 +203,27 @@ func publishList(ctx context.Context, c *s3.Client, bucket string, key listSigne
 	if err != nil {
 		return err
 	}
-	sig, err := signList(ctx, key, data)
-	if err != nil {
-		return err
-	}
 	pub := key.Public()
-	next, err := site.ParseServiceList(data, sig, pub)
-	if err != nil {
-		return err
-	}
 	cur, err := get(ctx, c, bucket, "v1/services.json")
 	if err != nil {
 		return err
 	}
 	curSig, err := get(ctx, c, bucket, "v1/services.json.sig")
+	if err != nil {
+		return err
+	}
+	// A list the published one refuses is refused before it is signed: a
+	// signature with the site key is emailed and alarmed (README "The
+	// watch"), so none is made for a list that won't be published. The
+	// same checks run again, on the signed list, below.
+	if err := preCheck(cur, curSig, data, pub); err != nil {
+		return err
+	}
+	sig, err := signList(ctx, key, data)
+	if err != nil {
+		return err
+	}
+	next, err := site.ParseServiceList(data, sig, pub)
 	if err != nil {
 		return err
 	}
@@ -282,6 +290,32 @@ func publishList(ctx context.Context, c *s3.Client, bucket string, key listSigne
 		return err
 	}
 	fmt.Printf("published service list version %d (%d services)\n", next.Version, len(next.Services))
+	return nil
+}
+
+// preCheck refuses, before signing, a new list (not the published one)
+// that doesn't extend a published list that verifies, or isn't its next
+// version. Anything else (a first list, an interrupted publish, a
+// published pair that doesn't verify) is left to the checks after
+// signing.
+func preCheck(cur, curSig object, data []byte, pub ed25519.PublicKey) error {
+	if cur.data == nil || curSig.data == nil || bytes.Equal(cur.data, data) {
+		return nil
+	}
+	prev, err := site.ParseServiceList(cur.data, curSig.data, pub)
+	if err != nil {
+		return nil // an interrupted publish of data, or a broken pair: decided below
+	}
+	var draft site.ServiceList
+	if err := json.Unmarshal(data, &draft); err != nil {
+		return fmt.Errorf("the service list: %w", err)
+	}
+	if err := site.Extends(prev, cur.data, &draft); err != nil {
+		return err
+	}
+	if draft.Version != prev.Version+1 {
+		return fmt.Errorf("the next version is %d", prev.Version+1)
+	}
 	return nil
 }
 

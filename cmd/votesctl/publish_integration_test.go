@@ -210,3 +210,57 @@ func TestPublishServices(t *testing.T) {
 		t.Fatalf("a list without its signature: %v", err)
 	}
 }
+
+// publish-services through the KMS signer (a fake KMS with the same key):
+// the same bytes as the secret's key; a list the published one refuses
+// is refused before KMS signs it; a rerun of the published list resumes.
+func TestPublishServicesKMS(t *testing.T) {
+	ep := os.Getenv("VOTES_IT_LOCALSTACK")
+	if ep == "" {
+		t.Skip("set VOTES_IT_LOCALSTACK")
+	}
+	ctx := context.Background()
+	c := s3.New(s3.Options{Region: "us-east-1", BaseEndpoint: aws.String(ep), UsePathStyle: true,
+		Credentials: credentials.NewStaticCredentialsProvider("test", "test", "")})
+	bucket := fmt.Sprintf("votesctl-it-kms-%d", time.Now().UnixNano())
+	if _, err := c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatal(err)
+	}
+	key := testKey("votesctl kms test site key")
+	f := newFakeKMS(key)
+	k, err := newKMSSigner(ctx, f, testKeyARN, pub(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ik := bytes.Repeat([]byte{4}, 32)
+	svc := site.Service{ServiceID: site.ServiceID(ik), Name: "K", IKs: [][]byte{ik}, AnchorKeys: []site.AnchorKey{}}
+	list := func(version int64, previous []byte) []byte {
+		b, _ := json.Marshal(&site.ServiceList{V: 1, Version: version, Previous: previous, Services: []site.Service{svc}})
+		b, _ = vote.Canonicalize(b)
+		return b
+	}
+	v1 := list(1, make([]byte, 32))
+	if err := publishList(ctx, c, bucket, k, v1); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.signs) != 1 {
+		t.Fatalf("%d signs", len(f.signs))
+	}
+	want, _ := signList(ctx, secretSigner(key), v1)
+	if got, _ := get(ctx, c, bucket, "v1/services.json.sig"); !bytes.Equal(got.data, want) {
+		t.Fatal("the KMS signature differs from the key's own")
+	}
+	h := sha256.Sum256(v1)
+	if err := publishList(ctx, c, bucket, k, list(3, h[:])); err == nil || !strings.Contains(err.Error(), "next version is 2") {
+		t.Fatalf("a version gap: %v", err)
+	}
+	if len(f.signs) != 1 {
+		t.Fatalf("a refused list was signed: %d signs", len(f.signs))
+	}
+	if err := publishList(ctx, c, bucket, k, v1); err != nil {
+		t.Fatalf("a rerun of the published list: %v", err)
+	}
+	if err := publishList(ctx, c, bucket, k, list(2, h[:])); err != nil {
+		t.Fatal(err)
+	}
+}

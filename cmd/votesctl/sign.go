@@ -157,6 +157,12 @@ var (
 	subID       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
 
+// watchPair reports whether a and b are a stack's two key watch topics:
+// SNS topic ARNs <prefix>-key-watch and <prefix>-key-watch-b.
+func watchPair(a, b string) bool {
+	return snsTopicARN.MatchString(a) && strings.HasSuffix(a, "-key-watch") && b == a+"-b"
+}
+
 // confirmedSub reports whether arn is a confirmed subscription of topic.
 func confirmedSub(topic, arn string) bool {
 	id, ok := strings.CutPrefix(arn, topic+":")
@@ -169,13 +175,10 @@ func confirmedSub(topic, arn string) bool {
 // confirmed (README "The watch"). It fails closed: an answer it can't
 // read is a refusal.
 func checkWatch(ctx context.Context, c snsAPI, topics []string) error {
-	if len(topics) < 2 {
-		return errors.New("-watch-topics (the stack's KeyWatchTopicArn and KeyWatchTopicBArn, comma-separated) is required with -kms")
+	if len(topics) != 2 || !watchPair(topics[0], topics[1]) {
+		return errors.New("-watch-topics takes the stack's two key watch topics, KeyWatchTopicArn and KeyWatchTopicBArn (…-key-watch,…-key-watch-b), comma-separated")
 	}
 	for _, t := range topics {
-		if !snsTopicARN.MatchString(t) {
-			return fmt.Errorf("-watch-topics: %q is not an SNS topic ARN", t)
-		}
 		email := 0
 		var next *string
 		for {
@@ -187,7 +190,9 @@ func checkWatch(ctx context.Context, c snsAPI, topics []string) error {
 				if aws.ToString(s.Protocol) != "email" {
 					continue
 				}
-				email++
+				if email++; email > 1 {
+					return fmt.Errorf("the key watch topic %s has more than one email subscription: it has one, the stack's", t)
+				}
 				// A confirmed subscription's ARN is the topic's and an id; one
 				// waiting is "PendingConfirmation" (or "Deleted").
 				if arn := aws.ToString(s.SubscriptionArn); !confirmedSub(t, arn) {

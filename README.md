@@ -149,9 +149,12 @@ environment. None has a default.
    `-site-key`; it signs through KMS (`ED25519_SHA_512` over the label
    and the list's SHA-256) and checks every signature under `-site-key`
    before anything is written; and first it refuses to publish unless
-   both key watch topics have an email subscription and every one is
-   confirmed (README "The watch"), since nobody would be told of the
-   signature. To act as the publish role, add a profile and set
+   `-watch-topics` names the stack's two key watch topics (in that
+   order) and each has exactly one email subscription, confirmed
+   (README "The watch"), since nobody would be told of the signature. A
+   list the published one refuses (a version gap, a dropped service) is
+   refused before it is signed, so no signature is made, or emailed, for
+   it. To act as the publish role, add a profile and set
    `AWS_PROFILE` to it:
 
    ```ini

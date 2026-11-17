@@ -9,6 +9,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/vettid/service-vault/vote"
 	"github.com/vettid/vettid-vault/vms/suite"
+	"github.com/vettid/votes/site"
 )
 
 // Fixed test values: no real account or key.
@@ -290,7 +293,15 @@ func TestCheckWatch(t *testing.T) {
 	}{
 		{"one topic", []string{topicA}, nil, nil, "-watch-topics"},
 		{"none", nil, nil, nil, "-watch-topics"},
-		{"not an ARN", []string{topicA, "vettid-votes-staging-key-watch-b"}, nil, nil, "not an SNS topic ARN"},
+		{"the same topic twice", []string{topicA, topicA}, nil, nil, "-watch-topics"},
+		{"the other order", []string{topicB, topicA}, nil, nil, "-watch-topics"},
+		{"three", []string{topicA, topicB, topicB}, nil, nil, "-watch-topics"},
+		{"another stack's b", []string{topicA, "arn:aws:sns:us-east-1:123456789012:vettid-votes-prod-key-watch-b"}, nil, nil, "-watch-topics"},
+		{"not watch topics", []string{"arn:aws:sns:us-east-1:123456789012:alerts", "arn:aws:sns:us-east-1:123456789012:alerts-b"}, nil, nil, "-watch-topics"},
+		{"not an ARN", []string{"vettid-votes-staging-key-watch", "vettid-votes-staging-key-watch-b"}, nil, nil, "-watch-topics"},
+		{"a second email", []string{topicA, topicB}, func(m map[string][][]snstypes.Subscription) {
+			m[topicA] = [][]snstypes.Subscription{{sub(topicA, "confirmed", "email"), sub(topicA, "confirmed", "email")}}
+		}, nil, "more than one email"},
 		{"pending", []string{topicA, topicB}, func(m map[string][][]snstypes.Subscription) {
 			m[topicB] = [][]snstypes.Subscription{{sub(topicB, "PendingConfirmation", "email")}}
 		}, nil, "not confirmed"},
@@ -301,7 +312,7 @@ func TestCheckWatch(t *testing.T) {
 			m[topicA] = [][]snstypes.Subscription{{sub(topicA, topicB+":0123abcd-4567-89ab-cdef-0123456789ab", "email")}}
 		}, nil, "not confirmed"},
 		{"pending on a later page", []string{topicA, topicB}, func(m map[string][][]snstypes.Subscription) {
-			m[topicA] = [][]snstypes.Subscription{{sub(topicA, "confirmed", "email")}, {sub(topicA, "PendingConfirmation", "email")}}
+			m[topicA] = [][]snstypes.Subscription{{sub(topicA, "confirmed", "sqs")}, {sub(topicA, "PendingConfirmation", "email")}}
 		}, nil, "not confirmed"},
 		{"no email", []string{topicA, topicB}, func(m map[string][][]snstypes.Subscription) {
 			m[topicB] = nil
@@ -344,5 +355,91 @@ func TestPublishFlags(t *testing.T) {
 	}
 	if _, err := sitePublicKey(ctx, "", ""); err == nil || !strings.Contains(err.Error(), "exactly one") {
 		t.Fatal(err)
+	}
+}
+
+// A KMS publish checks the watch, then the key, before anything is signed:
+// a watch that fails means no call to KMS at all.
+func TestKMSPublishOrder(t *testing.T) {
+	ctx := context.Background()
+	key := testKey("site")
+	a := publishArgs{kms: testKeyARN, siteKey: base64Key(pub(key)), watch: topicA + "," + topicB}
+	f := newFakeKMS(key)
+	if _, err := kmsPublishSigner(ctx, a, f, &fakeSNS{err: errors.New("AuthorizationError")}); err == nil {
+		t.Fatal("a watch that can't be read")
+	}
+	if f.publicReads != 0 || len(f.signs) != 0 {
+		t.Fatalf("KMS called: %d reads, %d signs", f.publicReads, len(f.signs))
+	}
+	pending := &fakeSNS{pages: map[string][][]snstypes.Subscription{
+		topicA: {{sub(topicA, "confirmed", "email")}}, topicB: {{sub(topicB, "PendingConfirmation", "email")}}}}
+	if _, err := kmsPublishSigner(ctx, a, f, pending); err == nil || f.publicReads != 0 || len(f.signs) != 0 {
+		t.Fatalf("a pending watch: %v, %d reads, %d signs", err, f.publicReads, len(f.signs))
+	}
+	ok := &fakeSNS{pages: map[string][][]snstypes.Subscription{
+		topicA: {{sub(topicA, "confirmed", "email")}}, topicB: {{sub(topicB, "confirmed", "email")}}}}
+	s, err := kmsPublishSigner(ctx, a, f, ok)
+	if err != nil || !bytes.Equal(s.Public(), pub(key)) || len(f.signs) != 0 {
+		t.Fatalf("%v, %d signs", err, len(f.signs))
+	}
+	// A malformed -site-key is refused before any call.
+	f = newFakeKMS(key)
+	if _, err := kmsPublishSigner(ctx, publishArgs{kms: testKeyARN, siteKey: "!", watch: a.watch}, f, ok); err == nil || f.publicReads != 0 {
+		t.Fatalf("%v", err)
+	}
+}
+
+func base64Key(k ed25519.PublicKey) string { return base64.StdEncoding.EncodeToString(k) }
+
+// preCheck refuses, before signing, a new list that the published one
+// refuses; it leaves every other case to the checks after signing.
+func TestPreCheck(t *testing.T) {
+	ctx := context.Background()
+	key := testKey("site")
+	ik := bytes.Repeat([]byte{3}, 32)
+	svc := site.Service{ServiceID: site.ServiceID(ik), Name: "A", IKs: [][]byte{ik}, AnchorKeys: []site.AnchorKey{}}
+	list := func(version int64, previous []byte, services ...site.Service) []byte {
+		if services == nil {
+			services = []site.Service{}
+		}
+		b, _ := json.Marshal(&site.ServiceList{V: 1, Version: version, Previous: previous, Services: services})
+		b, _ = vote.Canonicalize(b)
+		return b
+	}
+	v1 := list(1, make([]byte, 32), svc)
+	sig1, err := signList(ctx, secretSigner(key), v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, curSig := object{data: v1, tag: "t"}, object{data: sig1, tag: "s"}
+	h := sha256.Sum256(v1)
+	for _, c := range []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"skips a version", list(3, h[:], svc), "next version is 2"},
+		{"drops a service", list(2, h[:]), "dropped"},
+		{"another previous", list(2, make([]byte, 32), svc), ""},
+	} {
+		err := preCheck(cur, curSig, c.data, pub(key))
+		if c.want == "" && err == nil || c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)) {
+			t.Errorf("%s: %v, want %q", c.name, err, c.want)
+		}
+	}
+	for _, c := range []struct {
+		name        string
+		cur, curSig object
+		data        []byte
+	}{
+		{"the next version", cur, curSig, list(2, h[:], svc)},
+		{"the first list", object{}, object{}, v1},
+		{"the published list again", cur, curSig, v1},
+		{"a pair that doesn't verify (an interrupted publish)", cur, object{data: bytes.Repeat([]byte{1}, 64)}, list(5, h[:])},
+		{"only a signature", object{}, curSig, list(5, h[:])},
+	} {
+		if err := preCheck(c.cur, c.curSig, c.data, pub(key)); err != nil {
+			t.Errorf("%s: %v", c.name, err)
+		}
 	}
 }
