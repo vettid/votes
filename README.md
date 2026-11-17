@@ -104,7 +104,11 @@ sits past the current version (VOTES-SITE §7). The report's
 `services.log` says `from version <n>` and `services.logged` how many
 bundles verified, or `not pinned`. The `monitor` workflow takes both from
 `list_anchor_pub` and `first_logged` in its own matrix, pinned by PR on
-each environment's first publish with `-kms`; until then it warns.
+each environment's first publish with `-kms`; until then it warns on
+staging and fails on production (`log_required`). `-list-anchor-pub` must
+be a P-256 key's SubjectPublicKeyInfo and `-first-logged` a decimal
+version from 1; a pin past the real first logged version (the version
+before it has a bundle) is a mismatch.
 
 **The trusted root:** Sigstore's, for `-sigstore` (`production` by
 default), fetched through its TUF repository, or, if that fails, the one
@@ -399,9 +403,12 @@ another.
   filter policy on a subscription, then disabling the alarms' actions),
   can sign unseen until the change is noticed. Each list is logged in
   Rekor (task 3 of GC #12646), and the monitor checks hourly, from
-  outside AWS, that every served list from the first logged one on has
-  its entry (VOTES-SITE §7), which catches a list signed and served but
-  not logged. A list signed and logged but served somewhere other than
+  outside AWS, that the current list and every kept version from the
+  first logged one on have their entries at the time of the check
+  (VOTES-SITE §7). It doesn't catch a list served between two runs and
+  then removed with no kept copy, nor a bundle made after the fact by
+  someone who can sign with the list anchor key (its Rekor time isn't
+  compared with when the list was served). A list signed and logged but served somewhere other than
   this site needs a search of Rekor under the list anchor key, which is
   its own task, designed first (GC #12980). **Production waits for
   the cross-account forward** (the owner's choice c, GC #12690): every

@@ -178,6 +178,19 @@ func CheckServiceChainLogged(ctx context.Context, fetch Fetcher, siteKey ed25519
 			return nil, err
 		}
 	}
+	if lg != nil && lg.First > 1 && lg.First <= current.Version+1 {
+		// Versions before the first logged one have no bundle (§3): one
+		// there means the pin is past the real first logged version, and
+		// the versions between would go unchecked.
+		pb := bundlePath(lg.First - 1)
+		b, err := fetch(ctx, pb)
+		if err != nil {
+			return nil, err
+		}
+		if b != nil {
+			rep.Mismatches = append(rep.Mismatches, "services/"+strconv.FormatInt(lg.First-1, 10)+": has a bundle, so the pinned first logged version is past the real one")
+		}
+	}
 	if lg != nil {
 		// A bundle past the current version: a list logged, not served.
 		nb := bundlePath(current.Version + 1)

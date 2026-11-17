@@ -141,4 +141,46 @@ func TestServiceChainLogPins(t *testing.T) {
 	if _, err := CheckServiceChainLogged(context.Background(), fetcher(objs), siteKey().Public().(ed25519.PublicKey), time.Now(), nil, lg); err == nil {
 		t.Fatal("no key")
 	}
+	lg = &ListLog{SPKI: testListKey, First: 1}
+	if _, err := CheckServiceChainLogged(context.Background(), fetcher(objs), siteKey().Public().(ed25519.PublicKey), time.Now(), nil, lg); err == nil {
+		t.Fatal("no verifier")
+	}
+}
+
+// A first logged version pinned past the real one: the version before it
+// has a bundle, a mismatch (else the versions between go unchecked).
+func TestServiceChainLogPinTooHigh(t *testing.T) {
+	f := loadFixture(t)
+	objs, datas := chainSite(t, f)
+	objs["v1/services/2.bundle"], objs["v1/services/3.bundle"] = fakeBundle(datas[1]), fakeBundle(datas[2])
+	if rep, err := logCheck(objs, 3, time.Now(), nil); err != nil || !has(rep.Mismatches, "services/2: has a bundle, so the pinned first logged version is past the real one") {
+		t.Fatalf("%v %+v", err, rep)
+	}
+	// Pinned from the next version while the current one is logged.
+	if rep, err := logCheck(objs, 4, time.Now(), nil); err != nil || !has(rep.Mismatches, "services/3: has a bundle") {
+		t.Fatalf("%v %+v", err, rep)
+	}
+	if rep, err := logCheck(objs, 2, time.Now(), nil); err != nil || len(rep.Mismatches) != 0 {
+		t.Fatalf("the real first: %v %+v", err, rep)
+	}
+}
+
+// An answer that isn't a 404 (an error) on any bundle fails the check: it
+// never reads as "not there".
+func TestServiceChainLogFetchErrors(t *testing.T) {
+	f := loadFixture(t)
+	objs, datas := chainSite(t, f)
+	objs["v1/services/2.bundle"], objs["v1/services/3.bundle"] = fakeBundle(datas[1]), fakeBundle(datas[2])
+	for _, p := range []string{"v1/services/3.bundle", "v1/services/4.bundle", "v1/services/1.bundle"} {
+		failing := func(ctx context.Context, path string) ([]byte, error) {
+			if path == p {
+				return nil, errors.New("403")
+			}
+			return fetcher(objs)(ctx, path)
+		}
+		lg := &ListLog{Anchors: fakeBundles{spki: testListKey}, SPKI: testListKey, First: 2}
+		if _, err := CheckServiceChainLogged(context.Background(), failing, siteKey().Public().(ed25519.PublicKey), time.Now(), nil, lg); err == nil || !strings.Contains(err.Error(), "403") {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
 }

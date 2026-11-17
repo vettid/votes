@@ -213,11 +213,19 @@ reports to AWS (**Alerts**, below).
   the current version is a list logged but never served: a mismatch,
   except in the 10 minutes after it was written (its `Last-Modified`), a
   publish in progress. A first logged version past the next one is an
-  error. Versions before the first logged one aren't checked; a version
+  error, and a bundle at the version before it (which has none, §3) is a
+  mismatch: the pin is past the real first logged version, and the
+  versions between would go unchecked. Versions before the first logged
+  one aren't otherwise checked; a version
   whose copy is missing (already a mismatch) has its bundle checked only
   once the copy is there. Until an environment's pins are set (its first
   publish with `-kms`) the report says `"log": "not pinned"` and the run
-  warns. **Not in this check:** entries in Rekor under the list anchor key
+  warns; production's run fails without them (it has its KMS keys from
+  its first deploy). The check holds at the time of each run: a list
+  served between two runs and removed with no kept copy leaves nothing
+  to check, and a bundle's Rekor time isn't compared with when its list
+  was served, so a bundle made after the fact with the list anchor key
+  passes. **Not in this check:** entries in Rekor under the list anchor key
   that are no kept version's (a list signed but served elsewhere); that
   search is its own task, designed first (the owner's a, GC #12980).
 - **Every proposal** in `index.json` and in the archive's months, from

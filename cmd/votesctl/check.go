@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,21 +46,21 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	since := fs.String("since", firstMonth, "with -all: the first archive month read (YYYY-MM)")
 	ackFile := fs.String("acknowledged", "", "a file of acknowledged partial uploads (docs/VOTES-SITE.md §7)")
 	anchorPub := fs.String("list-anchor-pub", "", "with -all: the list anchor key's SubjectPublicKeyInfo (base64), pinned; with -first-logged, every version from it on must have its Rekor bundle")
-	firstLogged := fs.Int64("first-logged", 0, "with -all and -list-anchor-pub: the first version of the service list that was logged in Rekor, pinned")
+	firstLogged := fs.String("first-logged", "", "with -all and -list-anchor-pub: the first version of the service list that was logged in Rekor (decimal), pinned")
 	usageLine := "usage: votesctl check [-all [-since YYYY-MM] [-list-anchor-pub <base64> -first-logged <version>] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] [-acknowledged <file>]"
 	if fs.Parse(args) != nil || *all != (fs.NArg() == 0) || fs.NArg() > 1 ||
-		(*anchorPub == "") != (*firstLogged == 0) || (*anchorPub != "" && !*all) {
+		(*anchorPub == "") != (*firstLogged == "") || (*anchorPub != "" && !*all) {
 		fmt.Fprintln(stderr, usageLine)
 		return exitUsage
 	}
 	var logPin *listLogPin
 	if *anchorPub != "" {
-		spki, err := base64.StdEncoding.Strict().DecodeString(*anchorPub)
-		if err != nil || len(spki) == 0 || *firstLogged < 1 {
-			fmt.Fprintln(stderr, "votesctl: -list-anchor-pub is the list anchor key's SubjectPublicKeyInfo in base64 (votesctl list-anchor-key), and -first-logged a version from 1")
+		pin, err := parseLogPin(*anchorPub, *firstLogged)
+		if err != nil {
+			fmt.Fprintln(stderr, "votesctl:", err)
 			return exitUsage
 		}
-		logPin = &listLogPin{spki: spki, first: *firstLogged}
+		logPin = pin
 	}
 	var acks []site.Acknowledgement
 	anchors, err := anchorsFor(*instance, *rootFile)
@@ -324,6 +328,29 @@ type servicesOut struct {
 type listLogPin struct {
 	spki  []byte
 	first int64
+}
+
+// parseLogPin checks the pins as given, so that a typo fails at once, not
+// only once a bundle is checked: the key an ECDSA P-256
+// SubjectPublicKeyInfo in strict base64, the version decimal, from 1.
+func parseLogPin(spkiB64, first string) (*listLogPin, error) {
+	spki, err := base64.StdEncoding.Strict().DecodeString(spkiB64)
+	if err == nil {
+		var k any
+		if k, err = x509.ParsePKIXPublicKey(spki); err == nil {
+			if ec, ok := k.(*ecdsa.PublicKey); !ok || ec.Curve != elliptic.P256() {
+				err = errors.New("not P-256")
+			}
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("-list-anchor-pub is the list anchor key's SubjectPublicKeyInfo, an ECDSA P-256 key in base64, as votesctl list-anchor-key prints it (%v)", err)
+	}
+	v, err := strconv.ParseInt(first, 10, 64)
+	if err != nil || v < 1 {
+		return nil, errors.New("-first-logged is a version, in decimal, from 1")
+	}
+	return &listLogPin{spki: spki, first: v}, nil
 }
 
 // errChecksFailed is check -all's error when a check failed somewhere;

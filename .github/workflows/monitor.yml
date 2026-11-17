@@ -20,7 +20,8 @@ name: monitor
 # reviewed PR, never a repository variable. Both are set by a PR on the
 # environment's first publish with -kms (staging: the flag day, GC
 # #12646); until then the log isn't checked, with a warning, and one set
-# without the other fails the run.
+# without the other fails the run. Production (log_required) has its KMS
+# keys from its first deploy, so its check fails without both pins.
 #
 # Partial uploads the site can never complete are listed, each by PR with
 # its reason, in monitor/acknowledged-<env>.json (docs/VOTES-SITE.md §7).
@@ -75,6 +76,7 @@ jobs:
             default_key: c4dqg2ssGVylbO9Xnpdv4zopmzx9S++4KgxMWOyhXJQ=
             list_anchor_pub: ""
             first_logged: ""
+            log_required: false # until the flag day's pins
             role_var: VOTES_STAGING_MONITOR_ROLE_ARN
             topic_var: VOTES_STAGING_ALERT_TOPIC_ARN
           - env: prod
@@ -84,6 +86,9 @@ jobs:
             default_key: ""
             list_anchor_pub: ""
             first_logged: ""
+            # Production has its KMS keys from its first deploy: once its
+            # site is checked at all, its log must be too.
+            log_required: true
             role_var: VOTES_PROD_MONITOR_ROLE_ARN
             topic_var: VOTES_PROD_ALERT_TOPIC_ARN
     defaults:
@@ -114,6 +119,7 @@ jobs:
           KEY_VAR: ${{ matrix.key_var }}
           LIST_ANCHOR_PUB: ${{ matrix.list_anchor_pub }}
           FIRST_LOGGED: ${{ matrix.first_logged }}
+          LOG_REQUIRED: ${{ matrix.log_required }}
         run: |
           if [ -z "$SITE_KEY" ]; then
             echo "::warning::$SITE not checked: set the repository variable $KEY_VAR to its site key"
@@ -122,8 +128,9 @@ jobs:
           log=()
           if [ -n "$LIST_ANCHOR_PUB" ] && [ -n "$FIRST_LOGGED" ]; then
             log=(-list-anchor-pub "$LIST_ANCHOR_PUB" -first-logged "$FIRST_LOGGED")
-          elif [ -n "$LIST_ANCHOR_PUB$FIRST_LOGGED" ]; then
-            echo "::error::$SITE: list_anchor_pub and first_logged are pinned together (monitor.yml)"
+          elif [ -n "$LIST_ANCHOR_PUB$FIRST_LOGGED" ] || [ "$LOG_REQUIRED" = "true" ]; then
+            echo "::error::$SITE: list_anchor_pub and first_logged must both be pinned in monitor.yml (required for this environment: $LOG_REQUIRED)"
+            echo "code=1" >> "$GITHUB_OUTPUT"
             exit 1
           else
             echo "::warning::$SITE: the service list's Rekor log isn't checked: its list anchor key isn't pinned in monitor.yml yet"
