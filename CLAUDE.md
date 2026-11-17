@@ -18,6 +18,16 @@ member data and no sessions, and keeps no record of readers.
 - Logs carry ids, types, sizes and error codes, never client addresses
   or document contents.
 
+## No backward compatibility before production users
+
+(Owner, 2026-11-17; Ground Control rule 3 once adopted.) VettID has no users yet; staging runs only the current release of every part, and compatibility work waits for the production-launch checklist.
+
+- The staging votes site starts fresh under its KMS key; no migration from the old key. The staging flag day is replaced by this fresh start.
+- Don't build, test or review rollback, downgrade or older-release behavior; staging runs only the current release of every part.
+- Review briefs say so, and reviewers don't raise findings about older releases.
+- Staging data and keys may be reset instead of migrated, with the owner's go for anything public or permanent (published ballots are public and permanent).
+- Never weakened: signature and Rekor verification, write-once behavior, fail-closed behavior, the reviews themselves; version markers stay.
+
 ## Coordination rules
 
 1. **Scope.** Work in this repository. Read service-vault, vettid-vault,
