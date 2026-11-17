@@ -250,8 +250,9 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, lg
 	switch {
 	case resuming && bytes.Equal(cur.data, data):
 		// Already the current list: only its history is checked, and
-		// written if missing (the list published before history was kept,
-		// or before lists were logged: it is logged now).
+		// written if missing (after an interrupted publish). Its bundle is
+		// written before the list moves, so one is missing here only if it
+		// was removed (a servicesRepair): it is logged again now.
 		var have []byte
 		if lg != nil {
 			if have, err = keptBundle(ctx, c, bucket, lg, next.Version, data); err != nil {

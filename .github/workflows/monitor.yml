@@ -138,7 +138,7 @@ jobs:
             # set and nothing else is pinned: an environment not deployed.
             if [ -z "$KEY_VAR" ] || [ -n "$LIST_ANCHOR_PUB$FIRST_LOGGED" ]; then
               echo "::error::$SITE: no site key, though its key is pinned in monitor.yml or its log is: the check can't run"
-              echo "code=1" >> "$GITHUB_OUTPUT"
+              echo "code=config" >> "$GITHUB_OUTPUT"
               exit 1
             fi
             echo "::warning::$SITE not checked: set the repository variable $KEY_VAR to its site key"
@@ -149,7 +149,7 @@ jobs:
             log=(-list-anchor-pub "$LIST_ANCHOR_PUB" -first-logged "$FIRST_LOGGED")
           elif [ -n "$LIST_ANCHOR_PUB$FIRST_LOGGED" ] || [ "$LOG_REQUIRED" = "true" ]; then
             echo "::error::$SITE: list_anchor_pub and first_logged must both be pinned in monitor.yml (required for this environment: $LOG_REQUIRED)"
-            echo "code=1" >> "$GITHUB_OUTPUT"
+            echo "code=config" >> "$GITHUB_OUTPUT"
             exit 1
           else
             echo "::warning::$SITE: the service list's Rekor log isn't checked: its list anchor key isn't pinned in monitor.yml yet"
@@ -191,6 +191,7 @@ jobs:
           case "$CODE" in
             3) what="mismatches (votesctl check exit 3)" ;;
             1) what="a check failed (votesctl check exit 1)" ;;
+            config) what="the monitor is misconfigured (no site key or log pins; votesctl did not run)" ;;
             "") what="the run failed before the check" ;;
             *) what="votesctl check exit $CODE" ;;
           esac

@@ -134,8 +134,6 @@ service's identity and anchor keys, which the new list keeps. From here
 until step 9, uploads are refused (there is no list), and the hourly
 monitor fails, alerting the alarm topic (expected).
 
-The monitor is red from step 3 until step 9: expected.
-
 ## 4. Redeploy: no repair, the new site key (go 3)
 
 As the publish role (`AWS_PROFILE=votes-publish-staging`):
