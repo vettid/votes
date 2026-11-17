@@ -357,9 +357,9 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
         Resource: [obj('v1/services.json'), obj('v1/services.json.sig'), obj('v1/services/*')] },
       // Unconditioned, so that a missing copy is a 404 (all documents are public).
       { Sid: 'ServiceListList', Effect: 'Allow', Action: 's3:ListBucket', Resource: { 'Fn::GetAtt': [bucketLogical, 'Arn'] } },
-      { Sid: 'KeyWatchSubscriptions', Effect: 'Allow', Action: 'sns:ListSubscriptionsByTopic', Resource: [{ Ref: topicA }, { Ref: topicB }] },
-      { Sid: 'KeyWatchSubscriptionAttributes', Effect: 'Allow', Action: 'sns:GetSubscriptionAttributes',
-        Resource: [{ Ref: logical('AWS::SNS::Subscription', /^KeyWatchEmail(?!B)/) }, { Ref: logical('AWS::SNS::Subscription', /^KeyWatchEmailB/) }] },
+      // On the topics: SNS authorizes both against the topic.
+      { Sid: 'KeyWatchSubscriptions', Effect: 'Allow', Action: ['sns:ListSubscriptionsByTopic', 'sns:GetSubscriptionAttributes'],
+        Resource: [{ Ref: topicA }, { Ref: topicB }] },
     ] });
   });
 
@@ -405,13 +405,13 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       expect(x.DeletionPolicy).toBe('Retain');
       expect(x.Properties.EventPattern['detail-type']).toEqual(['AWS API Call via CloudTrail']);
     }
-    expect(alts()).toHaveLength(13);
+    expect(alts()).toHaveLength(14);
   });
 
   // Each pattern, its ARNs resolved at realistic lengths, stays under
   // EventBridge's default quota (a longer one fails the deploy).
   test('each pattern fits EventBridge\'s quota once resolved', () => {
-    for (const envName of ['staging', 'prod']) {
+    for (const envName of ['staging', 'prod', 'production']) {
       const tpl = Template.fromStack(stack(envName, 'staging', {
         alarmTopicArn: 'arn:aws:sns:us-east-1:123456789012:vettid-org-staging-vault-alerts-topic-0123456789' })).toJSON();
       const res = tpl.Resources;
@@ -506,6 +506,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       { ...cfn, requestParameters: { stackName: ['VotesSite-staging', { prefix: { 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' },
         ':cloudformation:us-east-1:123456789012:stack/VotesSite-staging/']] } }] } },
       { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stackRefactor] }, // any refactor
+      { eventSource: ['cloudformation.amazonaws.com'], eventName: ['ExecuteChangeSet'], requestParameters: { stackName: [{ exists: false }] } },
     ]);
   });
 
@@ -523,7 +524,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
           '$.detail.userIdentity.type', '$.detail.userIdentity.accessKeyId', '$.detail.eventID',
           '$.detail.requestParameters.name', '$.detail.requestParameters.topicArn', '$.detail.requestParameters.subscriptionArn',
           '$.detail.requestParameters.alarmName', '$.detail.requestParameters.stackName', '$.detail.requestParameters.alarmNames',
-          '$.detail.requestParameters.policyName', '$.detail.requestParameters.changeSetName']));
+          '$.detail.requestParameters.policyName', '$.detail.requestParameters.changeSetName', '$.detail.requestParameters.trailName']));
         for (const pth of paths) expect(pth).not.toMatch(/userIdentity\.(arn|principalId|userName)$|sessionName|email/i);
       }
       // The shape a log group target needs: {"timestamp": <time>, "message": "..."}.

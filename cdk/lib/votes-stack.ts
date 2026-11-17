@@ -553,7 +553,6 @@ export class VotesStack extends cdk.Stack {
     // Two watch topics, each with its own subscription, so that a
     // subscription removed or a topic changed on one is told on the other
     // directly, whatever state the alarms are in.
-    const subscriptions: sns.Subscription[] = [];
     const watchTopics = ['', '-b'].map((suffix, i) => {
       const topic = new sns.Topic(this, i === 0 ? 'KeyWatchTopic' : 'KeyWatchTopicB', {
         topicName: `${prefix}-key-watch${suffix}`,
@@ -565,7 +564,6 @@ export class VotesStack extends cdk.Stack {
         topic, protocol: sns.SubscriptionProtocol.EMAIL, endpoint: props.keyWatchEmail,
       });
       sub.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
-      subscriptions.push(sub);
       // The alarms below publish here too.
       topic.addToResourcePolicy(new iam.PolicyStatement({
         sid: 'Alarms', principals: [new iam.ServicePrincipal('cloudwatch.amazonaws.com')], actions: ['sns:Publish'],
@@ -576,12 +574,10 @@ export class VotesStack extends cdk.Stack {
     // For votesctl (GC #12646, task 2) to check before a publish that both
     // subscriptions are confirmed, by an authenticated confirmation (it
     // reads them; it can't change them).
+    // SNS authorizes both against the topic (its only resource type).
     publish.addToPolicy(new iam.PolicyStatement({
-      sid: 'KeyWatchSubscriptions', actions: ['sns:ListSubscriptionsByTopic'], resources: watchTopics.map((t) => t.topicArn),
-    }));
-    publish.addToPolicy(new iam.PolicyStatement({
-      sid: 'KeyWatchSubscriptionAttributes', actions: ['sns:GetSubscriptionAttributes'],
-      resources: subscriptions.map((sub) => (sub.node.defaultChild as sns.CfnSubscription).ref),
+      sid: 'KeyWatchSubscriptions', actions: ['sns:ListSubscriptionsByTopic', 'sns:GetSubscriptionAttributes'],
+      resources: watchTopics.map((t) => t.topicArn),
     }));
     const alarmTopicArn = props.alarmTopicArn as string;
     const alarmTopic = sns.Topic.fromTopicArn(this, 'KeyUseTopic', alarmTopicArn);
@@ -609,12 +605,12 @@ export class VotesStack extends cdk.Stack {
         { eventSource: ['kms.amazonaws.com'], eventName: [...KEY_USE_EVENTS],
           resources: { ARN: [site.keyArn, listAnchor.keyArn, aliasArn(siteAlias), aliasArn(anchorAlias)] } },
         { eventSource: ['iam.amazonaws.com'], eventName: [...PUBLISH_ROLE_EVENTS], requestParameters: { roleName: [publish.roleName] } },
-        // This stack: one update can change every part of the watch. An
-        // ExecuteChangeSet named by ARN alone follows its CreateChangeSet,
-        // which names the stack.
+        // This stack: one update can change every part of the watch.
         { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stack],
           requestParameters: { stackName: [this.stackName, { prefix: stackArnPrefix }] } },
         { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stackRefactor] },
+        // A change set run later by its ARN alone (no stack name).
+        { eventSource: ['cloudformation.amazonaws.com'], eventName: ['ExecuteChangeSet'], requestParameters: { stackName: [{ exists: false }] } },
       ],
       watch: [
         { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.rules],
@@ -644,7 +640,7 @@ export class VotesStack extends cdk.Stack {
       f('$.detail.requestParameters.alarmName') + f('$.detail.requestParameters.topicArn') + f('$.detail.requestParameters.subscriptionArn') +
       f('$.detail.requestParameters.resourceArn') + f('$.detail.requestParameters.logGroupName') + f('$.detail.requestParameters.stackName') +
       f('$.detail.requestParameters.queueUrl') + f('$.detail.requestParameters.alarmNames') + f('$.detail.requestParameters.policyName') +
-      f('$.detail.requestParameters.changeSetName') + ' by ' + f('$.detail.userIdentity.type') + ' ' +
+      f('$.detail.requestParameters.changeSetName') + f('$.detail.requestParameters.trailName') + ' by ' + f('$.detail.userIdentity.type') + ' ' +
       f('$.detail.userIdentity.sessionContext.sessionIssuer.arn') + ' key ' + f('$.detail.userIdentity.accessKeyId') +
       ' error ' + f('$.detail.errorCode') + ' event ' + f('$.detail.eventID');
     const logTarget = this.formatArn({ service: 'logs', resource: 'log-group', arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME, resourceName: keyUse.logGroupName });

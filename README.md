@@ -220,9 +220,8 @@ termination protection. They match:
   subscriptions (a data protection policy too);
 - every update, change set, stack policy, termination protection
   change, rollback or deletion of this stack, since one update can
-  change all of the watch (so a deploy is emailed too), and any stack
-  refactor (an `ExecuteChangeSet` named by its ARN alone follows a
-  `CreateChangeSet`, which names the stack);
+  change all of the watch (so a deploy is emailed too), any stack
+  refactor, and any change set run by its ARN alone (no stack name);
 - every change to any event bus (`UpdateEventBus`: a key put on the
   default bus, then disabled, could stop the rules);
 - every change to any CloudTrail trail (stopping or starting it,
@@ -301,7 +300,10 @@ another.
   a trail as above is logging (its home region, or that it is an
   organization trail); both subscriptions' `ConfirmationWasAuthenticated`
   is `true`; a test `UpdateEventBus` on the default bus (its description,
-  say) is emailed; a test signature with the publish role
+  say) is emailed; so is a call that only a nested match catches (a
+  `SetSubscriptionAttributes` on a watch subscription, putting back the
+  value it had, or a `PutRule` that rewrites a `-b` rule's description
+  as it was), which shows EventBridge took the nested patterns; a test signature with the publish role
   is logged twice, emailed four times and raises the alarm, and names the
   role and no session; whether a refused `Sign` by another principal is
   logged (note it if not); that the log resource policy's `aws:SourceArn`
