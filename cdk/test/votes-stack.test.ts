@@ -255,16 +255,20 @@ describe('monitor alerts', () => {
     expect(monitorRole().Properties.ManagedPolicyArns).toBeUndefined();
   });
 
-  test('the role may publish to the topic and put the heartbeat, nothing else', () => {
+  test('the role may publish to the topic, put the heartbeat and describe the site key (the key watch\'s heartbeat), nothing else', () => {
     const st = monitorStatements();
-    expect(st).toHaveLength(2);
+    expect(st).toHaveLength(3);
     expect(st.find((x) => x.Sid === 'Alert')).toEqual({ Sid: 'Alert', Effect: 'Allow', Action: 'sns:Publish', Resource: TOPIC });
     expect(st.find((x) => x.Sid === 'Heartbeat')).toEqual({ Sid: 'Heartbeat', Effect: 'Allow', Action: 'cloudwatch:PutMetricData', Resource: '*',
       Condition: { StringEquals: { 'cloudwatch:namespace': 'VettID/Votes/staging' } } });
+    const site = Object.keys(m.findResources('AWS::KMS::Key')).filter((k) => /^SiteSigningKey/.test(k));
+    expect(site).toHaveLength(1);
+    expect(st.find((x) => x.Sid === 'KeyWatchHeartbeat')).toEqual({ Sid: 'KeyWatchHeartbeat', Effect: 'Allow', Action: 'kms:DescribeKey',
+      Resource: { 'Fn::GetAtt': [site[0], 'Arn'] } });
   });
 
   test('the heartbeat alarm: three hours without a successful run, missing data breaching, to the topic', () => {
-    m.resourceCountIs('AWS::CloudWatch::Alarm', 3); // and the key-use and feed alarms (site keys, below)
+    m.resourceCountIs('AWS::CloudWatch::Alarm', 4); // and the key-use, feed and key watch heartbeat alarms (site keys, below)
     m.hasResourceProperties('AWS::CloudWatch::Alarm', {
       AlarmName: 'vettid-votes-staging-monitor-heartbeat',
       Namespace: heartbeatNamespace('staging'), MetricName: 'MonitorHeartbeat', Dimensions: [{ Name: 'env', Value: 'staging' }],
@@ -297,6 +301,10 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
   const groups = ['Keys', 'Watch', 'Notify'];
   const ruleLogicals = groups.flatMap((g) => [logical('AWS::Events::Rule', new RegExp(`^KeyWatch${g}(?!B)`)), logical('AWS::Events::Rule', new RegExp(`^KeyWatch${g}B`))]);
   const ruleNames = ['keys', 'watch', 'notify'].flatMap((g) => [`vettid-votes-staging-kw-${g}`, `vettid-votes-staging-kw-${g}-b`]);
+  const heartbeatRule = logical('AWS::Events::Rule', /^KeyWatchHeartbeat/);
+  const heartbeatLogs = logical('AWS::Logs::LogGroup', /^KeyWatchHeartbeatLogs/);
+  const siteLogical = logical('AWS::KMS::Key', /^SiteSigningKey/);
+  const monitorLogical = Object.keys(t.findResources('AWS::IAM::Role', { Properties: { RoleName: 'vettid-votes-staging-monitor' } }))[0];
   const topicA = logical('AWS::SNS::Topic', /^KeyWatchTopic(?!B)/);
   const topicB = logical('AWS::SNS::Topic', /^KeyWatchTopicB/);
   const queue = logical('AWS::SQS::Queue', /^KeyUseDeadLetters/);
@@ -399,7 +407,9 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     expect(() => stack('x', 'staging', { keyWatchEmail: 'not an address' })).toThrow(/keyWatchEmail/);
   });
 
-  const rules = (): any[] => Object.values(t.findResources('AWS::Events::Rule')) as any[];
+  // The six rules of the watch (not the heartbeat's, tested on its own).
+  const rules = (): any[] => (Object.values(t.findResources('AWS::Events::Rule')) as any[])
+    .filter((r) => r.Properties.Name !== 'vettid-votes-staging-kw-heartbeat');
   const firsts = (): any[] => rules().filter((r) => !r.Properties.Name.endsWith('-b'));
   const alts = (): any[] => firsts().flatMap((r) => r.Properties.EventPattern.detail.$or);
   const alt = (src: string): any[] => alts().filter((x) => x.eventSource[0] === src);
@@ -423,6 +433,8 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
   // Each pattern, its ARNs resolved at realistic lengths, stays under
   // EventBridge's default quota (a longer one fails the deploy).
   test('each pattern fits EventBridge\'s quota once resolved', () => {
+    let longest = 0;
+    const lengths: [string, number][] = [];
     for (const envName of ['staging', 'prod', 'production']) {
       const tpl = Template.fromStack(stack(envName, 'staging', {
         alarmTopicArn: 'arn:aws:sns:us-east-1:123456789012:vettid-org-staging-vault-alerts-topic-0123456789' })).toJSON();
@@ -450,12 +462,17 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
         return v;
       };
       const rs = Object.values(res).filter((r: any) => r.Type === 'AWS::Events::Rule') as any[];
-      expect(rs).toHaveLength(6);
+      expect(rs).toHaveLength(7); // the six and the heartbeat's
       for (const r of rs) {
         const n = JSON.stringify(resolve(r.Properties.EventPattern)).length;
-        expect([r.Properties.Name, n < KEY_WATCH_PATTERN_MAX - 200]).toEqual([r.Properties.Name, true]); // with room to spare
+        if (n > longest) longest = n;
+        lengths.push([r.Properties.Name, n]);
       }
     }
+    if (process.env.KEY_WATCH_PATTERN_REPORT) console.log(lengths.map(([name, n]) => `${name}: ${n}`).join('\n'));
+    // With room to spare.
+    expect(lengths.filter(([, n]) => n >= KEY_WATCH_PATTERN_MAX - 200)).toEqual([]);
+    expect(longest).toBeGreaterThan(0);
     expect(KEY_WATCH_PATTERN_MAX).toBe(2048);
   });
 
@@ -489,15 +506,21 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       stackRefactor: ['CreateStackRefactor', 'ExecuteStackRefactor'],
       buses: ['UpdateEventBus'],
     });
+    // The six rules and the heartbeat's.
+    const watched = [...ruleNames, 'vettid-votes-staging-kw-heartbeat'];
     expect(alt('events.amazonaws.com')).toEqual([
-      { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.rules], requestParameters: { $or: [{ name: ruleNames }, { rule: ruleNames }] } },
+      { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.rules], requestParameters: { $or: [{ name: watched }, { rule: watched }] } },
       { eventSource: ['events.amazonaws.com'], eventName: ['UpdateEventBus'] }, // any bus
     ]);
-    const alarms = ['vettid-votes-staging-key-use', 'vettid-votes-staging-key-use-feed'];
+    const alarms = ['vettid-votes-staging-key-use', 'vettid-votes-staging-key-use-feed', 'vettid-votes-staging-key-watch-heartbeat'];
+    // Mute rules in the watch pair; the alarms in the notify pair (for the quota).
     expect(alt('monitoring.amazonaws.com')).toEqual([
-      { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms], requestParameters: { $or: [{ alarmNames: alarms }, { alarmName: alarms }] } },
       { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.muteRules] }, // any mute rule
+      { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms], requestParameters: { $or: [{ alarmNames: alarms }, { alarmName: alarms }] } },
     ]);
+    const group = (name: string): any[] => rules().find((r) => r.Properties.Name === `vettid-votes-staging-kw-${name}`).Properties.EventPattern.detail.$or;
+    expect(group('notify').filter((x) => x.eventSource[0] === 'monitoring.amazonaws.com')).toHaveLength(1);
+    expect(group('watch').filter((x) => x.eventSource[0] === 'monitoring.amazonaws.com')).toHaveLength(1);
     expect(alt('logs.amazonaws.com')).toEqual([
       { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logGroup], requestParameters: { logGroupName: [{ Ref: logGroup }] } },
       { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logPolicies] }, // any name
@@ -552,7 +575,7 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     }
   });
 
-  test('each watch policy, whole: only the six rules write the log group, the dead letters and the topics; CloudWatch of this account the topics', () => {
+  test('each watch policy, whole: only the six rules write the key-use log group and the topics, only the heartbeat\'s its log group, the seven the dead letters; CloudWatch of this account the topics', () => {
     const lp = Object.values(t.findResources('AWS::Logs::ResourcePolicy')) as any[];
     expect(lp).toHaveLength(1);
     const arns = ruleLogicals.flatMap((r, i) => (i === 0 ? [] : ['","']).concat([{ 'Fn::GetAtt': [r, 'Arn'] } as any]));
@@ -560,13 +583,16 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       '{"Statement":[{"Action":["logs:CreateLogStream","logs:PutLogEvents"],"Condition":{"ArnEquals":{"aws:SourceArn":["',
       ...arns,
       '"]}},"Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},"Resource":"', { 'Fn::GetAtt': [logGroup, 'Arn'] },
+      '"},{"Action":["logs:CreateLogStream","logs:PutLogEvents"],"Condition":{"ArnEquals":{"aws:SourceArn":["', { 'Fn::GetAtt': [heartbeatRule, 'Arn'] },
+      '"]}},"Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},"Resource":"', { 'Fn::GetAtt': [heartbeatLogs, 'Arn'] },
       '"}],"Version":"2012-10-17"}']] } });
     const qp = Object.values(t.findResources('AWS::SQS::QueuePolicy')) as any[];
     expect(qp).toHaveLength(1);
     const q = { 'Fn::GetAtt': [queue, 'Arn'] };
+    const fromAll = { ArnEquals: { 'aws:SourceArn': [...ruleLogicals, heartbeatRule].map((r) => ({ 'Fn::GetAtt': [r, 'Arn'] })) } };
     expect(qp[0].Properties.PolicyDocument).toEqual({ Version: '2012-10-17', Statement: [
       { Action: 'sqs:*', Condition: { Bool: { 'aws:SecureTransport': 'false' } }, Effect: 'Deny', Principal: { AWS: '*' }, Resource: q },
-      { Action: 'sqs:SendMessage', Condition: fromRules, Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Resource: q },
+      { Action: 'sqs:SendMessage', Condition: fromAll, Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Resource: q },
     ] });
     const tps = t.findResources('AWS::SNS::TopicPolicy');
     expect(Object.keys(tps)).toHaveLength(2);
@@ -599,6 +625,72 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     for (const n of ruleNames) expect(text).toContain(`"${n}"`);
     t.hasResourceProperties('AWS::Logs::MetricFilter', { MetricTransformations: [Match.objectLike({ MetricNamespace: 'VettID/VotesKeys/staging' })] });
     expect(heartbeatNamespace('staging').startsWith('VettID/VotesKeys')).toBe(false);
+  });
+
+  test('the key-use metric filter and alarm, whole (the heartbeat does not touch them)', () => {
+    const filters = Object.values(t.findResources('AWS::Logs::MetricFilter')) as any[];
+    expect(filters).toHaveLength(2);
+    expect(filters.find((f) => f.Properties.FilterName === 'vettid-votes-staging-key-use').Properties).toEqual({
+      FilterName: 'vettid-votes-staging-key-use', LogGroupName: { Ref: logGroup }, FilterPattern: '',
+      MetricTransformations: [{ MetricNamespace: 'VettID/VotesKeys/staging', MetricName: 'KeyUse', MetricValue: '1' }],
+    });
+    const use = Object.values(t.findResources('AWS::CloudWatch::Alarm', { Properties: { AlarmName: 'vettid-votes-staging-key-use' } }))[0] as any;
+    expect(use.Properties).toEqual({
+      AlarmName: 'vettid-votes-staging-key-use',
+      AlarmDescription: {
+        'Fn::Join': ['', ['A votes site key of staging, its publish role or this watch was used or changed: see ', { Ref: logGroup },
+          '. A publish raises it (two signatures, each logged twice: four lines); a publish that does not means the feed is broken: stop and check it.']],
+      },
+      Namespace: 'VettID/VotesKeys/staging', MetricName: 'KeyUse', Statistic: 'SampleCount', Period: 60,
+      Threshold: 1, ComparisonOperator: 'GreaterThanOrEqualToThreshold', EvaluationPeriods: 1, TreatMissingData: 'notBreaching',
+      AlarmActions: [TOPIC, { Ref: topicA }, { Ref: topicB }],
+    });
+  });
+
+  test('the key watch\'s heartbeat: the monitor\'s DescribeKey of the site key, its own rule, in the read-only state, retained', () => {
+    const r = t.findResources('AWS::Events::Rule')[heartbeatRule] as any;
+    expect(r.DeletionPolicy).toBe('Retain');
+    expect(r.Properties.Name).toBe('vettid-votes-staging-kw-heartbeat');
+    expect(r.Properties.State).toBe('ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
+    expect(r.Properties.EventPattern).toEqual({
+      'detail-type': ['AWS API Call via CloudTrail'],
+      detail: {
+        eventSource: ['kms.amazonaws.com'], eventName: ['DescribeKey'], resources: { ARN: [{ 'Fn::GetAtt': [siteLogical, 'Arn'] }] },
+        userIdentity: { sessionContext: { sessionIssuer: { arn: [{ 'Fn::GetAtt': [monitorLogical, 'Arn'] }] } } },
+      },
+    });
+  });
+
+  test('its one target: its own log group, the raw event, the same dead letters and retries; no topic', () => {
+    const r = t.findResources('AWS::Events::Rule')[heartbeatRule] as any;
+    expect(r.Properties.Targets).toEqual([{
+      Id: r.Properties.Targets[0].Id,
+      Arn: { 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, ':logs:us-east-1:123456789012:log-group:', { Ref: heartbeatLogs }]] },
+      DeadLetterConfig: { Arn: { 'Fn::GetAtt': [queue, 'Arn'] } },
+      RetryPolicy: { MaximumRetryAttempts: 185, MaximumEventAgeInSeconds: 86400 },
+    }]);
+    const lg = t.findResources('AWS::Logs::LogGroup')[heartbeatLogs] as any;
+    expect(lg.DeletionPolicy).toBe('Retain');
+    expect(lg.Properties).toEqual({ LogGroupName: '/vettid/votes/staging/key-watch-heartbeat', RetentionInDays: 30 });
+  });
+
+  test('its alarm: three hours without a line (SampleCount), missing data breaching, to every topic', () => {
+    const filters = Object.values(t.findResources('AWS::Logs::MetricFilter')) as any[];
+    expect(filters.find((f) => f.Properties.FilterName === 'vettid-votes-staging-key-watch-heartbeat').Properties).toEqual({
+      FilterName: 'vettid-votes-staging-key-watch-heartbeat', LogGroupName: { Ref: heartbeatLogs }, FilterPattern: '',
+      MetricTransformations: [{ MetricNamespace: 'VettID/VotesKeys/staging', MetricName: 'KeyWatchHeartbeat', MetricValue: '1' }],
+    });
+    const a = Object.values(t.findResources('AWS::CloudWatch::Alarm', { Properties: { AlarmName: 'vettid-votes-staging-key-watch-heartbeat' } })) as any[];
+    expect(a).toHaveLength(1);
+    expect(a[0].Properties).toEqual({
+      AlarmName: 'vettid-votes-staging-key-watch-heartbeat',
+      AlarmDescription: { 'Fn::Join': ['', ['No monitor DescribeKey of the votes site key of staging reached ', { Ref: heartbeatLogs },
+        ' in 3 hours: the key watch\'s feed may be broken (the trail, the default bus, the rule, the log policy), or the monitor did not run (README "The watch").']] },
+      Namespace: 'VettID/VotesKeys/staging', MetricName: 'KeyWatchHeartbeat', Statistic: 'SampleCount', Period: 3600,
+      Threshold: 1, ComparisonOperator: 'LessThanThreshold', EvaluationPeriods: 3, DatapointsToAlarm: 3, TreatMissingData: 'breaching',
+      AlarmActions: [TOPIC, { Ref: topicA }, { Ref: topicB }],
+    });
+    expect(HEARTBEAT.hours).toBe(3);
   });
 
   test('outputs', () => {

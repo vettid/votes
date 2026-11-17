@@ -299,6 +299,13 @@ has a default.
    `VOTES_<STAGING|PROD>_MONITOR_ROLE_ARN` to that output and
    `VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN` to the topic. The alarm fires 3
    hours after the deploy until the first run that puts a heartbeat.
+   The deploy also makes the key watch's heartbeat (below, "The watch"):
+   the rule `vettid-votes-<env>-kw-heartbeat`, the log group
+   `/vettid/votes/<env>/key-watch-heartbeat` and the alarm
+   `vettid-votes-<env>-key-watch-heartbeat`. Check that the first hourly
+   run after the variables are set puts a line in that log group (its
+   step "key watch heartbeat" succeeds); until one does, that alarm too
+   fires 3 hours after the deploy.
 
 ### The site's signing keys
 
@@ -376,6 +383,45 @@ and raises `vettid-votes-<env>-key-use-feed`; both alarms notify the
 alarm topic and both watch topics, so silencing one path is told on
 another.
 
+**The heartbeat.** A feed that stops silently (a trail stopped, the bus
+or a rule changed, the log policy gone) would look like no use until a
+publish. So each hourly monitor run (`.github/workflows/monitor.yml`),
+as the monitor role, also calls
+`aws kms describe-key --key-id alias/vettid-votes-<env>-site` (read-only;
+the role may make that call on the site key and no other). A seventh
+rule, `vettid-votes-<env>-kw-heartbeat`, in the same state as the six,
+matches only that call by that role on that key and sends the whole
+event to the log group `/vettid/votes/<env>/key-watch-heartbeat` (kept a
+month; failures go to the same dead letters), not to the key-use log
+group or the watch topics: it is no use of the key. Three hours without
+a line there raise `vettid-votes-<env>-key-watch-heartbeat`, which
+notifies the alarm topic and both watch topics. The rule and the alarm
+are watched like the watch's own (a change to either is emailed). Like
+the monitor's own heartbeat, **3 missed hours raise it whatever the
+cause**, including GitHub delaying or skipping scheduled runs, or a
+GitHub outage. When it fires alone (no `monitor-heartbeat` alarm with
+it), check, in order:
+
+- the monitor's runs: did they run, and did their step "key watch
+  heartbeat" (`describe-key`) succeed? A failed call also fails the run,
+  which alerts;
+- the trail: is it logging (`aws cloudtrail get-trail-status`), with
+  management events (read and write), and homed in `us-east-1` or an
+  organization trail (below)?
+- the default event bus: its state, and its key (`aws events describe-event-bus`);
+- the rule `vettid-votes-<env>-kw-heartbeat`: its state is
+  `ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS`, its pattern and its
+  target are the stack's (`aws events describe-rule`, `list-targets-by-rule`);
+- the log resource policy `vettid-votes-<env>-key-use`
+  (`aws logs describe-resource-policies`) still lets the rule write the
+  log group, and the log group `/vettid/votes/<env>/key-watch-heartbeat`
+  exists;
+- the dead letters (`vettid-votes-<env>-key-use-dlq`; the feed alarm
+  fires with them).
+
+A broken feed means a signature would go unseen: stop publishing until
+it is found and fixed.
+
 - **Confirm both watch subscriptions** after the first deploy, from the
   token in each email AWS sends, so that unsubscribing needs a signed-in
   call (which is watched), not a link in the email:
@@ -425,9 +471,9 @@ another.
   the cross-account forward** (the owner's choice c, GC #12690): every
   watched event also sent to the management account, where the staging
   or production account's administrators can't silence it, before a
-  production key signs anything. A heartbeat that proves the feed is
-  alive (a scheduled watched call, and an alarm when its line is
-  missing) is its own task, not yet built.
+  production key signs anything. The heartbeat (above) proves hourly that
+  the feed is alive; a feed cut for less than three hours and then
+  restored doesn't raise it.
 - **The publisher is a permission set of its own** (GC #12713). Before
   the first deploy, the owner creates in IAM Identity Center a permission
   set (for example `VettIDVotesPublisher`) whose only permission is an

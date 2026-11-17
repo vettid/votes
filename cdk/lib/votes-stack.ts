@@ -438,11 +438,11 @@ export class VotesStack extends cdk.Stack {
     new route53.ARecord(this, 'AliasA', { zone, recordName: props.hostName, target: alias });
     new route53.AaaaRecord(this, 'AliasAAAA', { zone, recordName: props.hostName, target: alias });
 
-    if (props.alarmTopicArn !== undefined || props.githubOidcProviderArn !== undefined) {
-      this.monitorAlerts(prefix, props);
-    }
+    // alarmTopicArn is required (above), so the monitor's role always
+    // exists: the key watch's heartbeat is its call.
+    const monitor = this.monitorAlerts(prefix, props);
     // After monitorAlerts, which checks alarmTopicArn.
-    this.siteKeys(prefix, props);
+    this.siteKeys(prefix, props, monitor);
 
     new cdk.CfnOutput(this, 'BucketName', { value: this.bucket.bucketName });
     new cdk.CfnOutput(this, 'SiteKeySecret', { value: siteKeySecret.secretArn });
@@ -458,9 +458,12 @@ export class VotesStack extends cdk.Stack {
    * sign with them, and only publisherPrincipalArn may assume it. Every
    * signature, and every change that could let anyone else sign or
    * silence the watch, goes directly to two watch topics (emailed) and to
-   * a log group, and raises an alarm on the alarm topic and both.
+   * a log group, and raises an alarm on the alarm topic and both. The
+   * monitor's hourly DescribeKey of the site key goes through the same
+   * feed to a log group of its own: three hours without one raise the
+   * key watch's heartbeat alarm.
    */
-  private siteKeys(prefix: string, props: VotesStackProps): void {
+  private siteKeys(prefix: string, props: VotesStackProps, monitor: iam.Role): void {
     const publish = new iam.Role(this, 'PublishRole', {
       roleName: `${prefix}-publish`,
       description: 'votesctl publish-services: signs the service list with the site keys and writes it',
@@ -600,7 +603,12 @@ export class VotesStack extends cdk.Stack {
     // 2,048-character quota once its ARNs resolve (KEY_WATCH_PATTERN_MAX).
     const groups = ['keys', 'watch', 'notify'] as const;
     const ruleNames = groups.flatMap((g) => [`${prefix}-kw-${g}`, `${prefix}-kw-${g}-b`]);
-    const alarmNames = [`${prefix}-key-use`, `${prefix}-key-use-feed`];
+    // The heartbeat's rule and alarm (below) are watched with the six
+    // rules and the watch's alarms.
+    const heartbeatRuleName = `${prefix}-kw-heartbeat`;
+    const heartbeatAlarmName = `${prefix}-key-watch-heartbeat`;
+    const watchedRuleNames = [...ruleNames, heartbeatRuleName];
+    const alarmNames = [`${prefix}-key-use`, `${prefix}-key-use-feed`, heartbeatAlarmName];
     const policyName = `${prefix}-key-use`;
     const topicArns = [alarmTopicArn, ...watchTopics.map((t) => t.topicArn)];
     const stackArnPrefix = `arn:${this.partition}:cloudformation:${this.region}:${this.account}:stack/${this.stackName}/`;
@@ -618,11 +626,11 @@ export class VotesStack extends cdk.Stack {
       ],
       watch: [
         { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.rules],
-          requestParameters: { $or: [{ name: ruleNames }, { rule: ruleNames }] } },
+          requestParameters: { $or: [{ name: watchedRuleNames }, { rule: watchedRuleNames }] } },
         // Any bus: a bus's key change can stop its rules.
         { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.buses] },
-        { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms],
-          requestParameters: { $or: [{ alarmNames }, { alarmName: alarmNames }] } },
+        // (The watch's alarms are in notify, below: with the heartbeat's
+        // rule and alarm, this pattern would pass the quota.)
         // Any alarm mute rule: one can name the watch's alarms.
         { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.muteRules] },
         { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logGroup], requestParameters: { logGroupName: [keyUse.logGroupName] } },
@@ -634,6 +642,9 @@ export class VotesStack extends cdk.Stack {
         { eventSource: ['sns.amazonaws.com'], eventName: [...WATCH_EVENTS.topics], requestParameters: { $or: [
           { topicArn: topicArns }, { resourceArn: topicArns }, { subscriptionArn: topicArns.map((t) => ({ prefix: `${t}:` })) }] } },
         { eventSource: ['cloudtrail.amazonaws.com'], eventName: [...WATCH_EVENTS.trails] },
+        // The watch's alarms, which notify (by name).
+        { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms],
+          requestParameters: { $or: [{ alarmNames }, { alarmName: alarmNames }] } },
       ],
     };
     const f = (path: string): string => events.EventField.fromPath(path);
@@ -684,8 +695,49 @@ export class VotesStack extends cdk.Stack {
       return rule;
     });
     const fromRules = { ArnEquals: { 'aws:SourceArn': rules.map((r) => r.ruleArn) } };
-    // Only these rules may write to the log group, the dead letters or the
-    // watch topics. The log group's is set here rather than by the
+
+    // The key watch's heartbeat: each hourly monitor run
+    // (.github/workflows/monitor.yml), as the monitor's role, describes the
+    // site key, a read-only call that goes through the same feed
+    // (CloudTrail's management events, the default bus, a rule in the same
+    // state) to a log group of its own. Its alarm (below) fires when three
+    // hours pass without a line, so a feed that stopped is seen without
+    // waiting for a publish. Not to the key-use log group, its alarm or
+    // the watch topics: it is no use of the key.
+    monitor.addToPolicy(new iam.PolicyStatement({
+      sid: 'KeyWatchHeartbeat', actions: ['kms:DescribeKey'], resources: [site.keyArn],
+    }));
+    const heartbeatLogs = new logs.LogGroup(this, 'KeyWatchHeartbeatLogs', {
+      logGroupName: `/vettid/votes/${props.envName}/key-watch-heartbeat`,
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    const heartbeatRule = new events.Rule(this, 'KeyWatchHeartbeat', {
+      ruleName: heartbeatRuleName,
+      description: 'The key watch\'s heartbeat: the monitor\'s hourly DescribeKey of the votes site key, through the same feed as the watch',
+      eventPattern: {
+        detailType: ['AWS API Call via CloudTrail'],
+        detail: {
+          eventSource: ['kms.amazonaws.com'], eventName: ['DescribeKey'], resources: { ARN: [site.keyArn] },
+          userIdentity: { sessionContext: { sessionIssuer: { arn: [monitor.roleArn] } } },
+        },
+      },
+    });
+    // The whole event: the monitor's session name is its own
+    // (votes-monitor-<env>), never an email address.
+    heartbeatRule.addTarget({
+      bind: () => ({
+        arn: this.formatArn({ service: 'logs', resource: 'log-group', arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME, resourceName: heartbeatLogs.logGroupName }),
+        deadLetterConfig: { arn: deadLetters.queueArn },
+        retryPolicy: retry,
+      }),
+    });
+    heartbeatRule.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+    (heartbeatRule.node.defaultChild as events.CfnRule).addPropertyOverride('State', 'ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
+
+    // Only these rules may write to the log groups, the dead letters or the
+    // watch topics (the heartbeat's rule to its own log group and the dead
+    // letters only). The log groups' is set here rather than by the
     // CloudWatchLogGroup target, which would add a Lambda to set it.
     for (const topic of watchTopics) {
       topic.addToResourcePolicy(new iam.PolicyStatement({
@@ -699,12 +751,16 @@ export class VotesStack extends cdk.Stack {
         principals: [new iam.ServicePrincipal('events.amazonaws.com')],
         actions: ['logs:CreateLogStream', 'logs:PutLogEvents'], resources: [keyUse.logGroupArn],
         conditions: fromRules,
+      }), new iam.PolicyStatement({
+        principals: [new iam.ServicePrincipal('events.amazonaws.com')],
+        actions: ['logs:CreateLogStream', 'logs:PutLogEvents'], resources: [heartbeatLogs.logGroupArn],
+        conditions: { ArnEquals: { 'aws:SourceArn': [heartbeatRule.ruleArn] } },
       })],
     });
     deadLetters.addToResourcePolicy(new iam.PolicyStatement({
       principals: [new iam.ServicePrincipal('events.amazonaws.com')],
       actions: ['sqs:SendMessage'], resources: [deadLetters.queueArn],
-      conditions: fromRules,
+      conditions: { ArnEquals: { 'aws:SourceArn': [...rules, heartbeatRule].map((r) => r.ruleArn) } },
     }));
 
     // The alarms, to every topic: the alarm topic and the watch's two (so
@@ -750,7 +806,25 @@ export class VotesStack extends cdk.Stack {
       evaluationPeriods: 1,
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
-    for (const a of [alarm, feed]) {
+    // The heartbeat's: three hours without a line (missing data breaches),
+    // as the monitor's own heartbeat, so a run GitHub delayed or skipped
+    // raises it too.
+    new logs.MetricFilter(this, 'KeyWatchHeartbeatMetric', {
+      filterName: heartbeatAlarmName, logGroup: heartbeatLogs, filterPattern: logs.FilterPattern.allEvents(),
+      metricNamespace: namespace, metricName: 'KeyWatchHeartbeat', metricValue: '1',
+    });
+    const beat = new cloudwatch.Alarm(this, 'KeyWatchHeartbeatAlarm', {
+      alarmName: heartbeatAlarmName,
+      alarmDescription: `No monitor DescribeKey of the votes site key of ${props.envName} reached ${heartbeatLogs.logGroupName} in ${HEARTBEAT.hours} hours: ` +
+        'the key watch\'s feed may be broken (the trail, the default bus, the rule, the log policy), or the monitor did not run (README "The watch").',
+      metric: new cloudwatch.Metric({ namespace, metricName: 'KeyWatchHeartbeat', statistic: cloudwatch.Stats.SAMPLE_COUNT, period: cdk.Duration.hours(1) }),
+      threshold: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+      evaluationPeriods: HEARTBEAT.hours,
+      datapointsToAlarm: HEARTBEAT.hours,
+      treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+    });
+    for (const a of [alarm, feed, beat]) {
       a.addAlarmAction(new cwactions.SnsAction(alarmTopic));
       for (const topic of watchTopics) a.addAlarmAction(new cwactions.SnsAction(topic));
     }
@@ -763,7 +837,7 @@ export class VotesStack extends cdk.Stack {
   }
 
   /** The monitor's role and its heartbeat alarm (docs/VOTES-SITE.md §7). */
-  private monitorAlerts(prefix: string, props: VotesStackProps): void {
+  private monitorAlerts(prefix: string, props: VotesStackProps): iam.Role {
     const topicArn = props.alarmTopicArn;
     const providerArn = props.githubOidcProviderArn;
     if (topicArn === undefined || providerArn === undefined) {
@@ -817,5 +891,6 @@ export class VotesStack extends cdk.Stack {
     alarm.addAlarmAction(new cwactions.SnsAction(topic));
     alarm.addOkAction(new cwactions.SnsAction(topic));
     new cdk.CfnOutput(this, 'MonitorRoleArn', { value: role.roleArn });
+    return role;
   }
 }

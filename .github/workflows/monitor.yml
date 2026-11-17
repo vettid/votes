@@ -44,6 +44,11 @@ name: monitor
 # MonitorRoleArn output) and VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN (its
 # alarmTopicArn). While either is unset the run warns and reports to no
 # one but GitHub.
+#
+# Each run with the role also describes the site key (read-only), the key
+# watch's heartbeat: the stack's kw-heartbeat rule logs the call, and
+# three hours without one raise the key watch's heartbeat alarm, so a
+# CloudTrail feed that stopped is seen without waiting for a publish.
 
 on:
   schedule:
@@ -176,11 +181,26 @@ jobs:
           role-to-assume: ${{ vars[matrix.role_var] }}
           role-session-name: votes-monitor-${{ matrix.env }}
           aws-region: ${{ env.AWS_REGION }}
+      # The key watch's heartbeat (README "The watch"): a read-only call on
+      # the site key, which the stack's kw-heartbeat rule logs to
+      # /vettid/votes/<env>/key-watch-heartbeat; three hours without a line
+      # raise vettid-votes-<env>-key-watch-heartbeat. After the check,
+      # whatever its outcome: it proves the CloudTrail feed, not the site.
+      # A failed call fails the run, which alerts.
+      - name: key watch heartbeat (describe the site key)
+        id: key_watch
+        if: ${{ !cancelled() && steps.aws.outcome == 'success' }}
+        env:
+          ENV_NAME: ${{ matrix.env }}
+        run: |
+          aws kms describe-key --key-id "alias/vettid-votes-${ENV_NAME}-site" --region us-east-1 \
+            --query 'KeyMetadata.[KeyId,KeyState]' --output text
       - name: alert (a failed run)
         if: ${{ failure() && steps.aws.outcome == 'success' }}
         env:
           TOPIC_ARN: ${{ vars[matrix.topic_var] }}
           CODE: ${{ steps.check.outputs.code }}
+          KEY_WATCH: ${{ steps.key_watch.outcome }}
           ENV_NAME: ${{ matrix.env }}
           SITE: ${{ matrix.site }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -188,9 +208,13 @@ jobs:
           case "$CODE" in
             3) what="mismatches (votesctl check exit 3)" ;;
             1) what="a check failed (votesctl check exit 1)" ;;
-            "") what="the run failed before the check" ;;
+            ""|0) what="" ;;
             *) what="votesctl check exit $CODE" ;;
           esac
+          if [ "$KEY_WATCH" = "failure" ]; then
+            what="${what:+$what; }the key watch heartbeat failed (aws kms describe-key)"
+          fi
+          [ -n "$what" ] || what="the run failed before the check"
           region=$(cut -d: -f4 <<<"$TOPIC_ARN")
           aws sns publish --region "$region" --topic-arn "$TOPIC_ARN" \
             --subject "votes monitor ($ENV_NAME): failed" \
