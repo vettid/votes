@@ -192,16 +192,22 @@ watched (below). The publish role may read and write `v1/services.json`,
 `v1/services.json.sig` and `v1/services/*`, and list the bucket (so that
 a missing copy is a 404; every document is public), and nothing else.
 
-**The watch.** Two EventBridge rules with one pattern and the same
-targets (each sees a change to the other) send every event they match
-to the log group `/vettid/votes/<env>/key-use`, kept for good, and
-**directly to two topics, `vettid-votes-<env>-key-watch` and
+**The watch.** Six EventBridge rules, three pairs
+(`vettid-votes-<env>-kw-keys`, `-kw-watch` and `-kw-notify`, each with
+its `-b`; split so that each pattern stays under EventBridge's
+2,048-character quota), with the same targets, every one watching all
+six (so switching one off is seen), send every event they match to the
+log group `/vettid/votes/<env>/key-use`, kept for good, and **directly
+to two topics, `vettid-votes-<env>-key-watch` and
 `vettid-votes-<env>-key-watch-b`**, each emailing `keyWatchEmail` on its
 own subscription, so that no alarm sits between an event and a person
-and a subscription removed from one is told on the other. Only the two
-rules may publish to them (and CloudWatch alarms of the account). The
-rules, topics and subscriptions are kept if removed from the stack, and
-the stack has termination protection. They match:
+and a subscription removed from one is told on the other. Both are
+email, so both reach the same inbox: a second kind of notifier is the
+cross-account forward (below). Only the six rules may publish to them
+(and CloudWatch alarms of the account). The rules, the topics and the
+subscriptions are kept if removed from the stack (the topic, log and
+queue policies, the alarms and the queue are not), and the stack has
+termination protection. They match:
 
 - every signature with either key, and every grant, key policy change,
   alias change, deletion or disabling of either key or its alias;
@@ -212,9 +218,13 @@ the stack has termination protection. They match:
   streams, metric filter and key, any log group resource policy, its dead
   letters, the alarm topic and the two watch topics and their
   subscriptions (a data protection policy too);
-- every update, change set, stack policy, termination protection change
-  or deletion of this stack, since one update can change all of the
-  watch (so a deploy is emailed too);
+- every update, change set, stack policy, termination protection
+  change, rollback or deletion of this stack, since one update can
+  change all of the watch (so a deploy is emailed too), and any stack
+  refactor (an `ExecuteChangeSet` named by its ARN alone follows a
+  `CreateChangeSet`, which names the stack);
+- every change to any event bus (`UpdateEventBus`: a key put on the
+  default bus, then disabled, could stop the rules);
 - every change to any CloudTrail trail (stopping or starting it,
   deleting it, or changing what it records): the watch gets every event
   from CloudTrail.
@@ -235,15 +245,23 @@ another.
   token in each email AWS sends, so that unsubscribing needs a signed-in
   call (which is watched), not a link in the email:
   `aws sns confirm-subscription --topic-arn <KeyWatchTopicArn or KeyWatchTopicBArn> --token <token> --authenticate-on-unsubscribe true`.
-  Until then the watch emails no one. Keep `keyWatchEmail` in
+  Until then the watch emails no one. Then check that each says
+  `ConfirmationWasAuthenticated` `true`
+  (`aws sns get-subscription-attributes --subscription-arn <arn>`): a
+  confirmation or an unsubscribe by the email's link is not in
+  CloudTrail, so the watch can't see it. Keep `keyWatchEmail` in
   `~/.cdk.json`, not the tracked `cdk.json`, and out of shell history.
-- **A publish is two signatures, each sent twice** (four lines and four
-  emails) and raises the key-use alarm; **a deploy of this stack does
+- **A publish is two signatures (once the list anchor key is used, task
+  3), each logged twice and emailed four times** (a pair of rules, two
+  topics: four lines and eight emails) and raises the key-use alarm; **a deploy of this stack does
   too** (it updates the watch). **A publish that does not means the feed
   is broken: stop publishing and find out why.**
 - The feed needs CloudTrail's management events (read and write) for
-  `us-east-1` in the account, from a trail that is logging: one homed in
-  `us-east-1`, a multi-region trail, or an organization trail.
+  `us-east-1` in the account, from a trail that is logging and is
+  **homed in `us-east-1`, or an organization trail**: a trail homed in
+  another region can be stopped by a call there, which this watch (in
+  `us-east-1`) doesn't see. An organization trail can be stopped from
+  the management account, also outside this watch.
 - EventBridge retries a failed delivery for up to 24 hours before it
   goes to the dead letters, so the feed alarm can come that late. While
   any dead letter remains, the feed alarm stays in ALARM: read them, then
@@ -252,9 +270,10 @@ another.
   keys, so an administrator of the account who cuts every path in one
   CloudFormation update, or in calls quicker than the watch reports (a
   filter policy on a subscription, then disabling the alarms' actions),
-  can sign unseen until the change is noticed. Each list is still logged
-  in Rekor and checked hourly from outside AWS (GC #12646, tasks 3 and
-  4), which catches a list signed but not logged. **Production waits for
+  can sign unseen until the change is noticed. Once tasks 3 and 4 of GC
+  #12646 are in, each list will also be logged in Rekor and checked
+  hourly from outside AWS, which will catch a list signed but not
+  logged. **Production waits for
   the cross-account forward** (the owner's choice c, GC #12690): every
   watched event also sent to the management account, where the staging
   or production account's administrators can't silence it, before a
@@ -279,8 +298,11 @@ another.
   retained) with their aliases gone: schedule their deletion as the root
   user, or leave them, disabled, before deploying again.
 - **After the first deploy of an environment, check** (with the owner):
-  a trail as above is logging; a test signature with the publish role
-  is logged twice, emailed twice and raises the alarm, and names the
+  a trail as above is logging (its home region, or that it is an
+  organization trail); both subscriptions' `ConfirmationWasAuthenticated`
+  is `true`; a test `UpdateEventBus` on the default bus (its description,
+  say) is emailed; a test signature with the publish role
+  is logged twice, emailed four times and raises the alarm, and names the
   role and no session; whether a refused `Sign` by another principal is
   logged (note it if not); that the log resource policy's `aws:SourceArn`
   condition lets the rules write (the lines arrive at all); that breaking

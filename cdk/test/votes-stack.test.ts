@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import { API_RATE_LIMIT, API_RATE_WINDOW_SECONDS, HEARTBEAT, heartbeatNamespace, KEY_USE_EVENTS, LAMBDA_TIMEOUT_SECONDS, MONITOR_OIDC, PUBLISH_ROLE_EVENTS, VotesStack, validRoleArn, validSiteKey, WATCH_EVENTS } from '../lib/votes-stack';
+import { API_RATE_LIMIT, API_RATE_WINDOW_SECONDS, HEARTBEAT, heartbeatNamespace, KEY_USE_EVENTS, KEY_WATCH_PATTERN_MAX, LAMBDA_TIMEOUT_SECONDS, MONITOR_OIDC, PUBLISH_ROLE_EVENTS, VotesStack, validRoleArn, validSiteKey, WATCH_EVENTS } from '../lib/votes-stack';
 
 // A fixed public test value, not a real key: 32 bytes of 0x07.
 const SITE_KEY = Buffer.alloc(32, 7).toString('base64');
@@ -294,15 +294,16 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
   };
   const publishLogical = Object.keys(t.findResources('AWS::IAM::Role', { Properties: { RoleName: 'vettid-votes-staging-publish' } }))[0];
   const bucketLogical = Object.keys(t.findResources('AWS::S3::Bucket'))[0];
-  const ruleA = logical('AWS::Events::Rule', /^KeyUseRule(?!B)/);
-  const ruleB = logical('AWS::Events::Rule', /^KeyUseRuleB/);
+  const groups = ['Keys', 'Watch', 'Notify'];
+  const ruleLogicals = groups.flatMap((g) => [logical('AWS::Events::Rule', new RegExp(`^KeyWatch${g}(?!B)`)), logical('AWS::Events::Rule', new RegExp(`^KeyWatch${g}B`))]);
+  const ruleNames = ['keys', 'watch', 'notify'].flatMap((g) => [`vettid-votes-staging-kw-${g}`, `vettid-votes-staging-kw-${g}-b`]);
   const topicA = logical('AWS::SNS::Topic', /^KeyWatchTopic(?!B)/);
   const topicB = logical('AWS::SNS::Topic', /^KeyWatchTopicB/);
   const queue = logical('AWS::SQS::Queue', /^KeyUseDeadLetters/);
   const logGroup = logical('AWS::Logs::LogGroup', /^KeyUseLogs/);
   const roleArn = { 'Fn::GetAtt': [publishLogical, 'Arn'] };
   const rootArn = { 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, ':iam::123456789012:root']] };
-  const fromRules = { ArnEquals: { 'aws:SourceArn': [{ 'Fn::GetAtt': [ruleA, 'Arn'] }, { 'Fn::GetAtt': [ruleB, 'Arn'] }] } };
+  const fromRules = { ArnEquals: { 'aws:SourceArn': ruleLogicals.map((r) => ({ 'Fn::GetAtt': [r, 'Arn'] })) } };
   const keyPolicy = (algorithm: string): any => ({
     Version: '2012-10-17',
     Statement: [
@@ -357,6 +358,8 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       // Unconditioned, so that a missing copy is a 404 (all documents are public).
       { Sid: 'ServiceListList', Effect: 'Allow', Action: 's3:ListBucket', Resource: { 'Fn::GetAtt': [bucketLogical, 'Arn'] } },
       { Sid: 'KeyWatchSubscriptions', Effect: 'Allow', Action: 'sns:ListSubscriptionsByTopic', Resource: [{ Ref: topicA }, { Ref: topicB }] },
+      { Sid: 'KeyWatchSubscriptionAttributes', Effect: 'Allow', Action: 'sns:GetSubscriptionAttributes',
+        Resource: [{ Ref: logical('AWS::SNS::Subscription', /^KeyWatchEmail(?!B)/) }, { Ref: logical('AWS::SNS::Subscription', /^KeyWatchEmailB/) }] },
     ] });
   });
 
@@ -371,6 +374,12 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     expect(validRoleArn('arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Operator_0123')).toBe(false);
     expect(validRoleArn('arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Operator_0123456789abcdef/x')).toBe(false);
     expect(() => stack('x', 'staging', { publisherPrincipalArn: 'arn:aws:iam::123456789012:role/admin' })).toThrow(/permission set/);
+    expect(validRoleArn('arn:aws:iam::123456789012:role/AWSReservedSSO_Operator_0123456789abcdef')).toBe(false); // no aws-reserved path
+    expect(validRoleArn('arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_*_0123456789abcdef')).toBe(false);
+    // The this-account check can't be skipped by an account left to deploy time.
+    expect(() => new VotesStack(new cdk.App(), 'X', { envName: 'x', hostName: 'v.example.org', hostedZoneId: 'Z1', zoneName: 'example.org',
+      sigstore: 'staging', publisherPrincipalArn: PUBLISHER, alarmTopicArn: TOPIC, githubOidcProviderArn: PROVIDER, keyWatchEmail: EMAIL,
+      lambdaCode: lambda.Code.fromAsset(path.join(__dirname, 'fake-api')), env: { region: 'us-east-1' } })).toThrow(/needs its account/);
     expect(() => stack('x', 'staging', { publisherPrincipalArn: '*' })).toThrow(/publisherPrincipalArn/);
     expect(() => stack('x', 'staging', { publisherPrincipalArn: 'arn:aws:iam::210987654321:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Operator_0123456789abcdef' })).toThrow(/this account/);
     expect(() => stack('x', 'staging', { alarmTopicArn: undefined, githubOidcProviderArn: undefined })).toThrow(/alarmTopicArn/);
@@ -379,20 +388,63 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
   });
 
   const rules = (): any[] => Object.values(t.findResources('AWS::Events::Rule')) as any[];
-  const alts = (): any[] => rules()[0].Properties.EventPattern.detail.$or;
+  const firsts = (): any[] => rules().filter((r) => !r.Properties.Name.endsWith('-b'));
+  const alts = (): any[] => firsts().flatMap((r) => r.Properties.EventPattern.detail.$or);
   const alt = (src: string): any[] => alts().filter((x) => x.eventSource[0] === src);
 
-  test('two rules with one pattern and the same targets, each in the state that gets read-only events, retained', () => {
+  test('six rules, three pairs: each pair one pattern, every rule the same targets, each in the state that gets read-only events, retained', () => {
     const r = rules();
-    expect(r.map((x) => x.Properties.Name).sort()).toEqual(['vettid-votes-staging-key-use', 'vettid-votes-staging-key-use-b']);
-    expect(r[1].Properties.EventPattern).toEqual(r[0].Properties.EventPattern);
-    expect(r[1].Properties.Targets).toEqual(r[0].Properties.Targets);
+    expect(r.map((x) => x.Properties.Name).sort()).toEqual([...ruleNames].sort());
+    for (const g of ['keys', 'watch', 'notify']) {
+      const [x, y] = ['', '-b'].map((sfx) => r.find((q) => q.Properties.Name === `vettid-votes-staging-kw-${g}${sfx}`));
+      expect(y.Properties.EventPattern).toEqual(x.Properties.EventPattern);
+    }
     for (const x of r) {
+      expect(x.Properties.Targets).toEqual(r[0].Properties.Targets);
       expect(x.Properties.State).toBe('ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS');
       expect(x.DeletionPolicy).toBe('Retain');
+      expect(x.Properties.EventPattern['detail-type']).toEqual(['AWS API Call via CloudTrail']);
     }
-    expect(r[0].Properties.EventPattern['detail-type']).toEqual(['AWS API Call via CloudTrail']);
-    expect(alts()).toHaveLength(16);
+    expect(alts()).toHaveLength(13);
+  });
+
+  // Each pattern, its ARNs resolved at realistic lengths, stays under
+  // EventBridge's default quota (a longer one fails the deploy).
+  test('each pattern fits EventBridge\'s quota once resolved', () => {
+    for (const envName of ['staging', 'prod']) {
+      const tpl = Template.fromStack(stack(envName, 'staging', {
+        alarmTopicArn: 'arn:aws:sns:us-east-1:123456789012:vettid-org-staging-vault-alerts-topic-0123456789' })).toJSON();
+      const res = tpl.Resources;
+      const resolve = (v: any): any => {
+        if (Array.isArray(v)) return v.map(resolve);
+        if (v && typeof v === 'object') {
+          if ('Ref' in v) {
+            if (v.Ref === 'AWS::Partition') return 'aws';
+            const r = res[v.Ref];
+            const p = r.Properties;
+            switch (r.Type) {
+              case 'AWS::SNS::Topic': return `arn:aws:sns:us-east-1:123456789012:${p.TopicName}`;
+              case 'AWS::SQS::Queue': return `https://sqs.us-east-1.amazonaws.com/123456789012/${p.QueueName}`;
+              case 'AWS::Logs::LogGroup': return p.LogGroupName;
+              case 'AWS::IAM::Role': return p.RoleName;
+            }
+            throw new Error(`a Ref to ${r.Type}`);
+          }
+          // The longest key ARN form (a multi-Region key).
+          if ('Fn::GetAtt' in v) return 'arn:aws:kms:us-east-1:123456789012:key/mrk-0123456789abcdef0123456789abcdef';
+          if ('Fn::Join' in v) return resolve(v['Fn::Join'][1]).join(v['Fn::Join'][0]);
+          return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, resolve(x)]));
+        }
+        return v;
+      };
+      const rs = Object.values(res).filter((r: any) => r.Type === 'AWS::Events::Rule') as any[];
+      expect(rs).toHaveLength(6);
+      for (const r of rs) {
+        const n = JSON.stringify(resolve(r.Properties.EventPattern)).length;
+        expect([r.Properties.Name, n < KEY_WATCH_PATTERN_MAX - 200]).toEqual([r.Properties.Name, true]); // with room to spare
+      }
+    }
+    expect(KEY_WATCH_PATTERN_MAX).toBe(2048);
   });
 
   test('watched, exactly: the keys and their aliases, the publish role', () => {
@@ -421,17 +473,17 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       queue: ['PurgeQueue', 'DeleteQueue', 'SetQueueAttributes', 'AddPermission', 'RemovePermission'],
       muteRules: ['PutAlarmMuteRule', 'DeleteAlarmMuteRule'],
       stack: ['UpdateStack', 'DeleteStack', 'CreateChangeSet', 'ExecuteChangeSet', 'SetStackPolicy',
-        'UpdateTerminationProtection', 'ContinueUpdateRollback', 'CancelUpdateStack'],
+        'UpdateTerminationProtection', 'ContinueUpdateRollback', 'CancelUpdateStack', 'RollbackStack'],
+      stackRefactor: ['CreateStackRefactor', 'ExecuteStackRefactor'],
+      buses: ['UpdateEventBus'],
     });
-    const names = ['vettid-votes-staging-key-use', 'vettid-votes-staging-key-use-b'];
     expect(alt('events.amazonaws.com')).toEqual([
-      { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.rules], requestParameters: { name: names } },
-      { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.rules], requestParameters: { rule: names } },
+      { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.rules], requestParameters: { $or: [{ name: ruleNames }, { rule: ruleNames }] } },
+      { eventSource: ['events.amazonaws.com'], eventName: ['UpdateEventBus'] }, // any bus
     ]);
     const alarms = ['vettid-votes-staging-key-use', 'vettid-votes-staging-key-use-feed'];
     expect(alt('monitoring.amazonaws.com')).toEqual([
-      { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms], requestParameters: { alarmNames: alarms } },
-      { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms], requestParameters: { alarmName: alarms } },
+      { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms], requestParameters: { $or: [{ alarmNames: alarms }, { alarmName: alarms }] } },
       { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.muteRules] }, // any mute rule
     ]);
     expect(alt('logs.amazonaws.com')).toEqual([
@@ -441,19 +493,19 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     expect(alt('cloudtrail.amazonaws.com')).toEqual([{ eventSource: ['cloudtrail.amazonaws.com'], eventName: [...WATCH_EVENTS.trails] }]); // any trail
     const topics = [TOPIC, { Ref: topicA }, { Ref: topicB }];
     const sns = { eventSource: ['sns.amazonaws.com'], eventName: [...WATCH_EVENTS.topics] };
-    expect(alt('sns.amazonaws.com')).toEqual([
-      { ...sns, requestParameters: { topicArn: topics } },
-      { ...sns, requestParameters: { resourceArn: topics } }, // PutDataProtectionPolicy
-      { ...sns, requestParameters: { subscriptionArn: [{ prefix: `${TOPIC}:` },
-        { prefix: { 'Fn::Join': ['', [{ Ref: topicA }, ':']] } }, { prefix: { 'Fn::Join': ['', [{ Ref: topicB }, ':']] } }] } },
-    ]);
+    expect(alt('sns.amazonaws.com')).toEqual([{ ...sns, requestParameters: { $or: [
+      { topicArn: topics },
+      { resourceArn: topics }, // PutDataProtectionPolicy
+      { subscriptionArn: [{ prefix: `${TOPIC}:` },
+        { prefix: { 'Fn::Join': ['', [{ Ref: topicA }, ':']] } }, { prefix: { 'Fn::Join': ['', [{ Ref: topicB }, ':']] } }] },
+    ] } }]);
     expect(alt('sqs.amazonaws.com')).toEqual([{ eventSource: ['sqs.amazonaws.com'], eventName: [...WATCH_EVENTS.queue],
       requestParameters: { queueUrl: [{ Ref: queue }] } }]);
     const cfn = { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stack] };
     expect(alt('cloudformation.amazonaws.com')).toEqual([
-      { ...cfn, requestParameters: { stackName: ['VotesSite-staging'] } },
-      { ...cfn, requestParameters: { stackName: [{ prefix: { 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' },
+      { ...cfn, requestParameters: { stackName: ['VotesSite-staging', { prefix: { 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' },
         ':cloudformation:us-east-1:123456789012:stack/VotesSite-staging/']] } }] } },
+      { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stackRefactor] }, // any refactor
     ]);
   });
 
@@ -470,7 +522,8 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
         expect(paths).toEqual(expect.arrayContaining(['$.detail.eventName', '$.detail.userIdentity.sessionContext.sessionIssuer.arn',
           '$.detail.userIdentity.type', '$.detail.userIdentity.accessKeyId', '$.detail.eventID',
           '$.detail.requestParameters.name', '$.detail.requestParameters.topicArn', '$.detail.requestParameters.subscriptionArn',
-          '$.detail.requestParameters.alarmName', '$.detail.requestParameters.stackName']));
+          '$.detail.requestParameters.alarmName', '$.detail.requestParameters.stackName', '$.detail.requestParameters.alarmNames',
+          '$.detail.requestParameters.policyName', '$.detail.requestParameters.changeSetName']));
         for (const pth of paths) expect(pth).not.toMatch(/userIdentity\.(arn|principalId|userName)$|sessionName|email/i);
       }
       // The shape a log group target needs: {"timestamp": <time>, "message": "..."}.
@@ -486,12 +539,13 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     }
   });
 
-  test('each watch policy, whole: only the two rules write the log group, the dead letters and the topics; CloudWatch of this account the topics', () => {
+  test('each watch policy, whole: only the six rules write the log group, the dead letters and the topics; CloudWatch of this account the topics', () => {
     const lp = Object.values(t.findResources('AWS::Logs::ResourcePolicy')) as any[];
     expect(lp).toHaveLength(1);
+    const arns = ruleLogicals.flatMap((r, i) => (i === 0 ? [] : ['","']).concat([{ 'Fn::GetAtt': [r, 'Arn'] } as any]));
     expect(lp[0].Properties).toEqual({ PolicyName: 'vettid-votes-staging-key-use', PolicyDocument: { 'Fn::Join': ['', [
       '{"Statement":[{"Action":["logs:CreateLogStream","logs:PutLogEvents"],"Condition":{"ArnEquals":{"aws:SourceArn":["',
-      { 'Fn::GetAtt': [ruleA, 'Arn'] }, '","', { 'Fn::GetAtt': [ruleB, 'Arn'] },
+      ...arns,
       '"]}},"Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},"Resource":"', { 'Fn::GetAtt': [logGroup, 'Arn'] },
       '"}],"Version":"2012-10-17"}']] } });
     const qp = Object.values(t.findResources('AWS::SQS::QueuePolicy')) as any[];
@@ -525,11 +579,11 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
     expect(feed.Properties.AlarmActions).toEqual(actions);
     expect(JSON.stringify(feed.Properties.AlarmDescription)).toMatch(/then purge them/);
     const exprs = feed.Properties.Metrics.filter((m: any) => m.Expression).map((m: any) => m.Expression);
-    expect(exprs).toEqual(['FILL(f0, 0) + FILL(f1, 0) + FILL(d, 0)']);
+    expect(exprs).toEqual(['FILL(f0, 0) + FILL(f1, 0) + FILL(f2, 0) + FILL(f3, 0) + FILL(f4, 0) + FILL(f5, 0) + FILL(d, 0)']);
     const text = JSON.stringify(feed.Properties.Metrics);
     expect(text).toContain('FailedInvocations');
     expect(text).toContain('ApproximateNumberOfMessagesVisible');
-    expect(text).toContain('vettid-votes-staging-key-use-b');
+    for (const n of ruleNames) expect(text).toContain(`"${n}"`);
     t.hasResourceProperties('AWS::Logs::MetricFilter', { MetricTransformations: [Match.objectLike({ MetricNamespace: 'VettID/VotesKeys/staging' })] });
     expect(heartbeatNamespace('staging').startsWith('VettID/VotesKeys')).toBe(false);
   });

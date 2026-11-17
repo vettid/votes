@@ -163,8 +163,16 @@ export const WATCH_EVENTS = {
   muteRules: ['PutAlarmMuteRule', 'DeleteAlarmMuteRule'],
   // This stack, by name or ARN: one update can change all of the watch.
   stack: ['UpdateStack', 'DeleteStack', 'CreateChangeSet', 'ExecuteChangeSet', 'SetStackPolicy',
-    'UpdateTerminationProtection', 'ContinueUpdateRollback', 'CancelUpdateStack'],
+    'UpdateTerminationProtection', 'ContinueUpdateRollback', 'CancelUpdateStack', 'RollbackStack'],
+  // Any stack refactor (it can move this stack's resources out of it).
+  stackRefactor: ['CreateStackRefactor', 'ExecuteStackRefactor'],
+  // Any event bus: a key change on the default bus can stop its rules.
+  buses: ['UpdateEventBus'],
 } as const;
+
+/** EventBridge's default quota on an event pattern's length; each of the
+ * key watch's patterns stays under it with its ARNs resolved. */
+export const KEY_WATCH_PATTERN_MAX = 2048;
 
 /** The role of an IAM Identity Center permission set, as
  * publisherPrincipalArn must be (GC #12713: a set of its own, assigned to
@@ -200,7 +208,10 @@ export class VotesStack extends cdk.Stack {
       throw new Error(`publisherPrincipalArn must be the role of an IAM Identity Center permission set (…:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_<set>_<hash>; got "${props.publisherPrincipalArn}")`);
     }
     const publisherAccount = props.publisherPrincipalArn.split(':')[4];
-    if (!cdk.Token.isUnresolved(this.account) && publisherAccount !== this.account) {
+    if (cdk.Token.isUnresolved(this.account)) {
+      throw new Error('the stack needs its account (CDK_DEFAULT_ACCOUNT, or env.account): publisherPrincipalArn must be a role of it');
+    }
+    if (publisherAccount !== this.account) {
       throw new Error(`publisherPrincipalArn must be a role of this account, ${this.account} (got ${publisherAccount})`);
     }
     // The site keys can sign, so their watch must reach a person: both
@@ -542,6 +553,7 @@ export class VotesStack extends cdk.Stack {
     // Two watch topics, each with its own subscription, so that a
     // subscription removed or a topic changed on one is told on the other
     // directly, whatever state the alarms are in.
+    const subscriptions: sns.Subscription[] = [];
     const watchTopics = ['', '-b'].map((suffix, i) => {
       const topic = new sns.Topic(this, i === 0 ? 'KeyWatchTopic' : 'KeyWatchTopicB', {
         topicName: `${prefix}-key-watch${suffix}`,
@@ -553,6 +565,7 @@ export class VotesStack extends cdk.Stack {
         topic, protocol: sns.SubscriptionProtocol.EMAIL, endpoint: props.keyWatchEmail,
       });
       sub.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+      subscriptions.push(sub);
       // The alarms below publish here too.
       topic.addToResourcePolicy(new iam.PolicyStatement({
         sid: 'Alarms', principals: [new iam.ServicePrincipal('cloudwatch.amazonaws.com')], actions: ['sns:Publish'],
@@ -560,10 +573,15 @@ export class VotesStack extends cdk.Stack {
       }));
       return topic;
     });
-    // votesctl checks before a publish that both subscriptions are
-    // confirmed (it reads them; it can't change them).
+    // For votesctl (GC #12646, task 2) to check before a publish that both
+    // subscriptions are confirmed, by an authenticated confirmation (it
+    // reads them; it can't change them).
     publish.addToPolicy(new iam.PolicyStatement({
       sid: 'KeyWatchSubscriptions', actions: ['sns:ListSubscriptionsByTopic'], resources: watchTopics.map((t) => t.topicArn),
+    }));
+    publish.addToPolicy(new iam.PolicyStatement({
+      sid: 'KeyWatchSubscriptionAttributes', actions: ['sns:GetSubscriptionAttributes'],
+      resources: subscriptions.map((sub) => (sub.node.defaultChild as sns.CfnSubscription).ref),
     }));
     const alarmTopicArn = props.alarmTopicArn as string;
     const alarmTopic = sns.Topic.fromTopicArn(this, 'KeyUseTopic', alarmTopicArn);
@@ -575,38 +593,48 @@ export class VotesStack extends cdk.Stack {
       enforceSSL: true,
       retentionPeriod: cdk.Duration.days(14),
     });
-    const ruleNames = [`${prefix}-key-use`, `${prefix}-key-use-b`];
+    // Three groups of what is watched, each deployed as a pair of rules
+    // with the same pattern and targets: every rule watches all six, so
+    // switching one off is seen (every event is logged and sent twice).
+    // Split so that each pattern stays under EventBridge's default
+    // 2,048-character quota once its ARNs resolve (KEY_WATCH_PATTERN_MAX).
+    const groups = ['keys', 'watch', 'notify'] as const;
+    const ruleNames = groups.flatMap((g) => [`${prefix}-kw-${g}`, `${prefix}-kw-${g}-b`]);
     const alarmNames = [`${prefix}-key-use`, `${prefix}-key-use-feed`];
     const policyName = `${prefix}-key-use`;
     const topicArns = [alarmTopicArn, ...watchTopics.map((t) => t.topicArn)];
     const stackArnPrefix = `arn:${this.partition}:cloudformation:${this.region}:${this.account}:stack/${this.stackName}/`;
-    const pattern = {
-      detailType: ['AWS API Call via CloudTrail'],
-      detail: {
-        $or: [
-          { eventSource: ['kms.amazonaws.com'], eventName: [...KEY_USE_EVENTS],
-            resources: { ARN: [site.keyArn, listAnchor.keyArn, aliasArn(siteAlias), aliasArn(anchorAlias)] } },
-          { eventSource: ['iam.amazonaws.com'], eventName: [...PUBLISH_ROLE_EVENTS], requestParameters: { roleName: [publish.roleName] } },
-          { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.rules], requestParameters: { name: ruleNames } },
-          { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.rules], requestParameters: { rule: ruleNames } },
-          { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms], requestParameters: { alarmNames } },
-          { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms], requestParameters: { alarmName: alarmNames } },
-          { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logGroup], requestParameters: { logGroupName: [keyUse.logGroupName] } },
-          { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logPolicies] },
-          { eventSource: ['cloudtrail.amazonaws.com'], eventName: [...WATCH_EVENTS.trails] },
-          { eventSource: ['sns.amazonaws.com'], eventName: [...WATCH_EVENTS.topics], requestParameters: { topicArn: topicArns } },
-          // PutDataProtectionPolicy names its topic as resourceArn.
-          { eventSource: ['sns.amazonaws.com'], eventName: [...WATCH_EVENTS.topics], requestParameters: { resourceArn: topicArns } },
-          { eventSource: ['sns.amazonaws.com'], eventName: [...WATCH_EVENTS.topics],
-            requestParameters: { subscriptionArn: topicArns.map((t) => ({ prefix: `${t}:` })) } },
-          { eventSource: ['sqs.amazonaws.com'], eventName: [...WATCH_EVENTS.queue], requestParameters: { queueUrl: [deadLetters.queueUrl] } },
-          // Any alarm mute rule: one can name the watch's alarms.
-          { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.muteRules] },
-          // This stack: one update can change every part of the watch.
-          { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stack], requestParameters: { stackName: [this.stackName] } },
-          { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stack], requestParameters: { stackName: [{ prefix: stackArnPrefix }] } },
-        ],
-      },
+    const detail: Record<(typeof groups)[number], any[]> = {
+      keys: [
+        { eventSource: ['kms.amazonaws.com'], eventName: [...KEY_USE_EVENTS],
+          resources: { ARN: [site.keyArn, listAnchor.keyArn, aliasArn(siteAlias), aliasArn(anchorAlias)] } },
+        { eventSource: ['iam.amazonaws.com'], eventName: [...PUBLISH_ROLE_EVENTS], requestParameters: { roleName: [publish.roleName] } },
+        // This stack: one update can change every part of the watch. An
+        // ExecuteChangeSet named by ARN alone follows its CreateChangeSet,
+        // which names the stack.
+        { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stack],
+          requestParameters: { stackName: [this.stackName, { prefix: stackArnPrefix }] } },
+        { eventSource: ['cloudformation.amazonaws.com'], eventName: [...WATCH_EVENTS.stackRefactor] },
+      ],
+      watch: [
+        { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.rules],
+          requestParameters: { $or: [{ name: ruleNames }, { rule: ruleNames }] } },
+        // Any bus: a bus's key change can stop its rules.
+        { eventSource: ['events.amazonaws.com'], eventName: [...WATCH_EVENTS.buses] },
+        { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.alarms],
+          requestParameters: { $or: [{ alarmNames }, { alarmName: alarmNames }] } },
+        // Any alarm mute rule: one can name the watch's alarms.
+        { eventSource: ['monitoring.amazonaws.com'], eventName: [...WATCH_EVENTS.muteRules] },
+        { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logGroup], requestParameters: { logGroupName: [keyUse.logGroupName] } },
+        { eventSource: ['logs.amazonaws.com'], eventName: [...WATCH_EVENTS.logPolicies] },
+        { eventSource: ['sqs.amazonaws.com'], eventName: [...WATCH_EVENTS.queue], requestParameters: { queueUrl: [deadLetters.queueUrl] } },
+      ],
+      notify: [
+        // PutDataProtectionPolicy names its topic as resourceArn.
+        { eventSource: ['sns.amazonaws.com'], eventName: [...WATCH_EVENTS.topics], requestParameters: { $or: [
+          { topicArn: topicArns }, { resourceArn: topicArns }, { subscriptionArn: topicArns.map((t) => ({ prefix: `${t}:` })) }] } },
+        { eventSource: ['cloudtrail.amazonaws.com'], eventName: [...WATCH_EVENTS.trails] },
+      ],
     };
     const f = (path: string): string => events.EventField.fromPath(path);
     // What it acted on: the key, or the name its API gives (only one is
@@ -615,19 +643,19 @@ export class VotesStack extends cdk.Stack {
       f('$.detail.requestParameters.roleName') + f('$.detail.requestParameters.name') + f('$.detail.requestParameters.rule') +
       f('$.detail.requestParameters.alarmName') + f('$.detail.requestParameters.topicArn') + f('$.detail.requestParameters.subscriptionArn') +
       f('$.detail.requestParameters.resourceArn') + f('$.detail.requestParameters.logGroupName') + f('$.detail.requestParameters.stackName') +
-      f('$.detail.requestParameters.queueUrl') + ' by ' + f('$.detail.userIdentity.type') + ' ' +
+      f('$.detail.requestParameters.queueUrl') + f('$.detail.requestParameters.alarmNames') + f('$.detail.requestParameters.policyName') +
+      f('$.detail.requestParameters.changeSetName') + ' by ' + f('$.detail.userIdentity.type') + ' ' +
       f('$.detail.userIdentity.sessionContext.sessionIssuer.arn') + ' key ' + f('$.detail.userIdentity.accessKeyId') +
       ' error ' + f('$.detail.errorCode') + ' event ' + f('$.detail.eventID');
     const logTarget = this.formatArn({ service: 'logs', resource: 'log-group', arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME, resourceName: keyUse.logGroupName });
     const retry = { maximumRetryAttempts: 185, maximumEventAgeInSeconds: 86400 };
-    // Two rules with the same pattern and targets: each sees a change to
-    // the other, so switching one off is seen (every event is logged and
-    // sent twice).
     const rules = ruleNames.map((ruleName, i) => {
-      const rule = new events.Rule(this, i === 0 ? 'KeyUseRule' : 'KeyUseRuleB', {
+      const group = groups[Math.floor(i / 2)];
+      const id = `KeyWatch${group[0].toUpperCase()}${group.slice(1)}${i % 2 === 0 ? '' : 'B'}`;
+      const rule = new events.Rule(this, id, {
         ruleName,
-        description: 'The votes site keys: every signature, and every change that could let someone else sign or silence this',
-        eventPattern: pattern,
+        description: `The votes site keys (${group}): every signature, and every change that could let someone else sign or silence this`,
+        eventPattern: { detailType: ['AWS API Call via CloudTrail'], detail: { $or: detail[group] } },
       });
       rule.addTarget({
         bind: () => ({
@@ -703,10 +731,11 @@ export class VotesStack extends cdk.Stack {
     // is filled with 0 when it has no data, so that one with data counts.
     const failed = new cloudwatch.MathExpression({
       label: 'failed deliveries and dead letters',
-      expression: 'FILL(f0, 0) + FILL(f1, 0) + FILL(d, 0)',
+      expression: ruleNames.map((_, i) => `FILL(f${i}, 0)`).join(' + ') + ' + FILL(d, 0)',
       usingMetrics: {
-        f0: new cloudwatch.Metric({ namespace: 'AWS/Events', metricName: 'FailedInvocations', dimensionsMap: { RuleName: ruleNames[0] }, statistic: cloudwatch.Stats.SUM, period: cdk.Duration.minutes(5) }),
-        f1: new cloudwatch.Metric({ namespace: 'AWS/Events', metricName: 'FailedInvocations', dimensionsMap: { RuleName: ruleNames[1] }, statistic: cloudwatch.Stats.SUM, period: cdk.Duration.minutes(5) }),
+        ...Object.fromEntries(ruleNames.map((name, i) => [`f${i}`, new cloudwatch.Metric({
+          namespace: 'AWS/Events', metricName: 'FailedInvocations', dimensionsMap: { RuleName: name },
+          statistic: cloudwatch.Stats.SUM, period: cdk.Duration.minutes(5) })])),
         d: deadLetters.metricApproximateNumberOfMessagesVisible({ statistic: cloudwatch.Stats.MAXIMUM, period: cdk.Duration.minutes(5) }),
       },
       period: cdk.Duration.minutes(5),
