@@ -1,7 +1,9 @@
 // Command votesctl is the operator's tool for votes.vettid.org:
 //
-//	votesctl site-key -secret <arn>
-//	    prints the site's Ed25519 public key (base64) from its secret
+//	votesctl site-key -kms <key arn> | -secret <arn>
+//	    prints the site's Ed25519 public key (base64), from its KMS key or
+//	    its secret
+//	votesctl publish-services -kms <key arn> -site-key <base64> -watch-topics <arn>,<arn> -bucket <name> -in services.json
 //	votesctl publish-services -secret <arn> -bucket <name> -in services.json
 //	    signs the service list and publishes it, if it extends the one
 //	    published: a higher version, the previous one's hash, and every
@@ -21,8 +23,12 @@
 // 2 for a usage error; 3 when the checks held but the report has ok false:
 // a mismatch (docs/VOTES-SITE.md §7).
 //
-// The site's key is derived from its Secrets Manager secret as
-// Ed25519(seed = SHA-256(secret string)).
+// The site's key is the stack's KMS key (SiteSigningKeyArn), which only
+// its publish role may sign with (README "The site's signing keys"); with
+// -kms, publish-services signs through KMS, checks every signature under
+// -site-key, and first checks that the key watch's emails are confirmed.
+// Until the staging flag day it can still be derived from the Secrets
+// Manager secret as Ed25519(seed = SHA-256(secret string)) (-secret).
 package main
 
 import (
@@ -35,14 +41,16 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/sns"
 
 	"github.com/vettid/service-vault/vote"
-	"github.com/vettid/vettid-vault/vms/suite"
 	"github.com/vettid/votes/site"
 )
 
@@ -55,19 +63,23 @@ func main() {
 	switch os.Args[1] {
 	case "site-key":
 		fs := flag.NewFlagSet("site-key", flag.ExitOnError)
-		secret := fs.String("secret", "", "the site key's Secrets Manager secret")
+		kmsKey := fs.String("kms", "", "the site key's KMS key ARN (the stack's SiteSigningKeyArn)")
+		secret := fs.String("secret", "", "the site key's Secrets Manager secret (until the flag day)")
 		_ = fs.Parse(os.Args[2:])
-		var k ed25519.PrivateKey
-		if k, err = siteKey(ctx, *secret); err == nil {
-			fmt.Println(base64.StdEncoding.EncodeToString(k.Public().(ed25519.PublicKey)))
+		var pub ed25519.PublicKey
+		if pub, err = sitePublicKey(ctx, *kmsKey, *secret); err == nil {
+			fmt.Println(base64.StdEncoding.EncodeToString(pub))
 		}
 	case "publish-services":
 		fs := flag.NewFlagSet("publish-services", flag.ExitOnError)
-		secret := fs.String("secret", "", "the site key's Secrets Manager secret")
+		kmsKey := fs.String("kms", "", "the site key's KMS key ARN (the stack's SiteSigningKeyArn)")
+		expect := fs.String("site-key", "", "with -kms: the site's public key (base64) the vaults and the site pin")
+		watch := fs.String("watch-topics", "", "with -kms: the key watch's topics, comma-separated (KeyWatchTopicArn,KeyWatchTopicBArn)")
+		secret := fs.String("secret", "", "the site key's Secrets Manager secret (until the flag day)")
 		bucket := fs.String("bucket", "", "the site's bucket")
 		in := fs.String("in", "services.json", "the service list")
 		_ = fs.Parse(os.Args[2:])
-		err = publish(ctx, *secret, *bucket, *in)
+		err = publish(ctx, publishArgs{kms: *kmsKey, siteKey: *expect, watch: *watch, secret: *secret, bucket: *bucket, in: *in})
 	case "check":
 		os.Exit(runCheck(ctx, os.Args[2:], os.Stdout, os.Stderr))
 	default:
@@ -80,7 +92,9 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: votesctl site-key -secret <arn> | publish-services -secret <arn> -bucket <name> -in <file>\n"+
+	fmt.Fprintln(os.Stderr, "usage: votesctl site-key -kms <key arn> | -secret <arn>\n"+
+		"       votesctl publish-services -kms <key arn> -site-key <base64> -watch-topics <arn>,<arn> -bucket <name> -in <file>\n"+
+		"       votesctl publish-services -secret <arn> -bucket <name> -in <file>\n"+
 		"       votesctl check -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] <proposal_id>\n"+
 		"       votesctl check -all [-since YYYY-MM] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>]")
 	os.Exit(2)
@@ -106,15 +120,44 @@ func siteKey(ctx context.Context, secret string) (ed25519.PrivateKey, error) {
 	return ed25519.NewKeyFromSeed(seed[:]), nil
 }
 
-func publish(ctx context.Context, secret, bucket, in string) error {
-	if bucket == "" {
+// sitePublicKey is site-key's work: the public key from KMS (-kms) or
+// from the secret (-secret), exactly one of them.
+func sitePublicKey(ctx context.Context, kmsKey, secret string) (ed25519.PublicKey, error) {
+	if (kmsKey == "") == (secret == "") {
+		return nil, errors.New("give exactly one of -kms and -secret")
+	}
+	if secret != "" {
+		k, err := siteKey(ctx, secret)
+		if err != nil {
+			return nil, err
+		}
+		return secretSigner(k).Public(), nil
+	}
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return kmsPublicKey(ctx, kms.NewFromConfig(cfg), kmsKey)
+}
+
+type publishArgs struct {
+	kms, siteKey, watch, secret, bucket, in string
+}
+
+func publish(ctx context.Context, a publishArgs) error {
+	if a.bucket == "" {
 		return errors.New("-bucket is required")
 	}
-	key, err := siteKey(ctx, secret)
-	if err != nil {
-		return err
+	if (a.kms == "") == (a.secret == "") {
+		return errors.New("give exactly one of -kms and -secret")
 	}
-	raw, err := os.ReadFile(in)
+	if a.kms == "" && (a.siteKey != "" || a.watch != "") {
+		return errors.New("-site-key and -watch-topics go with -kms")
+	}
+	if a.kms != "" && (a.siteKey == "" || a.watch == "") {
+		return errors.New("-kms needs -site-key (the site's public key) and -watch-topics (the key watch's two topics)")
+	}
+	raw, err := os.ReadFile(a.in)
 	if err != nil {
 		return err
 	}
@@ -122,25 +165,52 @@ func publish(ctx context.Context, secret, bucket, in string) error {
 	if err != nil {
 		return err
 	}
-	return publishList(ctx, s3.NewFromConfig(cfg), bucket, key, raw)
+	var signer listSigner
+	if a.secret != "" {
+		k, err := siteKey(ctx, a.secret)
+		if err != nil {
+			return err
+		}
+		signer = secretSigner(k)
+	} else {
+		var expect ed25519.PublicKey
+		if a.siteKey != "" {
+			if expect, err = decodeSiteKey(a.siteKey); err != nil {
+				return err
+			}
+		}
+		// The watch first: a publish nobody would be told of is refused
+		// before anything is signed.
+		var topics []string
+		if a.watch != "" {
+			topics = strings.Split(a.watch, ",")
+		}
+		if err := checkWatch(ctx, sns.NewFromConfig(cfg), topics); err != nil {
+			return err
+		}
+		if signer, err = newKMSSigner(ctx, kms.NewFromConfig(cfg), a.kms, expect); err != nil {
+			return err
+		}
+	}
+	return publishList(ctx, s3.NewFromConfig(cfg), a.bucket, signer, raw)
 }
 
 // publishList signs raw and publishes it on c's bucket (publish's work,
 // apart from the key and the client).
-func publishList(ctx context.Context, c *s3.Client, bucket string, key ed25519.PrivateKey, raw []byte) error {
+func publishList(ctx context.Context, c *s3.Client, bucket string, key listSigner, raw []byte) error {
 	data, err := vote.Canonicalize(raw)
 	if err != nil {
 		return err
 	}
-	sig, err := signList(key, data)
+	sig, err := signList(ctx, key, data)
 	if err != nil {
 		return err
 	}
-	next, err := site.ParseServiceList(data, sig, key.Public().(ed25519.PublicKey))
+	pub := key.Public()
+	next, err := site.ParseServiceList(data, sig, pub)
 	if err != nil {
 		return err
 	}
-	pub := key.Public().(ed25519.PublicKey)
 	cur, err := get(ctx, c, bucket, "v1/services.json")
 	if err != nil {
 		return err
@@ -298,12 +368,6 @@ func put(ctx context.Context, c *s3.Client, bucket, key string, data []byte, ct,
 		return fmt.Errorf("%s changed while publishing (another publish?): %w", key, err)
 	}
 	return nil
-}
-
-// signList is the site's signature of a list's bytes (BALLOT-PROTOCOL
-// §3.3).
-func signList(key ed25519.PrivateKey, data []byte) ([]byte, error) {
-	return suite.Sign(key, vote.LabelServiceList, sum(data))
 }
 
 func sum(b []byte) []byte { h := sha256.Sum256(b); return h[:] }

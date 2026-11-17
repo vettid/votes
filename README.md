@@ -122,9 +122,11 @@ environment. None has a default.
    CloudFront distribution, the name's records and the site key's
    secret (output `SiteKeySecret`). Uploads are refused until step 4.
 3. **The site key:** build votesctl (`go build -o votesctl ./cmd/votesctl`
-   at the root), then `./votesctl site-key -secret <SiteKeySecret>`
-   prints its public key. It also goes in the member vaults' release
-   config (BALLOT-PROTOCOL §3.3).
+   at the root), then `./votesctl site-key -kms <SiteSigningKeyArn>`
+   (as the publish role, below) prints its public key; until the staging
+   flag day (GC #12646) the key is the secret's,
+   `./votesctl site-key -secret <SiteKeySecret>`. It also goes in the
+   member vaults' release config (BALLOT-PROTOCOL §3.3).
 4. **Deploy again** with `-c siteKey=<that key>`, and pass it on every
    deploy from then on (a deploy without it is refused).
 5. **The service list:** `services.json` holds
@@ -139,7 +141,27 @@ environment. None has a default.
    from the service vault's `GET /v1/anchor-key`. Each later list has the
    next `version` and, as `previous`, the base64 SHA-256 of the published
    `v1/services.json`. Publish it with
-   `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`.
+   `./votesctl publish-services -kms <SiteSigningKeyArn> -site-key <that key> -watch-topics <KeyWatchTopicArn>,<KeyWatchTopicBArn> -bucket <BucketName> -in services.json`,
+   as the publish role (until the flag day, with the secret's key:
+   `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`).
+   With `-kms` it takes the key's ARN only, never an alias; it refuses a
+   key that isn't an Ed25519 signing key whose public key is
+   `-site-key`; it signs through KMS (`ED25519_SHA_512` over the label
+   and the list's SHA-256) and checks every signature under `-site-key`
+   before anything is written; and first it refuses to publish unless
+   both key watch topics have an email subscription and every one is
+   confirmed (README "The watch"), since nobody would be told of the
+   signature. To act as the publish role, add a profile and set
+   `AWS_PROFILE` to it:
+
+   ```ini
+   [profile votes-publish-<env>]
+   role_arn = <PublishRoleArn>
+   source_profile = <your Identity Center profile>
+   ```
+
+   Each publish is emailed (twice) and raises the key-use alarm: that is
+   the watch working.
    Each version is also kept, write-once, as `v1/services/<version>.json`
    and `.sig`, for vaults that missed versions; running the command again
    with the list that is already published writes its copy if it is
