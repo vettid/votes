@@ -113,7 +113,7 @@ func TestCheckCommand(t *testing.T) {
 	all := func() (allReport, bool, error) {
 		t.Helper()
 		var out bytes.Buffer
-		ok, err := checkAll(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), httpModified(srv.URL, noRedirects()), anchors, key, "2026-10", nil, time.Now())
+		ok, err := checkAll(context.Background(), &out, httpFetcher(srv.URL, noRedirects()), httpModified(srv.URL, noRedirects()), anchors, key, "2026-10", nil, nil, time.Now())
 		var rep allReport
 		if jerr := json.Unmarshal(out.Bytes(), &rep); jerr != nil {
 			t.Fatalf("%v: %s", jerr, out.Bytes())
@@ -129,8 +129,15 @@ func TestCheckCommand(t *testing.T) {
 	store.Objects["v1/services/1.json"], store.Objects["v1/services/1.json.sig"] = list, lsig
 	rep2, ok, err := all()
 	if err != nil || !ok || rep2.Services.Checked != 1 || len(rep2.Proposals) != 1 || !rep2.Proposals[0].OK ||
-		rep2.Proposals[0].ProposalID != p.ProposalID || len(rep2.Months) == 0 {
+		rep2.Proposals[0].ProposalID != p.ProposalID || len(rep2.Months) == 0 || rep2.Services.Log != "not pinned" {
 		t.Fatalf("-all: %+v %v %v", rep2, ok, err)
+	}
+	// Pinned: the report says from which version, and the unlogged list.
+	var lout bytes.Buffer
+	if ok, err := checkAll(context.Background(), &lout, httpFetcher(srv.URL, noRedirects()), httpModified(srv.URL, noRedirects()), anchors, key, "2026-10", nil,
+		&listLogPin{spki: []byte("pin"), first: 1}, time.Now()); err != nil || ok ||
+		!bytes.Contains(lout.Bytes(), []byte(`"log": "from version 1"`)) || !bytes.Contains(lout.Bytes(), []byte(`services/1: no bundle`)) {
+		t.Fatalf("pinned: %v %v %s", ok, err, lout.Bytes())
 	}
 	// A listed proposal the site doesn't serve is an error, reported with
 	// the rest.
@@ -179,6 +186,16 @@ func TestCheckCommand(t *testing.T) {
 		{args("-site-key", key), exitUsage},
 		{args("-site-key", key, "-all", p.ProposalID), exitUsage},
 		{args("-site-key", key, "-bogus"), exitUsage},
+		// The list log's pins: both or neither, only with -all, and valid.
+		{args("-site-key", key, "-all", "-list-anchor-pub", "cGlu"), exitUsage},
+		{args("-site-key", key, "-all", "-first-logged", "1"), exitUsage},
+		{args("-site-key", key, "-list-anchor-pub", "cGlu", "-first-logged", "1", p.ProposalID), exitUsage},
+		{args("-site-key", key, "-all", "-list-anchor-pub", "!", "-first-logged", "1"), exitUsage},
+		{args("-site-key", key, "-all", "-list-anchor-pub", "cGlu", "-first-logged", "-1"), exitUsage},
+		// Pinned from version 1: the list has no bundle, a mismatch.
+		{args("-site-key", key, "-all", "-list-anchor-pub", "cGlu", "-first-logged", "1"), exitMismatch},
+		// Pinned from the next version (before the flag day's publish): ok.
+		{args("-site-key", key, "-all", "-list-anchor-pub", "cGlu", "-first-logged", "2"), exitOK},
 	} {
 		if got := code(c.args); got != c.want {
 			t.Errorf("%v: exit %d, want %d", c.args[6:], got, c.want)

@@ -13,6 +13,15 @@ name: monitor
 # VOTES_PROD_SITE_KEY to it (`votesctl site-key`) once production is
 # deployed; until then its check is skipped with a warning.
 #
+# The service list's Rekor log (docs/VOTES-SITE.md §3, §7): each
+# environment's list anchor key (its SubjectPublicKeyInfo, base64, as
+# `votesctl list-anchor-key` prints it) and the first version logged with
+# it are pinned here, in this file, so that a change of either is a
+# reviewed PR, never a repository variable. Both are set by a PR on the
+# environment's first publish with -kms (staging: the flag day, GC
+# #12646); until then the log isn't checked, with a warning, and one set
+# without the other fails the run.
+#
 # Partial uploads the site can never complete are listed, each by PR with
 # its reason, in monitor/acknowledged-<env>.json (docs/VOTES-SITE.md §7).
 #
@@ -64,6 +73,8 @@ jobs:
             sigstore: staging
             key_var: VOTES_STAGING_SITE_KEY
             default_key: c4dqg2ssGVylbO9Xnpdv4zopmzx9S++4KgxMWOyhXJQ=
+            list_anchor_pub: ""
+            first_logged: ""
             role_var: VOTES_STAGING_MONITOR_ROLE_ARN
             topic_var: VOTES_STAGING_ALERT_TOPIC_ARN
           - env: prod
@@ -71,6 +82,8 @@ jobs:
             sigstore: production
             key_var: VOTES_PROD_SITE_KEY
             default_key: ""
+            list_anchor_pub: ""
+            first_logged: ""
             role_var: VOTES_PROD_MONITOR_ROLE_ARN
             topic_var: VOTES_PROD_ALERT_TOPIC_ARN
     defaults:
@@ -99,14 +112,25 @@ jobs:
           SIGSTORE: ${{ matrix.sigstore }}
           SITE_KEY: ${{ vars[matrix.key_var] || matrix.default_key }}
           KEY_VAR: ${{ matrix.key_var }}
+          LIST_ANCHOR_PUB: ${{ matrix.list_anchor_pub }}
+          FIRST_LOGGED: ${{ matrix.first_logged }}
         run: |
           if [ -z "$SITE_KEY" ]; then
             echo "::warning::$SITE not checked: set the repository variable $KEY_VAR to its site key"
             exit 0
           fi
+          log=()
+          if [ -n "$LIST_ANCHOR_PUB" ] && [ -n "$FIRST_LOGGED" ]; then
+            log=(-list-anchor-pub "$LIST_ANCHOR_PUB" -first-logged "$FIRST_LOGGED")
+          elif [ -n "$LIST_ANCHOR_PUB$FIRST_LOGGED" ]; then
+            echo "::error::$SITE: list_anchor_pub and first_logged are pinned together (monitor.yml)"
+            exit 1
+          else
+            echo "::warning::$SITE: the service list's Rekor log isn't checked: its list anchor key isn't pinned in monitor.yml yet"
+          fi
           code=0
           "$RUNNER_TEMP/votesctl" check -all -site "$SITE" -sigstore "$SIGSTORE" -site-key "$SITE_KEY" \
-            -acknowledged "monitor/acknowledged-${{ matrix.env }}.json" || code=$?
+            "${log[@]}" -acknowledged "monitor/acknowledged-${{ matrix.env }}.json" || code=$?
           echo "checked=true" >> "$GITHUB_OUTPUT"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           exit "$code"

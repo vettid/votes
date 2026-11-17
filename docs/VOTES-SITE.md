@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.13 (2026-11-17), draft. The protocol this site serves is
+**Status:** 0.2.14 (2026-11-17), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -58,7 +58,7 @@ All under `https://votes.vettid.org/v1/`.
 |---|---|---|
 | `services.json`, `.sig` | The service list and the site's signature (BALLOT-PROTOCOL §3.3, §8.5). The two are separate objects, so while a publish moves them a reader may get a list and a signature of different versions; the cache is short so that a retry soon gets the matching pair | 10 s |
 | `services/<version>.json`, `.sig` | Every version of the service list that has been the current one, with its signature, written once just after it becomes current (`<version>` in decimal; the current version's copy may lag it briefly). Versions are consecutive, so for a vault holding version `h` the app fetches `h+1` to the current version in order, and each chains to the one before. A copy that is missing yet (404) is retried later | 1 year, immutable |
-| `services/<version>.bundle` | The list's Rekor anchor: a Sigstore bundle in BALLOT-PROTOCOL §8.5's Rekor profile, over SHA-256 of that version's `services/<version>.json` bytes (the same bytes as `services.json` when it was current), signed with the site's list anchor key, an ECDSA P-256 key the site's operator alone may sign with (the site key, Ed25519, can't sign a Rekor `hashedrekord` entry). Written once by `publish-services`, which makes the entry only for a list it has checked and signed with the site key, and uses a bundle already there only if it anchors that version's bytes. **Every version from the first one logged on has a bundle**, written before that version's `services.json.sig` and `services.json` are moved; versions before it have none. The first logged version is the first published with the site's KMS key: on staging, the flag day's (GC #12646), the lists before it being under the old secret's key, which is never logged; in production, version 1. (A list already current when it is first logged gets its bundle after it was first served; only a list published by the KMS path before this version of the site, which no environment has, could be one.) The monitor takes the first logged version as configuration; a missing bundle (404) from it on is a list served unlogged, and its checks (§7) come with GC #12646 task 4. A rerun after Rekor accepted an entry but the publish then failed can make a second entry for the same list (each signature is new), so entries are matched to kept versions by the list's SHA-256, never by entry. **The key and the instance:** a verifier takes the list anchor key's SubjectPublicKeyInfo from configuration, pinned like the first logged version (printed once by `votesctl list-anchor-key`, which reads it from KMS), never from a bundle; the bundles are on the environment's Sigstore instance (its `sigstore`, which the key's `vettid:sigstore` tag names and `publish-services` checks). The key signs SHA-256 of a list's bytes, raw, with no label, and nothing else: every Rekor entry under it is a claimed service list. An entry, or a bundle, can exist for a list that was never served: a publish that lost a race, or failed after logging and was not run again (while such a bundle stands, a different list at its version is refused). So the monitor reports an entry whose digest is no kept version's as a claimed list to look into, not as proof that it was served | 1 year, immutable |
+| `services/<version>.bundle` | The list's Rekor anchor: a Sigstore bundle in BALLOT-PROTOCOL §8.5's Rekor profile, over SHA-256 of that version's `services/<version>.json` bytes (the same bytes as `services.json` when it was current), signed with the site's list anchor key, an ECDSA P-256 key the site's operator alone may sign with (the site key, Ed25519, can't sign a Rekor `hashedrekord` entry). Written once by `publish-services`, which makes the entry only for a list it has checked and signed with the site key, and uses a bundle already there only if it anchors that version's bytes. **Every version from the first one logged on has a bundle**, written before that version's `services.json.sig` and `services.json` are moved; versions before it have none. The first logged version is the first published with the site's KMS key: on staging, the flag day's (GC #12646), the lists before it being under the old secret's key, which is never logged; in production, version 1. (A list already current when it is first logged gets its bundle after it was first served; only a list published by the KMS path before this version of the site, which no environment has, could be one.) The monitor takes the first logged version as configuration; a missing bundle (404) from it on is a list served unlogged (§7). A rerun after Rekor accepted an entry but the publish then failed can make a second entry for the same list (each signature is new), so entries are matched to kept versions by the list's SHA-256, never by entry. **The key and the instance:** a verifier takes the list anchor key's SubjectPublicKeyInfo from configuration, pinned like the first logged version (printed once by `votesctl list-anchor-key`, which reads it from KMS), never from a bundle; the bundles are on the environment's Sigstore instance (its `sigstore`, which the key's `vettid:sigstore` tag names and `publish-services` checks). The key signs SHA-256 of a list's bytes, raw, with no label, and nothing else: every Rekor entry under it is a claimed service list. An entry, or a bundle, can exist for a list that was never served: a publish that lost a race, or failed after logging and was not run again (while such a bundle stands, a different list at its version is refused). So the monitor reports an entry whose digest is no kept version's as a claimed list to look into, not as proof that it was served | 1 year, immutable |
 | `index.json` | Proposals open or closed within the last 30 days: `[{proposal_id, service_id, proposal_hash, opens_at, closes_at, extended, published, unhandled?}]`, by `opens_at`; `unhandled` is the results' `counts.unhandled`, once they are published | 60 s |
 | `archive/<YYYY-MM>.json` | Every proposal by the month of `opens_at`, same entries | 60 s |
 | `p/<proposal_id>/proposal.json`, `.sig`, `.sigstore.json` | The proposal, `proposal_sig` (raw 64 bytes), its anchor bundle | 1 year, immutable |
@@ -201,6 +201,25 @@ reports to AWS (**Alerts**, below).
   the current version, is a mismatch, except the current version's copy
   in the 10 minutes after `services.json` was last modified (its
   `Last-Modified`), as it is written just after the list (§3).
+- **The service list's Rekor log** (§3, `services/<version>.bundle`;
+  `-list-anchor-pub` and `-first-logged`): with the environment's list
+  anchor key and first logged version pinned (in `monitor.yml`, by PR,
+  never read from the site or a bundle), every version from the first
+  logged one to the current one has a bundle that verifies, under that
+  key and the instance's trusted root, for that version's bytes (the
+  current version's for `services.json` itself, so its copy's lag doesn't
+  matter). A bundle that doesn't verify is an error; a missing one is a
+  mismatch at once, as it is written before the list moves. A bundle past
+  the current version is a list logged but never served: a mismatch,
+  except in the 10 minutes after it was written (its `Last-Modified`), a
+  publish in progress. A first logged version past the next one is an
+  error. Versions before the first logged one aren't checked; a version
+  whose copy is missing (already a mismatch) has its bundle checked only
+  once the copy is there. Until an environment's pins are set (its first
+  publish with `-kms`) the report says `"log": "not pinned"` and the run
+  warns. **Not in this check:** entries in Rekor under the list anchor key
+  that are no kept version's (a list signed but served elsewhere); that
+  search is its own task, designed first (the owner's a, GC #12980).
 - **Every proposal** in `index.json` and in the archive's months, from
   the site's first (2026-10, or `-since`) to the current one and those
   of the index's entries, each checked as `votesctl check <id>` does.
@@ -635,6 +654,12 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 
 ## Changes
 
+- **0.2.14 (2026-11-17):** the monitor checks the service list's Rekor
+  log (§7, GC #12646 task 4): from the pinned first logged version on,
+  every version's bundle verifies under the pinned list anchor key for
+  its bytes; a missing bundle, or one past the current version, is a
+  mismatch. The search for Rekor entries under that key that are no kept
+  version's is not in it (the owner's a, GC #12980).
 - **0.2.13 (2026-11-17):** each service list is logged in Rekor before
   it is moved (§2, §3; GC #12646 task 3, VOTE-SITE-KEY-COMPROMISE §6
   step 3): SHA-256 of the list, signed with a separate ECDSA P-256 list

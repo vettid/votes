@@ -41,9 +41,22 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	all := fs.Bool("all", false, "check the service list's chain and every proposal the index and the archive list")
 	since := fs.String("since", firstMonth, "with -all: the first archive month read (YYYY-MM)")
 	ackFile := fs.String("acknowledged", "", "a file of acknowledged partial uploads (docs/VOTES-SITE.md §7)")
-	if fs.Parse(args) != nil || *all != (fs.NArg() == 0) || fs.NArg() > 1 {
-		fmt.Fprintln(stderr, "usage: votesctl check [-all [-since YYYY-MM] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] [-acknowledged <file>]")
+	anchorPub := fs.String("list-anchor-pub", "", "with -all: the list anchor key's SubjectPublicKeyInfo (base64), pinned; with -first-logged, every version from it on must have its Rekor bundle")
+	firstLogged := fs.Int64("first-logged", 0, "with -all and -list-anchor-pub: the first version of the service list that was logged in Rekor, pinned")
+	usageLine := "usage: votesctl check [-all [-since YYYY-MM] [-list-anchor-pub <base64> -first-logged <version>] | <proposal_id>] -site-key <base64> [-site <url>] [-sigstore production|staging] [-trusted-root <file>] [-acknowledged <file>]"
+	if fs.Parse(args) != nil || *all != (fs.NArg() == 0) || fs.NArg() > 1 ||
+		(*anchorPub == "") != (*firstLogged == 0) || (*anchorPub != "" && !*all) {
+		fmt.Fprintln(stderr, usageLine)
 		return exitUsage
+	}
+	var logPin *listLogPin
+	if *anchorPub != "" {
+		spki, err := base64.StdEncoding.Strict().DecodeString(*anchorPub)
+		if err != nil || len(spki) == 0 || *firstLogged < 1 {
+			fmt.Fprintln(stderr, "votesctl: -list-anchor-pub is the list anchor key's SubjectPublicKeyInfo in base64 (votesctl list-anchor-key), and -first-logged a version from 1")
+			return exitUsage
+		}
+		logPin = &listLogPin{spki: spki, first: *firstLogged}
 	}
 	var acks []site.Acknowledgement
 	anchors, err := anchorsFor(*instance, *rootFile)
@@ -58,7 +71,7 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		c := noRedirects()
 		fetch := httpFetcher(*base, c)
 		if *all {
-			ok, err = checkAll(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, *since, acks, time.Now())
+			ok, err = checkAll(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, *since, acks, logPin, time.Now())
 		} else {
 			ok, err = checkVote(ctx, stdout, fetch, httpModified(*base, c), anchors, *key, fs.Arg(0), acks, time.Now())
 		}
@@ -296,10 +309,21 @@ type allReport struct {
 }
 
 type servicesOut struct {
-	Version    int64    `json:"version"`
-	Checked    int      `json:"checked"`
+	Version int64 `json:"version"`
+	Checked int   `json:"checked"`
+	// Log is the list's Rekor log: "not pinned" when check ran without
+	// -list-anchor-pub and -first-logged, else "from version <n>", with
+	// Logged the bundles verified.
+	Log        string   `json:"log"`
+	Logged     int      `json:"logged"`
 	Mismatches []string `json:"mismatches,omitempty"`
 	Error      string   `json:"error,omitempty"`
+}
+
+// listLogPin is check -all's pins for the list's Rekor log.
+type listLogPin struct {
+	spki  []byte
+	first int64
 }
 
 // errChecksFailed is check -all's error when a check failed somewhere;
@@ -313,7 +337,7 @@ var errChecksFailed = errors.New("checks failed: see the report's errors")
 // failed, or the index or an archive month couldn't be read (the
 // report is still written, naming each).
 func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, modified func(context.Context, string) (time.Time, error),
-	anchors *site.Anchors, siteKeyB64, since string, acks []site.Acknowledgement, now time.Time) (ok bool, err error) {
+	anchors *site.Anchors, siteKeyB64, since string, acks []site.Acknowledgement, pin *listLogPin, now time.Time) (ok bool, err error) {
 	key, err := decodeSiteKey(siteKeyB64)
 	if err != nil {
 		return false, err
@@ -323,11 +347,18 @@ func checkAll(ctx context.Context, w io.Writer, fetch site.Fetcher, modified fun
 		return false, errors.New("-since: a month, YYYY-MM")
 	}
 	out := allReport{TrustedRoot: anchors.RootSource(), Months: []string{}, Proposals: []report{}}
-	if c, err := site.CheckServiceChain(ctx, fetch, key, now, modified); err != nil {
+	var lg *site.ListLog
+	logDesc := "not pinned"
+	if pin != nil {
+		lg = &site.ListLog{Anchors: anchors, SPKI: pin.spki, First: pin.first}
+		logDesc = fmt.Sprintf("from version %d", pin.first)
+	}
+	out.Services.Log = logDesc
+	if c, err := site.CheckServiceChainLogged(ctx, fetch, key, now, modified, lg); err != nil {
 		out.Services.Error = err.Error()
 		out.Errors++
 	} else {
-		out.Services = servicesOut{Version: c.Version, Checked: c.Checked, Mismatches: c.Mismatches}
+		out.Services = servicesOut{Version: c.Version, Checked: c.Checked, Log: logDesc, Logged: c.Logged, Mismatches: c.Mismatches}
 	}
 
 	// The proposals: the index's, then each month's archive.
