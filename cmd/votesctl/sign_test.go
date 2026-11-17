@@ -379,6 +379,10 @@ func TestPublishFlags(t *testing.T) {
 		{publishArgs{kms: testKeyARN, in: "x"}, "-bucket"},
 		{publishArgs{kms: testKeyARN, watch: topicA + "," + topicB, bucket: "b", in: "x"}, "needs -site-key"},
 		{publishArgs{kms: testKeyARN, siteKey: "k", bucket: "b", in: "x"}, "needs -site-key"},
+		{publishArgs{secret: "s", listAnchor: testAnchorARN, bucket: "b", in: "x"}, "go with -kms"},
+		{publishArgs{secret: "s", sigstore: "staging", bucket: "b", in: "x"}, "go with -kms"},
+		{publishArgs{kms: testKeyARN, siteKey: "k", watch: topicA + "," + topicB, sigstore: "staging", bucket: "b", in: "x"}, "-list-anchor-key"},
+		{publishArgs{kms: testKeyARN, siteKey: "k", watch: topicA + "," + topicB, listAnchor: testAnchorARN, bucket: "b", in: "x"}, "-sigstore"},
 	} {
 		if err := publish(ctx, c.a); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%+v: %v, want %q", c.a, err, c.want)

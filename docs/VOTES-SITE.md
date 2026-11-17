@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.12 (2026-11-10), draft. The protocol this site serves is
+**Status:** 0.2.13 (2026-11-17), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -26,7 +26,7 @@ one: the service's signature and the Rekor anchor catch that.
 | Bucket | Private S3 bucket, versioned, blocking public access. Read only through CloudFront (origin access control). Written only by the upload function, which cannot delete. |
 | CloudFront | `votes.vettid.org`. Serves `/v1/*` from the bucket and `/api/*` from the API. Security headers as vettid.org's sites. No access logs. Behind an AWS WAF web ACL with one rate rule (§4, "Limits"). |
 | Upload API | API Gateway HTTP API → Lambda `votes-api` (Go, arm64). |
-| Service list | `services.json`, kept by VettID's operator (a service is added by the owner, BALLOT-PROTOCOL §3.3), not in this repository. The operator's `votesctl publish-services` signs it with the site's Ed25519 key and writes it to the bucket as `v1/services.json` and `.sig`, refusing a list that doesn't extend the published one, and keeps each version as `v1/services/<version>.json` (§3): the bucket's copies are the record of every list. The function reads it on every upload and checks it under the site's public key whenever its bytes or its signature's differ from the pair it checked last. |
+| Service list | `services.json`, kept by VettID's operator (a service is added by the owner, BALLOT-PROTOCOL §3.3), not in this repository. The operator's `votesctl publish-services` signs it with the site's Ed25519 key and writes it to the bucket as `v1/services.json` and `.sig`, refusing a list that doesn't extend the published one, and keeps each version as `v1/services/<version>.json` (§3): the bucket's copies are the record of every list. Each list is also logged in Rekor before it is moved, under the site's **list anchor key** (§3, `services/<version>.bundle`), so that a list signed with the site key but never logged can be told from outside AWS. The function reads it on every upload and checks it under the site's public key whenever its bytes or its signature's differ from the pair it checked last. |
 | Stack | CDK (TypeScript), `VotesSite-staging` and `VotesSite-prod`, as member-service. |
 
 **(chosen; not in the spec:** Lambda rather than an ECS service, because
@@ -58,6 +58,7 @@ All under `https://votes.vettid.org/v1/`.
 |---|---|---|
 | `services.json`, `.sig` | The service list and the site's signature (BALLOT-PROTOCOL §3.3, §8.5). The two are separate objects, so while a publish moves them a reader may get a list and a signature of different versions; the cache is short so that a retry soon gets the matching pair | 10 s |
 | `services/<version>.json`, `.sig` | Every version of the service list that has been the current one, with its signature, written once just after it becomes current (`<version>` in decimal; the current version's copy may lag it briefly). Versions are consecutive, so for a vault holding version `h` the app fetches `h+1` to the current version in order, and each chains to the one before. A copy that is missing yet (404) is retried later | 1 year, immutable |
+| `services/<version>.bundle` | The list's Rekor anchor: a Sigstore bundle in BALLOT-PROTOCOL §8.5's Rekor profile, over SHA-256 of that version's `services/<version>.json` bytes (the same bytes as `services.json` when it was current), signed with the site's list anchor key, an ECDSA P-256 key the site's operator alone may sign with (the site key, Ed25519, can't sign a Rekor `hashedrekord` entry). Written once, before the version's `services.json.sig` and `services.json`, by `publish-services`, which makes the entry only for a list it has checked and signed, and uses a bundle already there only if it anchors that version's bytes. Versions published before the site's keys moved to KMS (GC #12646; staging only) have none. A bundle that is missing (404) means the version isn't logged; the monitor's check of the bundles (§7) comes with GC #12646 task 4 | 1 year, immutable |
 | `index.json` | Proposals open or closed within the last 30 days: `[{proposal_id, service_id, proposal_hash, opens_at, closes_at, extended, published, unhandled?}]`, by `opens_at`; `unhandled` is the results' `counts.unhandled`, once they are published | 60 s |
 | `archive/<YYYY-MM>.json` | Every proposal by the month of `opens_at`, same entries | 60 s |
 | `p/<proposal_id>/proposal.json`, `.sig`, `.sigstore.json` | The proposal, `proposal_sig` (raw 64 bytes), its anchor bundle | 1 year, immutable |
@@ -634,6 +635,14 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 
 ## Changes
 
+- **0.2.13 (2026-11-17):** each service list is logged in Rekor before
+  it is moved (§2, §3; GC #12646 task 3, VOTE-SITE-KEY-COMPROMISE §6
+  step 3): SHA-256 of the list, signed with a separate ECDSA P-256 list
+  anchor key in KMS, in BALLOT-PROTOCOL §8.5's Rekor profile, the bundle
+  kept write-once as `services/<version>.bundle`. The monitor's checks of
+  these bundles, and of entries under the list anchor key that aren't a
+  kept version, come in the next version (task 4); vaults don't yet
+  require a list's bundle (a later VAULT-MESSAGING change).
 - **0.2.12 (2026-11-10):** `votesctl check -all -rekor` (§7)
   reads Rekor v1 through an allowlist of four endpoints (never one that
   adds to the log), and the site by `GET` and `HEAD` only. It searches

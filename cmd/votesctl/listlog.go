@@ -1,0 +1,117 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/vettid/service-vault/anchor"
+
+	"github.com/vettid/votes/signer/awsio"
+	"github.com/vettid/votes/site"
+)
+
+// listLog logs each service list in Rekor (VOTES-SITE §3, GC #12646 task
+// 3): SHA-256 of the list's bytes, signed with the list anchor key, an
+// ECDSA P-256 key in KMS that only the publish role may sign with, in the
+// Rekor profile of BALLOT-PROTOCOL §8.5. The site key can't sign its own
+// entry: Rekor's hashedrekord takes no pure Ed25519.
+type listLog interface {
+	// Check reports whether bundle anchors exactly data under the list
+	// anchor key: the signature, the Rekor entry and its inclusion proof,
+	// and one RFC 3161 timestamp, under the instance's trusted root.
+	Check(bundle, data []byte) error
+	// Anchor signs data with the list anchor key (one KMS Sign), enters it
+	// in Rekor, and returns its bundle, checked as Check checks it. A Rekor
+	// entry is public and permanent: Anchor is called only for a list that
+	// every check has passed and that the site key has signed.
+	Anchor(ctx context.Context, data []byte) ([]byte, error)
+}
+
+// rekorLog is the listLog on a Sigstore instance.
+type rekorLog struct {
+	a    *anchor.Anchorer
+	v    *site.Anchors
+	spki []byte
+}
+
+func (r *rekorLog) Check(bundle, data []byte) error {
+	_, err := r.v.Verify(bundle, data, r.spki)
+	return err
+}
+
+func (r *rekorLog) Anchor(ctx context.Context, data []byte) ([]byte, error) {
+	b, err := r.a.Anchor(ctx, data)
+	if err != nil {
+		return nil, fmt.Errorf("logging the list in Rekor: %w", err)
+	}
+	if err := r.Check(b, data); err != nil {
+		return nil, fmt.Errorf("the list's Rekor bundle doesn't verify: nothing written: %w", err)
+	}
+	return b, nil
+}
+
+// newRekorLog checks the list anchor key (an ECDSA P-256 signing key, by
+// ARN only, in the site key's partition, region and account) and returns
+// the list log on instance, whose trusted root it fetches through TUF.
+func newRekorLog(ctx context.Context, k kmsAPI, keyARN, siteKeyARN, instance string) (*rekorLog, error) {
+	if !kmsKeyARN.MatchString(keyARN) {
+		return nil, errors.New("-list-anchor-key takes the list anchor key's ARN (arn:aws:kms:<region>:<account>:key/<id>, the stack's ListAnchorKeyArn), not an alias or a key id")
+	}
+	if keyARN == siteKeyARN {
+		return nil, errors.New("-list-anchor-key is -kms: it is the stack's ListAnchorKeyArn, the other key")
+	}
+	a, s := strings.Split(keyARN, ":"), strings.Split(siteKeyARN, ":")
+	if a[1] != s[1] || a[3] != s[3] || a[4] != s[4] {
+		return nil, errors.New("-list-anchor-key is not in the site key's partition, region and account")
+	}
+	if instance != site.Staging && instance != site.Production {
+		return nil, fmt.Errorf("-sigstore is %q: give staging or production, the stack's sigstore", instance)
+	}
+	key, err := awsio.NewKey(ctx, k, keyARN)
+	if err != nil {
+		return nil, fmt.Errorf("the list anchor key: %w", err)
+	}
+	anch, err := anchor.NewSigner(instance, key)
+	if err != nil {
+		return nil, err
+	}
+	ver, err := site.NewAnchors(instance)
+	if err != nil {
+		return nil, err
+	}
+	return &rekorLog{a: anch, v: ver, spki: anch.PublicKeyDER()}, nil
+}
+
+// bundleKey is a list version's Rekor bundle in the bucket, kept
+// write-once beside its copy (VOTES-SITE §3).
+func bundleKey(version int64) string { return fmt.Sprintf("v1/services/%d.bundle", version) }
+
+// keptBundle returns the bundle kept for a version, after checking that it
+// anchors data: nil if there is none yet. One that anchors anything else
+// is refused (a version is never rewritten), before anything is signed.
+func keptBundle(ctx context.Context, c s3API, bucket string, lg listLog, version int64, data []byte) ([]byte, error) {
+	o, err := get(ctx, c, bucket, bundleKey(version))
+	if err != nil || o.data == nil {
+		return nil, err
+	}
+	if err := lg.Check(o.data, data); err != nil {
+		return nil, fmt.Errorf("%s holds a bundle that doesn't anchor this list (%v): a version is never rewritten", bundleKey(version), err)
+	}
+	return o.data, nil
+}
+
+// logList makes sure a version's list is logged: the bundle kept (have,
+// from keptBundle), or a new entry, kept write-once before the list is
+// moved, so that no list is served without its entry.
+func logList(ctx context.Context, c s3API, bucket string, lg listLog, version int64, data, have []byte) error {
+	if have != nil {
+		return nil
+	}
+	b, err := lg.Anchor(ctx, data)
+	if err != nil {
+		return err
+	}
+	return writeOnce(ctx, c, bucket, bundleKey(version), b, "application/json")
+}
