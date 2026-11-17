@@ -330,10 +330,12 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, lg
 		if err := keepVersion(ctx, c, bucket, next.Version, data, sig); err != nil {
 			return err
 		}
-		if lg != nil {
-			if err := logList(ctx, c, bucket, lg, next.Version, data, have); err != nil {
+		if lg != nil && have == nil {
+			if err := logList(ctx, c, bucket, lg, next.Version, data, nil); err != nil {
 				return err
 			}
+			fmt.Printf("service list version %d is already published; its history is kept, and it is now logged in Rekor\n", next.Version)
+			return nil
 		}
 		fmt.Printf("service list version %d is already published; its history is kept\n", next.Version)
 		return nil
@@ -366,6 +368,14 @@ func publishList(ctx context.Context, c s3API, bucket string, key listSigner, lg
 		}
 		if err := site.Extends(prev, cur.data, next); err != nil {
 			return err
+		}
+		// The published list's bundle, if it has one, must verify here: a
+		// -sigstore that isn't the stack's (or another list anchor key) is
+		// refused before anything is signed or logged.
+		if lg != nil {
+			if _, err := keptBundle(ctx, c, bucket, lg, prev.Version, cur.data); err != nil {
+				return err
+			}
 		}
 		if next.Version != prev.Version+1 {
 			// Consecutive, so a vault's app fetches each version after

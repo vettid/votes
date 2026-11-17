@@ -193,9 +193,18 @@ has a default.
    stray, below) and is used, so a rerun logs nothing again; a list
    already published without a bundle (before this step) is logged by
    running the same command again, with no new site signature. If
-   logging fails, nothing is written; run the same command again (the
-   site key signs again, so that publish is emailed twice). `-secret`
-   doesn't log (it goes after the flag day).
+   logging fails, nothing is written; run the same command again. The
+   site key then signs again, so that publish is emailed twice; and if
+   Rekor had already accepted the entry (the failure came after it: a
+   lost answer, the bundle's check, or its write), the list anchor key
+   signs again too, and Rekor holds a second entry for the same list
+   (the monitor, task 4, is to match entries by the list's SHA-256, so
+   that is no mismatch). Before anything is signed, the published list's own
+   bundle, if it has one, must verify on `-sigstore` under the list
+   anchor key, so a `-sigstore` that isn't the stack's is refused, not
+   logged. `-secret` doesn't log (it goes after the flag day), and it
+   can't publish once a list under the KMS key is current, so every
+   version from the first one published with `-kms` on has a bundle.
 
    **On the flag day** (GC #12646), the published list is signed with
    the secret's key: give that key as `-previous-site-key` on the first

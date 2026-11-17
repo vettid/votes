@@ -45,6 +45,10 @@ func (f *fakeS3) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*
 
 func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
 	k := aws.ToString(in.Key)
+	// As the bucket policy: under v1/services/ a put needs If-None-Match.
+	if strings.HasPrefix(k, "v1/services/") && aws.ToString(in.IfNoneMatch) != "*" {
+		return nil, errors.New("AccessDenied: write-once")
+	}
 	o, exists := f.objs[k]
 	if aws.ToString(in.IfNoneMatch) == "*" && exists || in.IfMatch != nil && (!exists || o.etag != aws.ToString(in.IfMatch)) {
 		return nil, errors.New("PreconditionFailed")
@@ -166,17 +170,26 @@ func TestPublishFlagDay(t *testing.T) {
 	}
 	h1 := sha256.Sum256(v1)
 	v2 := testList(2, h1[:], testService(3, "A"))
-	if err := publishList(ctx, b, "bucket", k, nil, nil, v2); err == nil || !strings.Contains(err.Error(), "-previous-site-key") {
+	// With the list log, as every -kms publish: the first list under the
+	// new key is logged, the old key's list (from -secret) isn't.
+	lg := &fakeLog{}
+	if err := publishList(ctx, b, "bucket", k, lg, nil, v2); err == nil || !strings.Contains(err.Error(), "-previous-site-key") {
 		t.Fatalf("without the previous key: %v", err)
 	}
-	if len(f.signs) != 0 {
-		t.Fatal("signed a list it then refused")
+	if len(f.signs) != 0 || len(lg.entries) != 0 {
+		t.Fatal("signed or logged a list it then refused")
 	}
-	if err := publishList(ctx, b, "bucket", k, nil, pub(testKey("third")), v2); err == nil || len(f.signs) != 0 {
+	if err := publishList(ctx, b, "bucket", k, lg, pub(testKey("third")), v2); err == nil || len(f.signs) != 0 || len(lg.entries) != 0 {
 		t.Fatalf("another previous key: %v, %d signs", err, len(f.signs))
 	}
-	if err := publishList(ctx, b, "bucket", k, nil, pub(old), v2); err != nil || len(f.signs) != 1 {
+	if err := publishList(ctx, b, "bucket", k, lg, pub(old), v2); err != nil || len(f.signs) != 1 {
 		t.Fatalf("the flag day: %v, %d signs", err, len(f.signs))
+	}
+	if len(lg.entries) != 1 || !bytes.Equal(b.objs["v1/services/2.bundle"].data, fakeBundle(v2)) {
+		t.Fatalf("the flag day's list isn't logged: %d entries", len(lg.entries))
+	}
+	if _, ok := b.objs["v1/services/1.bundle"]; ok {
+		t.Fatal("the old key's list was logged")
 	}
 	if _, err := site.ParseServiceList(b.objs["v1/services/2.json"].data, b.objs["v1/services/2.json.sig"].data, pub(nw)); err != nil {
 		t.Fatalf("v2 isn't under the new key: %v", err)
@@ -185,8 +198,8 @@ func TestPublishFlagDay(t *testing.T) {
 		t.Fatalf("v1's copy isn't the old key's: %v", err)
 	}
 	h2 := sha256.Sum256(v2)
-	if err := publishList(ctx, b, "bucket", k, nil, nil, testList(3, h2[:], testService(3, "A"))); err != nil || len(f.signs) != 2 {
-		t.Fatalf("after the flag day: %v, %d signs", err, len(f.signs))
+	if err := publishList(ctx, b, "bucket", k, lg, nil, testList(3, h2[:], testService(3, "A"))); err != nil || len(f.signs) != 2 || len(lg.entries) != 2 {
+		t.Fatalf("after the flag day: %v, %d signs, %d entries", err, len(f.signs), len(lg.entries))
 	}
 }
 

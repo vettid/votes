@@ -2,9 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
+	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 
 	"github.com/vettid/service-vault/anchor"
 
@@ -29,16 +36,24 @@ type listLog interface {
 	Anchor(ctx context.Context, data []byte) ([]byte, error)
 }
 
-// rekorLog is the listLog on a Sigstore instance.
+// rekorLog is the listLog on a Sigstore instance: service-vault's
+// anchor.Anchorer makes the entry, site.Anchors checks bundles.
 type rekorLog struct {
-	a    *anchor.Anchorer
-	v    *site.Anchors
-	spki []byte
+	a interface {
+		Anchor(context.Context, []byte) (json.RawMessage, error)
+	}
+	v interface {
+		Verify(bundle, doc, spki []byte) (time.Time, error)
+	}
+	spki     []byte
+	instance string
 }
 
 func (r *rekorLog) Check(bundle, data []byte) error {
-	_, err := r.v.Verify(bundle, data, r.spki)
-	return err
+	if _, err := r.v.Verify(bundle, data, r.spki); err != nil {
+		return fmt.Errorf("on Sigstore %s: %w", r.instance, err)
+	}
+	return nil
 }
 
 func (r *rekorLog) Anchor(ctx context.Context, data []byte) ([]byte, error) {
@@ -69,6 +84,19 @@ func newRekorLog(ctx context.Context, k kmsAPI, keyARN, siteKeyARN, instance str
 	if instance != site.Staging && instance != site.Production {
 		return nil, fmt.Errorf("-sigstore is %q: give staging or production, the stack's sigstore", instance)
 	}
+	// As for the site key (kmsPublicKey): KMS answered for this key, which
+	// signs with ECDSA_SHA_256. awsio.NewKey checks its spec, usage and
+	// curve, and the anchor package checks every signature under it.
+	out, err := k.GetPublicKey(ctx, &kms.GetPublicKeyInput{KeyId: aws.String(keyARN)})
+	if err != nil {
+		return nil, fmt.Errorf("reading the list anchor key: %w", err)
+	}
+	if aws.ToString(out.KeyId) != keyARN {
+		return nil, fmt.Errorf("KMS answered for key %q, not %q", aws.ToString(out.KeyId), keyARN)
+	}
+	if !slices.Contains(out.SigningAlgorithms, kmstypes.SigningAlgorithmSpecEcdsaSha256) {
+		return nil, errors.New("the list anchor key doesn't sign with ECDSA_SHA_256")
+	}
 	key, err := awsio.NewKey(ctx, k, keyARN)
 	if err != nil {
 		return nil, fmt.Errorf("the list anchor key: %w", err)
@@ -81,7 +109,7 @@ func newRekorLog(ctx context.Context, k kmsAPI, keyARN, siteKeyARN, instance str
 	if err != nil {
 		return nil, err
 	}
-	return &rekorLog{a: anch, v: ver, spki: anch.PublicKeyDER()}, nil
+	return &rekorLog{a: anch, v: ver, spki: anch.PublicKeyDER(), instance: instance}, nil
 }
 
 // bundleKey is a list version's Rekor bundle in the bucket, kept
@@ -97,7 +125,7 @@ func keptBundle(ctx context.Context, c s3API, bucket string, lg listLog, version
 		return nil, err
 	}
 	if err := lg.Check(o.data, data); err != nil {
-		return nil, fmt.Errorf("%s holds a bundle that doesn't anchor this list (%v): a version is never rewritten", bundleKey(version), err)
+		return nil, fmt.Errorf("%s holds a bundle that doesn't anchor this list (%v): check that -sigstore and -list-anchor-key are the stack's; otherwise it is a stray, and a version is never rewritten (README \"Clearing a stray version copy\")", bundleKey(version), err)
 	}
 	return o.data, nil
 }

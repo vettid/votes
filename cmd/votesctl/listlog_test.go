@@ -3,14 +3,27 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/sigstore/sigstore-go/pkg/root"
+
+	"github.com/vettid/votes/site"
 )
 
 // The list anchor key's test ARN: testKeyARN's account and region, another
@@ -85,7 +98,7 @@ func TestPublishLogsTheList(t *testing.T) {
 		t.Fatalf("bundle %q", bundle.data)
 	}
 	// Etags count the puts: the bundle went first.
-	if !(bundle.etag < sig.etag && sig.etag < list.etag) {
+	if n := func(o fakeObject) int { v, _ := strconv.Atoi(strings.Trim(o.etag, `"`)); return v }; !(n(bundle) < n(sig) && n(sig) < n(list)) {
 		t.Fatalf("put order: bundle %s, sig %s, list %s", bundle.etag, sig.etag, list.etag)
 	}
 	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err != nil {
@@ -231,10 +244,141 @@ func TestRekorLogRefuses(t *testing.T) {
 	if f.publicReads != 0 {
 		t.Fatalf("KMS called %d times", f.publicReads)
 	}
-	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging"); err == nil || !strings.Contains(err.Error(), "ECC_NIST_P256") {
+	// KMS's answer: for another key, or a key that doesn't sign with
+	// ECDSA_SHA_256 (the fake is Ed25519), or not P-256 (awsio.NewKey).
+	f.keyID = testKeyARN
+	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging"); err == nil || !strings.Contains(err.Error(), "answered for key") {
+		t.Fatalf("another key's answer: %v", err)
+	}
+	f.keyID = ""
+	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging"); err == nil || !strings.Contains(err.Error(), "ECDSA_SHA_256") {
 		t.Fatalf("an Ed25519 key: %v", err)
+	}
+	f.algs = append(f.algs, kmstypes.SigningAlgorithmSpecEcdsaSha256)
+	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging"); err == nil || !strings.Contains(err.Error(), "ECC_NIST_P256") {
+		t.Fatalf("not a P-256 key: %v", err)
 	}
 	if len(f.signs) != 0 {
 		t.Fatal("signed")
 	}
+}
+
+// A -sigstore (or list anchor key) that isn't the stack's: the published
+// list's bundle doesn't verify, and the next list is refused before it is
+// signed or logged.
+func TestWrongInstanceRefused(t *testing.T) {
+	ctx := context.Background()
+	key := testKey("site")
+	f := newFakeKMS(key)
+	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(key))
+	b := newFakeS3()
+	a := testService(3, "A")
+	v1 := testList(1, make([]byte, 32), a)
+	if err := publishList(ctx, b, "bucket", k, &fakeLog{}, nil, v1); err != nil {
+		t.Fatal(err)
+	}
+	other := &otherLog{}
+	h1 := sha256.Sum256(v1)
+	err := publishList(ctx, b, "bucket", k, other, nil, testList(2, h1[:], a))
+	if err == nil || !strings.Contains(err.Error(), "-sigstore") || !strings.Contains(err.Error(), "1.bundle") {
+		t.Fatalf("%v", err)
+	}
+	if len(f.signs) != 1 || other.entries != 0 {
+		t.Fatalf("%d signs, %d entries", len(f.signs), other.entries)
+	}
+}
+
+// otherLog is a log on another instance: no bundle verifies on it.
+type otherLog struct{ entries int }
+
+func (o *otherLog) Check([]byte, []byte) error { return errors.New("not on this instance") }
+func (o *otherLog) Anchor(context.Context, []byte) ([]byte, error) {
+	o.entries++
+	return nil, errors.New("unreachable")
+}
+
+// A stray bundle at the current list's version is refused before its
+// history is written.
+func TestStrayBundleBeforeHistory(t *testing.T) {
+	ctx := context.Background()
+	key := testKey("site")
+	f := newFakeKMS(key)
+	k, _ := newKMSSigner(ctx, f, testKeyARN, pub(key))
+	b := newFakeS3()
+	v1 := testList(1, make([]byte, 32), testService(3, "A"))
+	if err := publishList(ctx, b, "bucket", k, nil, nil, v1); err != nil {
+		t.Fatal(err)
+	}
+	delete(b.objs, "v1/services/1.json")
+	delete(b.objs, "v1/services/1.json.sig")
+	b.set("v1/services/1.bundle", []byte("bundle:other"))
+	lg := &fakeLog{}
+	if err := publishList(ctx, b, "bucket", k, lg, nil, v1); err == nil || !strings.Contains(err.Error(), "never rewritten") {
+		t.Fatalf("%v", err)
+	}
+	if _, ok := b.objs["v1/services/1.json"]; ok || len(lg.entries) != 0 {
+		t.Fatalf("history written or logged: %d entries", len(lg.entries))
+	}
+}
+
+// rekorLog checks bundles with site.Anchors: service-vault's anchor
+// vector (a real staging bundle and its trusted root) verifies for its own
+// document and key only, and Anchor refuses a bundle that doesn't verify.
+func TestRekorLogCheck(t *testing.T) {
+	cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/vettid/service-vault")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(strings.TrimSpace(string(out)), "vote", "testdata", "anchor-vector.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		AnchorKey   []byte          `json:"anchor_key"`
+		Proposal    string          `json:"proposal"`
+		Bundle      json.RawMessage `json:"bundle"`
+		TrustedRoot json.RawMessage `json:"trusted_root"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := root.NewTrustedRootFromJSON(v.TrustedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := []byte(v.Proposal)
+	other, _ := x509.MarshalPKIXPublicKey(&testECKey(t).PublicKey)
+	r := &rekorLog{v: site.NewAnchorsWith(tr), spki: v.AnchorKey, instance: "staging"}
+	if err := r.Check(v.Bundle, doc); err != nil {
+		t.Fatalf("the vector: %v", err)
+	}
+	if err := r.Check(v.Bundle, append(doc, ' ')); err == nil {
+		t.Fatal("other bytes")
+	}
+	if err := (&rekorLog{v: r.v, spki: other, instance: "staging"}).Check(v.Bundle, doc); err == nil {
+		t.Fatal("another key")
+	}
+	r.a = fixedAnchor(v.Bundle)
+	if b, err := r.Anchor(context.Background(), doc); err != nil || !bytes.Equal(b, v.Bundle) {
+		t.Fatalf("anchor: %v", err)
+	}
+	if _, err := r.Anchor(context.Background(), append(doc, ' ')); err == nil || !strings.Contains(err.Error(), "doesn't verify") {
+		t.Fatalf("an entry for other bytes: %v", err)
+	}
+}
+
+// fixedAnchor answers every Anchor with one bundle.
+type fixedAnchor json.RawMessage
+
+func (f fixedAnchor) Anchor(context.Context, []byte) (json.RawMessage, error) {
+	return json.RawMessage(f), nil
+}
+
+func testECKey(t *testing.T) *ecdsa.PrivateKey {
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
 }
