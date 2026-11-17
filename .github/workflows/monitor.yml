@@ -8,8 +8,9 @@ name: monitor
 #
 # The site keys are public. Staging's is pinned below (default_key), the
 # key the member vaults' release config pins too (vettid-vault,
-# enclave/releasecfg/staging.json, vote_site_key); the repository variable
-# VOTES_STAGING_SITE_KEY, if ever set, overrides it.
+# enclave/releasecfg/staging.json, vote_site_key), and only here: no
+# repository variable overrides it (its key_var is empty), so a change of
+# it is a reviewed PR, like the log pins.
 # Production's is not published yet: set the repository variable
 # VOTES_PROD_SITE_KEY to it (`votesctl site-key`) once production is
 # deployed; until then its check is skipped with a warning.
@@ -76,7 +77,7 @@ jobs:
           - env: staging
             site: https://votes.staging.vettid.org
             sigstore: staging
-            key_var: VOTES_STAGING_SITE_KEY
+            key_var: "" # no override: the pin below is the only source
             # The KMS site key (alias/vettid-votes-staging-site) since the
             # fresh start; the vaults pin the same key (vote_site_key).
             default_key: m3x8G8MlAnzaOoHr0eg0M2j38mE4d15hkNekqdOAios=
@@ -84,7 +85,7 @@ jobs:
             list_anchor_pub: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEVhK17Y0fK2EG4KYQPzr2h5AVhO/BkVMQuQ9LTQVH6+02DFyVqD3hJMwZHHxke9bHEdocFFhd7FqqMOAnqxMFA==
             # first_logged stays a quoted decimal string.
             first_logged: "1"
-            log_pending: false
+            log_pending: false # obsolete: removed with the -secret path (GC #12657)
             log_required: true
             role_var: VOTES_STAGING_MONITOR_ROLE_ARN
             topic_var: VOTES_STAGING_ALERT_TOPIC_ARN
@@ -125,7 +126,7 @@ jobs:
         env:
           SITE: ${{ matrix.site }}
           SIGSTORE: ${{ matrix.sigstore }}
-          SITE_KEY: ${{ vars[matrix.key_var] || matrix.default_key }}
+          SITE_KEY: ${{ (matrix.key_var && vars[matrix.key_var]) || matrix.default_key }}
           KEY_VAR: ${{ matrix.key_var }}
           LIST_ANCHOR_PUB: ${{ matrix.list_anchor_pub }}
           FIRST_LOGGED: ${{ matrix.first_logged }}

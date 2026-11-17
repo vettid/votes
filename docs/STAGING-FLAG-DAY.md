@@ -187,7 +187,10 @@ pin:
   start;
 - `.gitleaks.toml`: the new key, and the SPKI if gitleaks flags it, as
   narrow allowlist entries with a comment (each is public);
-- the nits carried from votes #36 (GC #13026);
+- staging's `key_var` emptied, so no repository variable can override
+  the pinned site key (votes #39). The nits carried from votes #36 (GC
+  #13026) were about the pending pin, which GC #12657 removes, so they
+  aren't done;
 - this document, with `NEW_KEY` and `SPKI` written into step 9's command.
 
 ## 8. Before the publish (read-only)
