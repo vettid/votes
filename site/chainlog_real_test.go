@@ -17,8 +17,8 @@ import (
 // The walk with the real verifier: service-vault's anchor vector (a real
 // staging bundle, over a proposal) kept as a version's bundle fails under
 // staging's root (it anchors another document) and under production's
-// (another instance). No real bundle over a signed list exists before the
-// flag day, so a passing case is the fake verifier's.
+// (another instance). No real bundle over a signed list is kept here, so
+// a passing case is the fake verifier's.
 func TestServiceChainLogRealVerifier(t *testing.T) {
 	cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/vettid/service-vault")
 	out, err := cmd.Output()

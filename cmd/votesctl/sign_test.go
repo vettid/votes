@@ -95,6 +95,17 @@ func (f *fakeKMS) Sign(_ context.Context, in *kms.SignInput, opts ...func(*kms.O
 
 func pub(k ed25519.PrivateKey) ed25519.PublicKey { return k.Public().(ed25519.PublicKey) }
 
+// localSigner is a listSigner over a local Ed25519 key: tests only.
+type localSigner ed25519.PrivateKey
+
+func (s localSigner) Public() ed25519.PublicKey {
+	return ed25519.PrivateKey(s).Public().(ed25519.PublicKey)
+}
+
+func (s localSigner) Sign(_ context.Context, msg []byte) ([]byte, error) {
+	return ed25519.Sign(ed25519.PrivateKey(s), msg), nil
+}
+
 // The list's signature is suite.Sign's, byte for byte, whichever signer
 // makes it (Ed25519 is deterministic), and KMS is asked for pure Ed25519
 // over label ‖ SHA-256(list), 59 bytes.
@@ -106,9 +117,9 @@ func TestSignListSameAsSuite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := signList(ctx, secretSigner(key), data)
+	got, err := signList(ctx, localSigner(key), data)
 	if err != nil || !bytes.Equal(got, want) {
-		t.Fatalf("secret signer: %x %v", got, err)
+		t.Fatalf("local signer: %x %v", got, err)
 	}
 	f := newFakeKMS(key)
 	k, err := newKMSSigner(ctx, f, testKeyARN, pub(key))
@@ -230,14 +241,14 @@ func TestKMSSignerChecksItself(t *testing.T) {
 }
 
 // signList itself checks the signature, whatever the signer.
-type lyingSigner struct{ secretSigner }
+type lyingSigner struct{ localSigner }
 
 func (l lyingSigner) Sign(ctx context.Context, msg []byte) ([]byte, error) {
-	return l.secretSigner.Sign(ctx, append(msg, 0))
+	return l.localSigner.Sign(ctx, append(msg, 0))
 }
 
 func TestSignListChecks(t *testing.T) {
-	if sig, err := signList(context.Background(), lyingSigner{secretSigner(testKey("site"))}, []byte(`{}`)); err == nil || sig != nil {
+	if sig, err := signList(context.Background(), lyingSigner{localSigner(testKey("site"))}, []byte(`{}`)); err == nil || sig != nil {
 		t.Fatalf("%x %v", sig, err)
 	}
 }
@@ -364,37 +375,29 @@ func TestCheckWatch(t *testing.T) {
 	}
 }
 
-// The flags: exactly one way to the key; -site-key and -watch-topics only
-// with -kms; refused before AWS is called.
+// The flags: -kms and the rest are required, and refused before AWS is
+// called.
 func TestPublishFlags(t *testing.T) {
 	ctx := context.Background()
 	for _, c := range []struct {
 		a    publishArgs
 		want string
 	}{
-		{publishArgs{bucket: "b", in: "x"}, "exactly one"},
-		{publishArgs{kms: testKeyARN, secret: "s", bucket: "b", in: "x"}, "exactly one"},
-		{publishArgs{secret: "s", siteKey: "k", bucket: "b", in: "x"}, "go with -kms"},
-		{publishArgs{secret: "s", watch: topicA, bucket: "b", in: "x"}, "go with -kms"},
+		{publishArgs{bucket: "b", in: "x"}, "-kms is required"},
+		{publishArgs{siteKey: "k", watch: topicA + "," + topicB, listAnchor: testAnchorARN, listAnchorPub: "cGlu", sigstore: "staging", bucket: "b", in: "x"}, "-kms is required"},
 		{publishArgs{kms: testKeyARN, in: "x"}, "-bucket"},
 		{publishArgs{kms: testKeyARN, watch: topicA + "," + topicB, bucket: "b", in: "x"}, "needs -site-key"},
 		{publishArgs{kms: testKeyARN, siteKey: "k", bucket: "b", in: "x"}, "needs -site-key"},
-		{publishArgs{secret: "s", listAnchor: testAnchorARN, bucket: "b", in: "x"}, "go with -kms"},
-		{publishArgs{secret: "s", sigstore: "staging", bucket: "b", in: "x"}, "go with -kms"},
 		{publishArgs{kms: testKeyARN, siteKey: "k", watch: topicA + "," + topicB, sigstore: "staging", bucket: "b", in: "x"}, "-list-anchor-key"},
 		{publishArgs{kms: testKeyARN, siteKey: "k", watch: topicA + "," + topicB, listAnchor: testAnchorARN, bucket: "b", in: "x"}, "-sigstore"},
 		{publishArgs{kms: testKeyARN, siteKey: "k", watch: topicA + "," + topicB, listAnchor: testAnchorARN, sigstore: "staging", bucket: "b", in: "x"}, "-list-anchor-pub"},
 		{publishArgs{kms: testKeyARN, siteKey: "k", watch: topicA + "," + topicB, listAnchor: testAnchorARN, listAnchorPub: "!", sigstore: "staging", bucket: "b", in: "x"}, "-list-anchor-pub: the list anchor key's"},
-		{publishArgs{secret: "s", listAnchorPub: "cGlu", bucket: "b", in: "x"}, "go with -kms"},
 	} {
 		if err := publish(ctx, c.a); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%+v: %v, want %q", c.a, err, c.want)
 		}
 	}
-	if _, err := sitePublicKey(ctx, testKeyARN, "s"); err == nil || !strings.Contains(err.Error(), "exactly one") {
-		t.Fatal(err)
-	}
-	if _, err := sitePublicKey(ctx, "", ""); err == nil || !strings.Contains(err.Error(), "exactly one") {
+	if _, err := sitePublicKey(ctx, ""); err == nil || !strings.Contains(err.Error(), "-kms is required") {
 		t.Fatal(err)
 	}
 }

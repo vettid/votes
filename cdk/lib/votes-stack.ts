@@ -17,7 +17,6 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
-import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
@@ -77,8 +76,8 @@ export interface VotesStackProps extends cdk.StackProps {
    * service vaults of this environment anchor in (their SV_SIGSTORE). */
   readonly sigstore: 'staging' | 'production';
   /** The site's Ed25519 public key (base64), from `votesctl site-key`.
-   * Absent only on the first deploy, which makes the key's secret: uploads
-   * are refused until a deploy sets it. */
+   * Absent only on the first deploy, which makes the site's KMS key
+   * (SiteSigningKeyArn): uploads are refused until a deploy sets it. */
   readonly siteKey?: string;
   /** Recovery only, for one deploy with the owner's go: lets a key under
    * v1/services/ be deleted, to clear a stray object at a version's key
@@ -277,15 +276,9 @@ export class VotesStack extends cdk.Stack {
       cdk.Annotations.of(this).addWarning('servicesRepair: keys under v1/services/ can be deleted until the next deploy without it');
     }
 
-    // The site's signing key for the service list: a generated secret the
-    // operator's votesctl derives the key from. The function never reads
+    // The site's signing key for the service list is a KMS key (siteKeys),
+    // which only the publish role may sign with. The function never uses
     // it: it gets the public key (siteKey).
-    const siteKeySecret = new secretsmanager.Secret(this, 'SiteKey', {
-      secretName: `${prefix}/site-key`,
-      description: 'Seed of the site key that signs the service list (votesctl)',
-      generateSecretString: { passwordLength: 64, excludePunctuation: true, includeSpace: false },
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
 
     const logGroup = new logs.LogGroup(this, 'ApiLogs', {
       logGroupName: `/vettid/votes/${props.envName}/api`,
@@ -459,7 +452,6 @@ export class VotesStack extends cdk.Stack {
     this.siteKeys(prefix, props);
 
     new cdk.CfnOutput(this, 'BucketName', { value: this.bucket.bucketName });
-    new cdk.CfnOutput(this, 'SiteKeySecret', { value: siteKeySecret.secretArn });
     new cdk.CfnOutput(this, 'DistributionId', { value: this.distribution.distributionId });
     new cdk.CfnOutput(this, 'Url', { value: `https://${props.hostName}` });
   }

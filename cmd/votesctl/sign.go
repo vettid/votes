@@ -21,25 +21,12 @@ import (
 
 // listSigner signs the service list (BALLOT-PROTOCOL §3.3): with the site
 // key in KMS, which can't be exported and which only the publish role may
-// use (kmsSigner, VOTE-SITE-KEY-COMPROMISE §6), or, until the staging
-// flag day, with the key derived from the Secrets Manager secret
-// (secretSigner).
+// use (kmsSigner, VOTE-SITE-KEY-COMPROMISE §6).
 type listSigner interface {
 	Public() ed25519.PublicKey
 	// Sign returns an Ed25519 signature of msg (pure Ed25519, as
 	// suite.Sign makes it), one that verifies under Public.
 	Sign(ctx context.Context, msg []byte) ([]byte, error)
-}
-
-// secretSigner is the key derived from the secret (siteKey).
-type secretSigner ed25519.PrivateKey
-
-func (s secretSigner) Public() ed25519.PublicKey {
-	return ed25519.PrivateKey(s).Public().(ed25519.PublicKey)
-}
-
-func (s secretSigner) Sign(_ context.Context, msg []byte) ([]byte, error) {
-	return ed25519.Sign(ed25519.PrivateKey(s), msg), nil
 }
 
 // kmsAPI is the part of the KMS client a kmsSigner uses.

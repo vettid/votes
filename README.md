@@ -112,14 +112,14 @@ the site key is set. `-list-anchor-pub` must be a P-256 key's
 SubjectPublicKeyInfo and `-first-logged` a decimal version from 1; a pin
 past the real first logged version (the version before it has a bundle)
 is a mismatch, and a `-first-logged` past the current version is an
-error. (`-first-logged-pending`, the workflow's `log_pending`, was for a
-migration no environment makes now; it goes with the `-secret` path, GC
-#12657.)
+error.
 
 **Production's site key** is a repository variable today
-(`VOTES_PROD_SITE_KEY`); at production's launch, pin it in the workflow's
-matrix (`default_key`) instead, by PR, as staging's is, along with its
-list anchor key.
+(`VOTES_PROD_SITE_KEY`), and its check is skipped with a warning while
+it is unset; at production's launch, pin it in the workflow's matrix
+(`default_key`) and empty its `key_var`, by PR, as staging's is, along
+with its list anchor key. A row with an empty `key_var`, or with a log
+pin, fails the run without a site key.
 
 **The trusted root:** Sigstore's, for `-sigstore` (`production` by
 default), fetched through its TUF repository, or, if that fails, the one
@@ -150,13 +150,11 @@ has a default.
 1. **Once per account:** `npx cdk bootstrap aws://<account>/us-east-1`.
 2. **First deploy:** `npx cdk deploy <context> -c firstDeploy=true`.
    It makes the bucket, the function, the API, the certificate, the
-   CloudFront distribution, the name's records and the site key's
-   secret (output `SiteKeySecret`). Uploads are refused until step 4.
+   CloudFront distribution, the name's records and the site key in KMS
+   (output `SiteSigningKeyArn`). Uploads are refused until step 4.
 3. **The site key:** build votesctl (`go build -o votesctl ./cmd/votesctl`
    at the root), then `./votesctl site-key -kms <SiteSigningKeyArn>`
-   (as the publish role, below) prints its public key; until the staging
-   flag day (GC #12646) the key is the secret's,
-   `./votesctl site-key -secret <SiteKeySecret>`. It also goes in the
+   (as the publish role, below) prints its public key. It also goes in the
    member vaults' release config (BALLOT-PROTOCOL §3.3).
 4. **Deploy again** with `-c siteKey=<that key>`, and pass it on every
    deploy from then on (a deploy without it is refused).
@@ -173,9 +171,8 @@ has a default.
    next `version` and, as `previous`, the base64 SHA-256 of the published
    `v1/services.json`. Publish it with
    `./votesctl publish-services -kms <SiteSigningKeyArn> -site-key <that key> -watch-topics <KeyWatchTopicArn>,<KeyWatchTopicBArn> -list-anchor-key <ListAnchorKeyArn> -list-anchor-pub <its pinned key> -sigstore <the stack's sigstore> -bucket <BucketName> -in services.json`,
-   as the publish role (until the flag day, with the secret's key:
-   `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`).
-   With `-kms` it takes the key's ARN only, never an alias, and uses the
+   as the publish role.
+   It takes the key's ARN only, never an alias, and uses the
    ARN's region; it refuses a key that isn't an Ed25519 signing key
    whose public key is `-site-key`. **Take `-site-key` from an
    independent pin** (the stack's deployed `siteKey`, or `vote_site_key`
@@ -229,9 +226,8 @@ has a default.
      `sigstore` (the deploy context) and the key watch's mail for a
      `TagResource` first;
    - the published list's own bundle verifies on that instance under that
-     key. Only on the flag day may the published list (the old key's)
-     have none; otherwise it is refused ("version N is current without
-     its bundle"): run the command with that version's list first, which
+     key. A published list without one is refused ("version N is current
+     without its bundle"): run the command with that version's list first, which
      logs it with no new site signature;
    - a bundle already kept for this version anchors this list. One that
      anchors anything else is refused (clear it as a stray, below); one
@@ -245,26 +241,8 @@ has a default.
    entry (the failure came after it: a lost answer, the bundle's check,
    or its write), the list anchor key signs again too, and Rekor holds a
    second entry for the same list (a search of entries is to match them by
-   the list's SHA-256, so that is no mismatch). `-secret` doesn't log (it
-   goes after the flag day), and it is refused when the file's version,
-   or the version before it, has a bundle; nor can it publish over a
-   list under the KMS key, which doesn't verify under the secret's key.
-   So every version from the first one published with `-kms` on has a
+   the list's SHA-256, so that is no mismatch). So every version has a
    bundle.
-
-   **On the flag day** (GC #12646), the published list is signed with
-   the secret's key: give that key as `-previous-site-key` on the first
-   `-kms` publish (the next version, the same services), which checks
-   the published list under it. Take it, like `-site-key`, from an
-   independent pin: `vote_site_key` in the member vaults' release config
-   before the flag day (the publish role can't read the secret, on
-   purpose). It is refused anywhere else: when it is `-site-key`, on a
-   first list, on a rerun or a resume (which need no old key), once the
-   published list is under the new key, and for good once any kept
-   version is: the flag day is then over, and a list under the old key
-   put back as current is a planted history, not the flag day. After the
-   flag day, destroy the old secret (the plan's step 5 schedules it) and
-   never give the flag again.
 
    To act as the publish role, add a profile and set
    `AWS_PROFILE` to it:
@@ -555,9 +533,6 @@ it is found and fixed.
   the feed (for example, removing the log resource policy for a moment)
   is emailed and raises the feed alarm; and that `GetObject` of a missing
   `v1/services/<n>.json` under the publish role is a 404.
-
-Until the staging flag day, `votesctl` still signs with the secret's key
-(GC #12646, tasks 2 to 5).
 
 ### Clearing a stray version copy
 

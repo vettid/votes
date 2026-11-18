@@ -146,7 +146,7 @@ func TestCheckCommand(t *testing.T) {
 		rep2.Proposals[0].ProposalID != p.ProposalID || len(rep2.Months) == 0 || rep2.Services.Log != "not pinned" {
 		t.Fatalf("-all: %+v %v %v", rep2, ok, err)
 	}
-	// A pin the chain refuses (past the current version, not pending): an
+	// A pin the chain refuses (past the current version): an
 	// error, and the report still says which pin.
 	var eout bytes.Buffer
 	if ok, err := checkAll(context.Background(), &eout, httpFetcher(srv.URL, noRedirects()), httpModified(srv.URL, noRedirects()), anchors, key, "2026-10", nil,
@@ -222,11 +222,10 @@ func TestCheckCommand(t *testing.T) {
 		{args("-site-key", key, "-all", "-list-anchor-pub", testPinB64, "-first-logged", "-1"), exitUsage},
 		// Pinned from version 1: the list has no bundle, a mismatch.
 		{args("-site-key", key, "-all", "-list-anchor-pub", testPinB64, "-first-logged", "1"), exitMismatch},
-		// Pinned from the next version: only pending (before the flag day's
-		// publish), else an error; pending needs the pins.
-		{args("-site-key", key, "-all", "-list-anchor-pub", testPinB64, "-first-logged", "2", "-first-logged-pending"), exitOK},
+		// Pinned from the next version (not published yet): an error; the
+		// pending flag is gone.
 		{args("-site-key", key, "-all", "-list-anchor-pub", testPinB64, "-first-logged", "2"), exitFailed},
-		{args("-site-key", key, "-all", "-first-logged-pending"), exitUsage},
+		{args("-site-key", key, "-all", "-list-anchor-pub", testPinB64, "-first-logged", "2", "-first-logged-pending"), exitUsage},
 	} {
 		if got := code(c.args); got != c.want {
 			t.Errorf("%v: exit %d, want %d", c.args[6:], got, c.want)

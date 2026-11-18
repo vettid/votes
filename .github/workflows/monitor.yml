@@ -13,7 +13,10 @@ name: monitor
 # it is a reviewed PR, like the log pins.
 # Production's is not published yet: set the repository variable
 # VOTES_PROD_SITE_KEY to it (`votesctl site-key`) once production is
-# deployed; until then its check is skipped with a warning.
+# deployed; until then its check is skipped with a warning. Only a row
+# whose key comes from a repository variable is ever skipped, and only
+# while it has no log pins (it isn't deployed): a row with an empty key_var
+# (its key pinned here) or with a log pin fails the run without a site key.
 #
 # The service list's Rekor log (docs/VOTES-SITE.md §3, §7): each
 # environment's list anchor key (its SubjectPublicKeyInfo, base64, as
@@ -85,7 +88,6 @@ jobs:
             list_anchor_pub: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEVhK17Y0fK2EG4KYQPzr2h5AVhO/BkVMQuQ9LTQVH6+02DFyVqD3hJMwZHHxke9bHEdocFFhd7FqqMOAnqxMFA==
             # first_logged stays a quoted decimal string.
             first_logged: "1"
-            log_pending: false # obsolete: removed with the -secret path (GC #12657)
             log_required: true
             role_var: VOTES_STAGING_MONITOR_ROLE_ARN
             topic_var: VOTES_STAGING_ALERT_TOPIC_ARN
@@ -96,7 +98,6 @@ jobs:
             default_key: ""
             list_anchor_pub: ""
             first_logged: ""
-            log_pending: false
             # Production has its KMS keys from its first deploy: once its
             # site is checked at all, its log must be too.
             log_required: true
@@ -131,22 +132,24 @@ jobs:
           LIST_ANCHOR_PUB: ${{ matrix.list_anchor_pub }}
           FIRST_LOGGED: ${{ matrix.first_logged }}
           LOG_REQUIRED: ${{ matrix.log_required }}
-          LOG_PENDING: ${{ matrix.log_pending }}
         run: |
           if [ -z "$SITE_KEY" ]; then
+            # Skipped only while the key is a repository variable not yet
+            # set and nothing else is pinned: an environment not deployed.
+            if [ -z "$KEY_VAR" ] || [ -n "$LIST_ANCHOR_PUB$FIRST_LOGGED" ]; then
+              echo "::error::$SITE: no site key, though its key is pinned in monitor.yml or its log is: the check can't run"
+              echo "code=config" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
             echo "::warning::$SITE not checked: set the repository variable $KEY_VAR to its site key"
             exit 0
           fi
           log=()
           if [ -n "$LIST_ANCHOR_PUB" ] && [ -n "$FIRST_LOGGED" ]; then
             log=(-list-anchor-pub "$LIST_ANCHOR_PUB" -first-logged "$FIRST_LOGGED")
-            if [ "$LOG_PENDING" = "true" ]; then
-              echo "::warning::$SITE: first_logged $FIRST_LOGGED is pinned pending (not published yet): remove log_pending once it is"
-              log+=(-first-logged-pending)
-            fi
-          elif [ -n "$LIST_ANCHOR_PUB$FIRST_LOGGED" ] || [ "$LOG_REQUIRED" = "true" ] || [ "$LOG_PENDING" = "true" ]; then
+          elif [ -n "$LIST_ANCHOR_PUB$FIRST_LOGGED" ] || [ "$LOG_REQUIRED" = "true" ]; then
             echo "::error::$SITE: list_anchor_pub and first_logged must both be pinned in monitor.yml (required for this environment: $LOG_REQUIRED)"
-            echo "code=1" >> "$GITHUB_OUTPUT"
+            echo "code=config" >> "$GITHUB_OUTPUT"
             exit 1
           else
             echo "::warning::$SITE: the service list's Rekor log isn't checked: its list anchor key isn't pinned in monitor.yml yet"
@@ -188,6 +191,7 @@ jobs:
           case "$CODE" in
             3) what="mismatches (votesctl check exit 3)" ;;
             1) what="a check failed (votesctl check exit 1)" ;;
+            config) what="the monitor is misconfigured (no site key or log pins; votesctl did not run)" ;;
             "") what="the run failed before the check" ;;
             *) what="votesctl check exit $CODE" ;;
           esac

@@ -41,11 +41,6 @@ type ListLog struct {
 	Anchors BundleVerifier
 	SPKI    []byte
 	First   int64
-	// Pending is set only between pinning First and its publish (the
-	// flag day's pin PR, removed by the next): First may then be the next
-	// version. Without it, a First past the current version is an error
-	// (a rollback to before logging began, or a wrong pin).
-	Pending bool
 }
 
 // BundleVerifier checks a bundle over doc under the key spki: *Anchors.
@@ -81,9 +76,7 @@ func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.Publi
 // served at all): a mismatch, unless it was written within ListingGrace
 // (a publish in progress), as modified says of it. A First past the
 // current version is an error (a rollback to before logging began, or a
-// wrong pin), unless lg.Pending, when it may be the next version; a
-// Pending pin whose First is published is a mismatch (it is to be
-// removed). A bundle at First-1 is a mismatch (the pin is past the real
+// wrong pin). A bundle at First-1 is a mismatch (the pin is past the real
 // first logged version).
 func CheckServiceChainLogged(ctx context.Context, fetch Fetcher, siteKey ed25519.PublicKey, now time.Time,
 	modified func(ctx context.Context, path string) (time.Time, error), lg *ListLog) (*ChainReport, error) {
@@ -100,16 +93,8 @@ func CheckServiceChainLogged(ctx context.Context, fetch Fetcher, siteKey ed25519
 	}
 	rep := &ChainReport{Version: current.Version}
 	if lg != nil {
-		limit := current.Version
-		if lg.Pending {
-			limit++
-		}
-		if lg.First < 1 || lg.First > limit || len(lg.SPKI) == 0 || lg.Anchors == nil {
-			return nil, fmt.Errorf("site: the list log's pins: first logged version %d with current version %d, pending %v (or no key): a rollback to before logging began, or a wrong pin", lg.First, current.Version, lg.Pending)
-		}
-		if lg.Pending && lg.First <= current.Version {
-			// Left on, it would let a rollback by one pass for pending.
-			rep.Mismatches = append(rep.Mismatches, "services/"+strconv.FormatInt(lg.First, 10)+": is published, but the pin is still pending: remove log_pending")
+		if lg.First < 1 || lg.First > current.Version || len(lg.SPKI) == 0 || lg.Anchors == nil {
+			return nil, fmt.Errorf("site: the list log's pins: first logged version %d with current version %d (or no key): a rollback to before logging began, or a wrong pin", lg.First, current.Version)
 		}
 	}
 	// logged checks version v's bundle against its bytes.
