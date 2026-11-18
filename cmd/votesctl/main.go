@@ -165,11 +165,12 @@ func publish(ctx context.Context, a publishArgs) error {
 	if err != nil {
 		return err
 	}
-	lg, err := newRekorLog(ctx, kc, a.listAnchor, a.kms, a.sigstore, anchorPin)
+	sc := s3.NewFromConfig(cfg)
+	lg, err := newRekorLog(ctx, kc, sc, a.bucket, a.listAnchor, a.kms, a.sigstore, anchorPin)
 	if err != nil {
 		return err
 	}
-	return publishList(ctx, s3.NewFromConfig(cfg), a.bucket, signer, lg, raw)
+	return publishList(ctx, sc, a.bucket, signer, lg, raw)
 }
 
 // publishTimeout bounds one publish.
