@@ -93,7 +93,7 @@ false. The `monitor` workflow runs `check -all` hourly on staging and
 production and fails on `1` or `3` (VOTES-SITE §7; it needs the
 repository variable `VOTES_PROD_SITE_KEY` before production is checked).
 A failed run is published to the alert topic, and a successful one puts
-a heartbeat whose alarm fires after 3 hours without one ("Deployment",
+a heartbeat whose alarm fires after 12 hours without one ("Deployment",
 step 6).
 
 **The service list's Rekor log:** with `-all`,
@@ -275,8 +275,24 @@ has a default.
    `MonitorRoleArn`) and the heartbeat alarm. Then set the repository
    variables (Settings, Variables: not secrets)
    `VOTES_<STAGING|PROD>_MONITOR_ROLE_ARN` to that output and
-   `VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN` to the topic. The alarm fires 3
-   hours after the deploy until the first run that puts a heartbeat.
+   `VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN` to the topic. The alarm can go
+   to ALARM within minutes of its creation (missing data counts as
+   breaching), and stays there until the first run that puts a heartbeat.
+   The deploy also makes the key watch's heartbeat (below, "The
+   heartbeat"): the function and role `vettid-votes-<env>-key-watch-heartbeat`,
+   the rules `vettid-votes-<env>-kw-heartbeat-tick` and
+   `vettid-votes-<env>-kw-heartbeat`, the log groups
+   `/aws/lambda/vettid-votes-<env>-key-watch-heartbeat` and
+   `/vettid/votes/<env>/key-watch-heartbeat`, and the alarm
+   `vettid-votes-<env>-key-watch-heartbeat`; it needs no repository
+   variable. Check that within an hour of the deploy a line appears in
+   `/vettid/votes/<env>/key-watch-heartbeat`, a `DescribeKey` whose
+   `userIdentity` is a session of the function's role:
+   `userIdentity.sessionContext.sessionIssuer.arn` is
+   `arn:aws:iam::<account>:role/vettid-votes-<env>-key-watch-heartbeat`.
+   A newly created alarm whose missing data breaches can go to ALARM
+   within minutes of its creation, before the first line: expect one
+   heartbeat alarm, and its OK, right after the first deploy.
 
 ### The site's signing keys
 
@@ -325,10 +341,21 @@ termination protection. They match:
 - every signature with either key, and every grant, key policy change,
   alias change, tag change, deletion or disabling of either key or its
   alias;
-- every change to the publish role (its trust or permission policies, a
-  boundary, its deletion);
-- every change to the watch: its rules and targets, its alarms (enabling
-  or disabling their actions too), any alarm mute rule, its log group,
+- every change to the publish role or the heartbeat's role (below; their
+  trust or permission policies, a boundary, their deletion);
+- every change to the heartbeat's function (below): its code, its
+  configuration, who may invoke it, its concurrency (a concurrency of 0
+  would silence it) and its deletion, by its name or ARN (CloudTrail
+  names these events with an API version, `UpdateFunctionCode20150331v2`,
+  so they are matched by prefix; unqualified, `:$LATEST` or with an alias
+  name). Not watched, each failing closed (no heartbeat line, so its
+  alarm fires): the function's event-invoke configuration (its retries
+  and failure destinations), a specific version or alias (the tick
+  invokes neither), and the function's own log group;
+- every change to the watch: its rules (the six and the heartbeat's two,
+  matched by their names' prefix `vettid-votes-<env>-kw-`) and targets,
+  its alarms (enabling or disabling their actions too), any alarm mute
+  rule, its log group,
   streams, metric filter and key, any log group resource policy, its dead
   letters, the alarm topic and the two watch topics and their
   subscriptions (a data protection policy too);
@@ -343,7 +370,7 @@ termination protection. They match:
   from CloudTrail.
 
 Each event has the operation, what it acted on (the key, role, rule,
-alarm, topic, subscription, log group, stack or queue), the caller's identity
+alarm, topic, subscription, log group, stack, queue or function), the caller's identity
 type, role and temporary key id (traceable to its `AssumeRole` in
 CloudTrail) and the CloudTrail event id: never the session name, which
 is an email address. Any logged line also raises the alarm
@@ -353,6 +380,73 @@ EventBridge's retries goes to the queue `vettid-votes-<env>-key-use-dlq`
 and raises `vettid-votes-<env>-key-use-feed`; both alarms notify the
 alarm topic and both watch topics, so silencing one path is told on
 another.
+
+**The heartbeat.** A feed that stops silently (a trail stopped, the bus
+or its rule changed, the log policy gone) would look like no use until a
+publish. So a rule on the default bus, `vettid-votes-<env>-kw-heartbeat-tick`
+(`rate(1 hour)`), runs a small Lambda function,
+`vettid-votes-<env>-key-watch-heartbeat` (Node.js, inline code, nothing
+bundled), which calls KMS `DescribeKey` on the site key's ARN every
+hour, from AWS, as a role of its own, `vettid-votes-<env>-key-watch-heartbeat`,
+which only Lambda may assume and which may make that read-only call on
+the site key and write the function's own log group
+(`/aws/lambda/vettid-votes-<env>-key-watch-heartbeat`, kept a month),
+and nothing else. Only the tick rule may invoke the function. **A
+failure of the function (a `DescribeKey` error, a timeout) leaves no
+heartbeat line, so the alarm fires: it fails closed.** (EventBridge
+Scheduler can't do this: its universal targets don't make describe
+calls.) GitHub's schedule doesn't matter for it (GitHub runs the hourly
+monitor every 4 to 11 hours); the monitor workflow is unchanged. A
+seventh watching rule, `vettid-votes-<env>-kw-heartbeat`, in the same state as
+the six, matches only that call by that role on that key and sends the
+whole event to the log group `/vettid/votes/<env>/key-watch-heartbeat`
+(kept a month; failures go to the same dead letters), not to the
+key-use log group or the watch topics: it is no use of the key. Three
+hours without a line there raise `vettid-votes-<env>-key-watch-heartbeat`,
+which notifies the alarm topic and both watch topics; its recovery
+(OK) is mailed to the alarm topic. The six rules watch each other, this
+one and the tick; the function, its role, the alarm, the heartbeat log
+group and any metric filter into the watch's metric namespace
+(`VettID/VotesKeys/<env>`) are watched like the watch's own (a change to
+any is emailed, above). **What
+it proves, and what not:** it proves the path of a read-only management
+event through the trail, the default bus and a rule in that state, to a
+log group. Write events go through the same trail's selector, and a
+change to any trail is watched. **It proves honest failures, not an
+administrator faking it:** `PutMetricData` into the watch's namespace,
+or `PutLogEvents` into the heartbeat group, are data-plane calls no
+trail shows, and either could keep the alarm quiet while the feed is
+cut. The cross-account forward (below) is what covers an
+administrator. **3 missed hours raise it whatever the cause**, the
+tick's or the function's too. When it fires, check, in order:
+
+- the tick rule `vettid-votes-<env>-kw-heartbeat-tick`: is it there and
+  `ENABLED`, with its schedule and its one target the stack's
+  (`aws events describe-rule`, `list-targets-by-rule`)? Its failed
+  invocations show in CloudWatch (`AWS/Events`, `FailedInvocations`);
+- the function `vettid-votes-<env>-key-watch-heartbeat`: its `Errors`
+  and `Throttles` (CloudWatch, `AWS/Lambda`) and its log group; its
+  concurrency (`aws lambda get-function-concurrency`: none reserved, and
+  never 0); its code and configuration the stack's
+  (`aws lambda get-function`), and the permission for the tick rule
+  (`aws lambda get-policy`); does its role still exist with its two
+  permissions (`aws iam get-role-policy`)?
+- the trail: is it logging (`aws cloudtrail get-trail-status`), with
+  management events (read and write), and homed in `us-east-1` or an
+  organization trail (below)?
+- the default event bus: its state, and its key (`aws events describe-event-bus`);
+- the rule `vettid-votes-<env>-kw-heartbeat`: its state is
+  `ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS`, its pattern and its
+  target are the stack's (`aws events describe-rule`, `list-targets-by-rule`);
+- the log resource policy `vettid-votes-<env>-key-use`
+  (`aws logs describe-resource-policies`) still lets the rule write the
+  log group, and the log group `/vettid/votes/<env>/key-watch-heartbeat`
+  exists;
+- the dead letters (`vettid-votes-<env>-key-use-dlq`; the feed alarm
+  fires with them).
+
+A broken feed means a signature would go unseen: stop publishing until
+it is found and fixed.
 
 - **Confirm both watch subscriptions** after the first deploy, from the
   token in each email AWS sends, so that unsubscribing needs a signed-in
@@ -403,9 +497,9 @@ another.
   the cross-account forward** (the owner's choice c, GC #12690): every
   watched event also sent to the management account, where the staging
   or production account's administrators can't silence it, before a
-  production key signs anything. A heartbeat that proves the feed is
-  alive (a scheduled watched call, and an alarm when its line is
-  missing) is its own task, not yet built.
+  production key signs anything. The heartbeat (above) proves hourly that
+  the feed is alive; a feed cut for less than three hours and then
+  restored doesn't raise it.
 - **The publisher is a permission set of its own** (GC #12713). Before
   the first deploy, the owner creates in IAM Identity Center a permission
   set (for example `VettIDVotesPublisher`) whose only permission is an

@@ -40,7 +40,7 @@ name: monitor
 # it assumes the stack's monitor role through GitHub's OIDC provider
 # (only this workflow, on main, may), then publishes a failed run (a
 # mismatch or an error) to the alert topic, or puts the heartbeat after a
-# successful check. The heartbeat's alarm, three hours without one,
+# successful check. The heartbeat's alarm, twelve hours without one,
 # notifies the same topic: it catches a schedule that stopped. The role
 # and the topic are repository variables (not secrets: neither is one),
 # per environment: VOTES_<STAGING|PROD>_MONITOR_ROLE_ARN (the stack's
