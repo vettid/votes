@@ -216,13 +216,14 @@ has a default.
    SubjectPublicKeyInfo, the digest and the signature, written
    write-once like the bundles. A rerun's, a lost race's and an abandoned
    publish's signatures are recorded too; they are the input of the
-   offline check for a reused nonce. If the record can't be written,
-   nothing is logged and the publish fails: run it again. "This
-   signature is already recorded" (a write that landed, retried) isn't
-   an alarm; run it again too. An `ALARM` that the key signed the digest
-   twice with the same r is a repeated nonce: don't publish again, and
-   tell the owner. The records are public, like the bundles: each holds
-   a digest and a signature, never a list. So the digests of abandoned
+   offline check for a reused nonce. The record is written in one
+   attempt. If it can't be written, nothing is logged and the publish
+   fails: run it again. If its name is already taken, an earlier
+   signature had the same r over the same digest: votesctl prints an
+   `ANOMALY` (KMS returned the same signature again, or a second one
+   with the same r). Nothing is logged; don't publish again, and tell
+   the owner. The records are public, like the bundles: each holds a
+   digest and a signature, never a list. So the digests of abandoned
    publishes are public too.
 
    Before anything is signed it checks:

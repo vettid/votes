@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/vettid/service-vault/anchor"
 
@@ -47,11 +48,24 @@ type rekorLog struct {
 	a interface {
 		Anchor(context.Context, []byte) (json.RawMessage, error)
 	}
-	v interface {
-		Verify(bundle, doc, spki []byte) (time.Time, error)
-	}
+	v        listVerifier
 	spki     []byte
 	instance string
+}
+
+// listVerifier checks a list's bundle (site.Anchors).
+type listVerifier interface {
+	Verify(bundle, doc, spki []byte) (time.Time, error)
+}
+
+// newListAnchors is the instance's bundle verifier, under its trusted
+// root (site.NewAnchors, which fetches it through TUF). Tests replace it.
+var newListAnchors = func(instance string) (listVerifier, error) {
+	v, err := site.NewAnchors(instance)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 func (r *rekorLog) Check(bundle, data []byte) error {
@@ -184,7 +198,7 @@ func newRekorLog(ctx context.Context, k anchorKeyAPI, c s3API, bucket, keyARN, s
 	if err != nil {
 		return nil, err
 	}
-	ver, err := site.NewAnchors(instance)
+	ver, err := newListAnchors(instance)
 	if err != nil {
 		return nil, err
 	}
@@ -233,10 +247,11 @@ type signRecord struct {
 }
 
 // signRecordKey names a record by its digest and r, both lowercase hex,
-// r as signer.RFromDER gives it (big-endian, no leading zero bytes). A
-// name is taken twice only by the same signature written again, or by a
-// second signature with the same r over the same digest: a repeated
-// nonce (SignDigest tells them apart).
+// r as signer.RFromDER gives it (big-endian, no leading zero bytes). The
+// record is written in one attempt (no SDK retry), so a name already
+// taken when SignDigest writes it was taken by an earlier signature with
+// the same r over the same digest: the same nonce, or its negation (the
+// same signature, or (r, N-s)). Neither is expected from KMS.
 func signRecordKey(digest, r []byte) string {
 	return "v1/services/signs/" + hex.EncodeToString(digest) + "/" + hex.EncodeToString(r) + ".json"
 }
@@ -246,7 +261,9 @@ func (s *recordingSigner) Public() *ecdsa.PublicKey { return s.key.Public() }
 
 // SignDigest implements anchor.DigestSigner: one KMS Sign, then the
 // record. On any failure it returns no signature (the Sign was made, and
-// its key watch mail has no record: a rerun's).
+// its key watch mail has no record: a rerun's). The one signature never
+// recorded is an answer that isn't strict DER, which KMS doesn't give: it
+// is discarded unrecorded (no r to name it by), and nothing is logged.
 func (s *recordingSigner) SignDigest(ctx context.Context, digest []byte) ([]byte, error) {
 	sig, err := s.key.SignDigest(ctx, digest)
 	if err != nil {
@@ -254,28 +271,32 @@ func (s *recordingSigner) SignDigest(ctx context.Context, digest []byte) ([]byte
 	}
 	r, err := signer.RFromDER(sig)
 	if err != nil {
-		return nil, fmt.Errorf("the list anchor key's signature: %w", err)
+		return nil, fmt.Errorf("the list anchor key's signature isn't strict DER: discarded, unrecorded, nothing logged: %w", err)
 	}
 	b, err := json.Marshal(&signRecord{V: 1, KeySPKI: s.spki, Digest: digest, Signature: sig})
 	if err != nil {
 		return nil, err
 	}
 	name := signRecordKey(digest, r)
-	if err := writeOnce(ctx, s.c, s.bucket, name, b, "application/json"); err != nil {
+	// One attempt: an SDK retry of a write that landed would take the name
+	// with this very record, and hide a repeated signature.
+	if err := writeOnce(ctx, s.c, s.bucket, name, b, "application/json", func(o *s3.Options) { o.RetryMaxAttempts = 1 }); err != nil {
 		var api interface{ ErrorCode() string }
 		if !errors.As(err, &api) || api.ErrorCode() != "PreconditionFailed" {
-			return nil, fmt.Errorf("recording the list anchor key's signature: nothing logged: %w", err)
+			return nil, fmt.Errorf("recording the list anchor key's signature: nothing logged, run the publish again: %w", err)
 		}
-		// The name is taken: by this record (a write that landed, retried),
-		// or by another signature with the same r over this digest.
+		// The name was taken before this call: an earlier signature with
+		// the same r over this digest.
 		have, gerr := get(ctx, s.c, s.bucket, name)
 		switch {
-		case gerr != nil || have.data == nil:
-			return nil, fmt.Errorf("recording the list anchor key's signature: %s is taken and can't be read (%v): nothing logged", name, gerr)
+		case gerr != nil:
+			return nil, fmt.Errorf("recording the list anchor key's signature: %s is already taken and couldn't be read back (%v): nothing logged. Read that object and compare it with this signature before publishing again", name, gerr)
+		case have.data == nil:
+			return nil, fmt.Errorf("recording the list anchor key's signature: %s is already taken but reads as absent: nothing logged. Read that object and compare it with this signature before publishing again", name)
 		case bytes.Equal(have.data, b):
-			return nil, fmt.Errorf("recording the list anchor key's signature: this signature is already recorded (%s); nothing logged, run the publish again", name)
+			return nil, fmt.Errorf("ANOMALY: KMS returned a signature it had returned before over this digest (a repeated nonce, %s): nothing logged. Don't publish again; tell the owner", name)
 		default:
-			return nil, fmt.Errorf("ALARM: the list anchor key signed this digest twice with the same r, a repeated nonce (%s holds the other signature): nothing logged. Don't publish again, and tell the owner: the key is to be rotated", name)
+			return nil, fmt.Errorf("ANOMALY: KMS returned a second signature with the same r over this digest (%s holds the other): nothing logged. Don't publish again; tell the owner", name)
 		}
 	}
 	return sig, nil

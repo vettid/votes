@@ -115,7 +115,7 @@ func TestRecordFailureNoSignature(t *testing.T) {
 		err        error
 	}{
 		{"denied", "nothing logged", errors.New("AccessDenied")},
-		{"taken, unreadable", "can't be read", precond},
+		{"taken, reads as absent", "compare it with this signature", precond},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			rs, _ := testRecorder(t, failingS3{newFakeS3(), c.err})
@@ -148,9 +148,9 @@ func (f fixedSigner) Public() *ecdsa.PublicKey { return f.pub }
 
 func (f fixedSigner) SignDigest(context.Context, []byte) ([]byte, error) { return f.sig, nil }
 
-// A taken name: the same signature again is a write that landed (not an
-// alarm), and another signature with the same r over the digest, here
-// (r, N-s), is a repeated nonce, an ALARM. Neither returns a signature.
+// A name taken before the call: the same signature again, or another
+// with the same r over the digest, here (r, N-s), is a signer anomaly.
+// Neither returns a signature or replaces the record.
 func TestRecordTakenName(t *testing.T) {
 	ctx := context.Background()
 	f := s3412{newFakeS3()}
@@ -164,7 +164,7 @@ func TestRecordTakenName(t *testing.T) {
 	if got, err := rs.SignDigest(ctx, d[:]); err != nil || !bytes.Equal(got, sig) {
 		t.Fatalf("first sign: %x, %v", got, err)
 	}
-	if got, err := rs.SignDigest(ctx, d[:]); got != nil || err == nil || !strings.Contains(err.Error(), "already recorded") || strings.Contains(err.Error(), "ALARM") {
+	if got, err := rs.SignDigest(ctx, d[:]); got != nil || err == nil || !strings.Contains(err.Error(), "ANOMALY: KMS returned a signature it had returned before") {
 		t.Fatalf("the same signature again: %x, %v", got, err)
 	}
 	var v struct{ R, S *big.Int }
@@ -177,7 +177,7 @@ func TestRecordTakenName(t *testing.T) {
 		t.Fatal("(r, N-s) doesn't verify")
 	}
 	rs.key = fixedSigner{&k.PublicKey, neg}
-	if got, err := rs.SignDigest(ctx, d[:]); got != nil || err == nil || !strings.Contains(err.Error(), "ALARM") {
+	if got, err := rs.SignDigest(ctx, d[:]); got != nil || err == nil || !strings.Contains(err.Error(), "ANOMALY: KMS returned a second signature with the same r") {
 		t.Fatalf("another signature with the same r: %x, %v", got, err)
 	}
 	if len(f.objs) != 1 {
@@ -185,9 +185,9 @@ func TestRecordTakenName(t *testing.T) {
 	}
 }
 
-// The list anchor key as publish-services builds it (listAnchorer, from
-// newRekorLog, over the KMS key anchorPublicKey returns) records each
+// listAnchorer, over the KMS key anchorPublicKey returns, records each
 // signature: a real Anchorer.Sign through a fake KMS leaves its record.
+// (TestPublishSetupRecords covers the path from publish.)
 func TestListAnchorerRecords(t *testing.T) {
 	ctx := context.Background()
 	ec := testECKey(t)
