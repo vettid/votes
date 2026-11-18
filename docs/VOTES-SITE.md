@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.14 (2026-11-17), draft. The protocol this site serves is
+**Status:** 0.2.15 (2026-11-17), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -320,7 +320,7 @@ reports to AWS (**Alerts**, below).
   to the topic, naming the environment, the exit code and the run. A run
   whose check succeeded puts the heartbeat: `MonitorHeartbeat` in
   `VettID/Votes/<env>`, dimension `env`, value 1. The stack's alarm
-  `vettid-votes-<env>-monitor-heartbeat` (the hourly sum below 1 for 3
+  `vettid-votes-<env>-monitor-heartbeat` (the hourly sum below 1 for 12
   hours in a row, missing data breaching) notifies the same topic, and
   again when it clears: it catches a schedule GitHub disabled, runs that
   can't reach AWS, a skipped check (production before its site key is
@@ -506,10 +506,9 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   resets. Below 3 it is neither a failed
   check nor a mismatch: the run exits `0` if the rest held, and puts the
   heartbeat. At 3 consecutive runs it is a mismatch, `rekor: search
-  unavailable` **(the owner's (a) of 2026-11-05: 3, as the heartbeat
-  alarm's 3 hours: an outage of an hour or two, within Rekor's 99.5%
-  availability objective, passes, and one that lasts is raised as soon
-  as a stopped monitor would be)**.
+  unavailable` **(the owner's (a) of 2026-11-05: 3)**. GitHub runs the hourly
+  schedule only every 5 to 11 hours, so 3 runs is about 15 to 33 hours:
+  a short Rekor outage, within its 99.5% availability objective, passes.
 - **Pacing:** Rekor's rate limits are undocumented. Requests go one at
   a time, at least 250 ms apart, at most 1,000 an instance a run, within
   10 minutes an instance a run; a network error, a `429` or a `5xx` is
@@ -672,6 +671,9 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 
 ## Changes
 
+- **0.2.15 (2026-11-17):** the monitor heartbeat alarm fires after 12
+  hours without a heartbeat, not 3: GitHub runs the hourly schedule only
+  every few hours (the owner's a, GC #13328).
 - **0.2.14 (2026-11-17):** the monitor checks the service list's Rekor
   log (§7, GC #12646 task 4): from the pinned first logged version on,
   every version's bundle verifies under the pinned list anchor key for

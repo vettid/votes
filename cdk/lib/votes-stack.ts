@@ -35,9 +35,16 @@ export const WRITE_PATHS = ['v1/p/*', 'v1/index.json', 'v1/archive/*'] as const;
 /** The monitor's heartbeat (docs/VOTES-SITE.md §7): each run of
  * .github/workflows/monitor.yml that finds nothing wrong puts it in its
  * environment's namespace (`VettID/Votes/<env>`, so one environment's role
- * can't put another's), with the dimension env; three hours without one
- * raise the heartbeat alarm. */
-export const HEARTBEAT = { namespacePrefix: 'VettID/Votes/', metricName: 'MonitorHeartbeat', hours: 3 } as const;
+ * can't put another's), with the dimension env; twelve hours without one
+ * raise the heartbeat alarm. GitHub runs the hourly schedule only every
+ * few hours (5 to 11 observed), so a shorter window would fire on a
+ * healthy monitor (the owner's a, GC #13328). */
+export const HEARTBEAT = { namespacePrefix: 'VettID/Votes/', metricName: 'MonitorHeartbeat', hours: 12 } as const;
+
+/** KEY_WATCH_HEARTBEAT_HOURS: hours without a key watch heartbeat line
+ * before its alarm fires. Its call comes from AWS every hour, so it stays
+ * short, unlike the monitor's. */
+export const KEY_WATCH_HEARTBEAT_HOURS = 3;
 
 /** heartbeatNamespace is an environment's heartbeat namespace. */
 export function heartbeatNamespace(envName: string): string { return HEARTBEAT.namespacePrefix + envName; }
@@ -915,14 +922,14 @@ export class VotesStack extends cdk.Stack {
     });
     const beat = new cloudwatch.Alarm(this, 'KeyWatchHeartbeatAlarm', {
       alarmName: heartbeatAlarmName,
-      alarmDescription: `No hourly DescribeKey of the votes site key of ${props.envName} reached ${heartbeatLogs.logGroupName} in ${HEARTBEAT.hours} hours: ` +
+      alarmDescription: `No hourly DescribeKey of the votes site key of ${props.envName} reached ${heartbeatLogs.logGroupName} in ${KEY_WATCH_HEARTBEAT_HOURS} hours: ` +
         `the key watch's feed may be broken (the trail, the default bus, the rule, the log policy), or the rule ${heartbeatTickName} ` +
         `or the function ${heartbeatFunctionName} did not run or failed (README "The heartbeat").`,
       metric: new cloudwatch.Metric({ namespace, metricName: 'KeyWatchHeartbeat', statistic: cloudwatch.Stats.SAMPLE_COUNT, period: cdk.Duration.hours(1) }),
       threshold: 1,
       comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
-      evaluationPeriods: HEARTBEAT.hours,
-      datapointsToAlarm: HEARTBEAT.hours,
+      evaluationPeriods: KEY_WATCH_HEARTBEAT_HOURS,
+      datapointsToAlarm: KEY_WATCH_HEARTBEAT_HOURS,
       treatMissingData: cloudwatch.TreatMissingData.BREACHING,
     });
     for (const a of [alarm, feed, beat]) {

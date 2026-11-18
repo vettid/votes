@@ -93,7 +93,7 @@ false. The `monitor` workflow runs `check -all` hourly on staging and
 production and fails on `1` or `3` (VOTES-SITE §7; it needs the
 repository variable `VOTES_PROD_SITE_KEY` before production is checked).
 A failed run is published to the alert topic, and a successful one puts
-a heartbeat whose alarm fires after 3 hours without one ("Deployment",
+a heartbeat whose alarm fires after 12 hours without one ("Deployment",
 step 6).
 
 **The service list's Rekor log:** with `-all`,
