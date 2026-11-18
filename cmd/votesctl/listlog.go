@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,9 +16,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/vettid/service-vault/anchor"
 
+	"github.com/vettid/votes/signer"
 	"github.com/vettid/votes/signer/awsio"
 	"github.com/vettid/votes/site"
 )
@@ -44,11 +48,24 @@ type rekorLog struct {
 	a interface {
 		Anchor(context.Context, []byte) (json.RawMessage, error)
 	}
-	v interface {
-		Verify(bundle, doc, spki []byte) (time.Time, error)
-	}
+	v        listVerifier
 	spki     []byte
 	instance string
+}
+
+// listVerifier checks a list's bundle (site.Anchors).
+type listVerifier interface {
+	Verify(bundle, doc, spki []byte) (time.Time, error)
+}
+
+// newListAnchors is the instance's bundle verifier, under its trusted
+// root (site.NewAnchors, which fetches it through TUF). Tests replace it.
+var newListAnchors = func(instance string) (listVerifier, error) {
+	v, err := site.NewAnchors(instance)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 func (r *rekorLog) Check(bundle, data []byte) error {
@@ -145,7 +162,7 @@ func keySigstore(ctx context.Context, k anchorKeyAPI, keyARN string) (string, er
 // SubjectPublicKeyInfo is pin, and whose tag names instance) and returns
 // the list log on instance, whose trusted root it fetches through TUF.
 // Nothing is signed before every check has passed.
-func newRekorLog(ctx context.Context, k anchorKeyAPI, keyARN, siteKeyARN, instance string, pin []byte) (*rekorLog, error) {
+func newRekorLog(ctx context.Context, k anchorKeyAPI, c s3API, bucket, keyARN, siteKeyARN, instance string, pin []byte) (*rekorLog, error) {
 	if !kmsKeyARN.MatchString(keyARN) {
 		return nil, errors.New("-list-anchor-key takes the list anchor key's ARN (arn:aws:kms:<region>:<account>:key/<id>, the stack's ListAnchorKeyArn), not an alias or a key id")
 	}
@@ -177,7 +194,23 @@ func newRekorLog(ctx context.Context, k anchorKeyAPI, keyARN, siteKeyARN, instan
 		// Not "use the tag's": an administrator could have retagged the key.
 		return nil, fmt.Errorf("the list anchor key's %s tag says %s, -sigstore says %s: refusing to log. Don't change -sigstore to match the tag: check the stack's sigstore and the key watch's mail for a TagResource (README)", sigstoreTag, tagged, instance)
 	}
-	anch, err := anchor.NewSigner(instance, key)
+	anch, err := listAnchorer(instance, key, pin, c, bucket)
+	if err != nil {
+		return nil, err
+	}
+	ver, err := newListAnchors(instance)
+	if err != nil {
+		return nil, err
+	}
+	return &rekorLog{a: anch, v: ver, spki: pin, instance: instance}, nil
+}
+
+// listAnchorer is the Anchorer for the list anchor key (key, whose
+// SubjectPublicKeyInfo is pin): it signs only through a recordingSigner,
+// so that every signature is recorded in bucket before anything else
+// sees it.
+func listAnchorer(instance string, key anchor.DigestSigner, pin []byte, c s3API, bucket string) (*anchor.Anchorer, error) {
+	anch, err := anchor.NewSigner(instance, &recordingSigner{key: key, spki: pin, c: c, bucket: bucket})
 	if err != nil {
 		return nil, err
 	}
@@ -186,11 +219,87 @@ func newRekorLog(ctx context.Context, k anchorKeyAPI, keyARN, siteKeyARN, instan
 	if !bytes.Equal(anch.PublicKeyDER(), pin) {
 		return nil, errors.New("the list anchor key's public key is not -list-anchor-pub: refusing to log")
 	}
-	ver, err := site.NewAnchors(instance)
+	return anch, nil
+}
+
+// recordingSigner is the list anchor key as the Anchorer signs with it:
+// every signature KMS returns is recorded in the bucket, write-once, before
+// the Anchorer sees it, so before it is checked, timestamped or entered in
+// Rekor (GC #12986). The records are the offline nonce-reuse check's input
+// for this key: every signature, a rerun's, a lost race's and an abandoned
+// publish's included, not only the published bundles'. A signature whose
+// record isn't written is returned to no one, so nothing is logged
+// without one.
+type recordingSigner struct {
+	key    anchor.DigestSigner
+	spki   []byte // the key's SubjectPublicKeyInfo, as pinned
+	c      s3API
+	bucket string
+}
+
+// signRecord is one record: which key signed which digest, and the
+// signature as KMS returned it (ASN.1 DER).
+type signRecord struct {
+	V         int    `json:"v"`
+	KeySPKI   []byte `json:"key_spki"`
+	Digest    []byte `json:"digest"`
+	Signature []byte `json:"signature"`
+}
+
+// signRecordKey names a record by its digest and r, both lowercase hex,
+// r as signer.RFromDER gives it (big-endian, no leading zero bytes). The
+// record is written in one attempt (no SDK retry), so a name already
+// taken when SignDigest writes it was taken by an earlier signature with
+// the same r over the same digest: the same nonce, or its negation (the
+// same signature, or (r, N-s)). Neither is expected from KMS.
+func signRecordKey(digest, r []byte) string {
+	return "v1/services/signs/" + hex.EncodeToString(digest) + "/" + hex.EncodeToString(r) + ".json"
+}
+
+// Public implements anchor.DigestSigner.
+func (s *recordingSigner) Public() *ecdsa.PublicKey { return s.key.Public() }
+
+// SignDigest implements anchor.DigestSigner: one KMS Sign, then the
+// record. On any failure it returns no signature (the Sign was made, and
+// its key watch mail has no record: a rerun's). The one signature never
+// recorded is an answer that isn't strict DER, which KMS doesn't give: it
+// is discarded unrecorded (no r to name it by), and nothing is logged.
+func (s *recordingSigner) SignDigest(ctx context.Context, digest []byte) ([]byte, error) {
+	sig, err := s.key.SignDigest(ctx, digest)
 	if err != nil {
 		return nil, err
 	}
-	return &rekorLog{a: anch, v: ver, spki: pin, instance: instance}, nil
+	r, err := signer.RFromDER(sig)
+	if err != nil {
+		return nil, fmt.Errorf("the list anchor key's signature isn't strict DER: discarded, unrecorded, nothing logged: %w", err)
+	}
+	b, err := json.Marshal(&signRecord{V: 1, KeySPKI: s.spki, Digest: digest, Signature: sig})
+	if err != nil {
+		return nil, err
+	}
+	name := signRecordKey(digest, r)
+	// One attempt: an SDK retry of a write that landed would take the name
+	// with this very record, and hide a repeated signature.
+	if err := writeOnce(ctx, s.c, s.bucket, name, b, "application/json", func(o *s3.Options) { o.RetryMaxAttempts = 1 }); err != nil {
+		var api interface{ ErrorCode() string }
+		if !errors.As(err, &api) || api.ErrorCode() != "PreconditionFailed" {
+			return nil, fmt.Errorf("recording the list anchor key's signature: nothing logged, run the publish again: %w", err)
+		}
+		// The name was taken before this call: an earlier signature with
+		// the same r over this digest.
+		have, gerr := get(ctx, s.c, s.bucket, name)
+		switch {
+		case gerr != nil:
+			return nil, fmt.Errorf("recording the list anchor key's signature: %s is already taken and couldn't be read back (%v): nothing logged. Read that object and compare it with this signature before publishing again", name, gerr)
+		case have.data == nil:
+			return nil, fmt.Errorf("recording the list anchor key's signature: %s is already taken but reads as absent: nothing logged. Read that object and compare it with this signature before publishing again", name)
+		case bytes.Equal(have.data, b):
+			return nil, fmt.Errorf("ANOMALY: KMS returned a signature it had returned before over this digest (a repeated nonce, %s): nothing logged. Don't publish again; tell the owner", name)
+		default:
+			return nil, fmt.Errorf("ANOMALY: KMS returned a second signature with the same r over this digest (%s holds the other): nothing logged. Don't publish again; tell the owner", name)
+		}
+	}
+	return sig, nil
 }
 
 // bundleKey is a list version's Rekor bundle in the bucket, kept

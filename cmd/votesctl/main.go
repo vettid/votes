@@ -161,15 +161,28 @@ func publish(ctx context.Context, a publishArgs) error {
 	// The key's region, from its ARN (the watch topics are bound to it).
 	inRegion := func(o *kms.Options) { o.Region = region }
 	kc := kms.NewFromConfig(cfg, inRegion)
-	signer, err := kmsPublishSigner(ctx, a, kc, sns.NewFromConfig(cfg, func(o *sns.Options) { o.Region = region }))
+	sc := s3.NewFromConfig(cfg)
+	signer, lg, err := publishSetup(ctx, a, anchorPin, kc, sns.NewFromConfig(cfg, func(o *sns.Options) { o.Region = region }), sc)
 	if err != nil {
 		return err
 	}
-	lg, err := newRekorLog(ctx, kc, a.listAnchor, a.kms, a.sigstore, anchorPin)
+	return publishList(ctx, sc, a.bucket, signer, lg, raw)
+}
+
+// publishSetup is a KMS publish's signer and list log: the key watch and
+// the site key (kmsPublishSigner), then the list anchor key, whose
+// signatures are recorded in a.bucket through c, the publish's own
+// bucket client (newRekorLog).
+func publishSetup(ctx context.Context, a publishArgs, anchorPin []byte, k anchorKeyAPI, n snsAPI, c s3API) (listSigner, *rekorLog, error) {
+	signer, err := kmsPublishSigner(ctx, a, k, n)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	return publishList(ctx, s3.NewFromConfig(cfg), a.bucket, signer, lg, raw)
+	lg, err := newRekorLog(ctx, k, c, a.bucket, a.listAnchor, a.kms, a.sigstore, anchorPin)
+	if err != nil {
+		return nil, nil, err
+	}
+	return signer, lg, nil
 }
 
 // publishTimeout bounds one publish.
@@ -410,11 +423,11 @@ func versionCopy(ctx context.Context, c s3API, bucket string, version int64, dat
 
 // writeOnce writes a kept object under v1/services/, only if there is none
 // (the bucket policy requires the condition there).
-func writeOnce(ctx context.Context, c s3API, bucket, key string, data []byte, ct string) error {
+func writeOnce(ctx context.Context, c s3API, bucket, key string, data []byte, ct string, opts ...func(*s3.Options)) error {
 	in := &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(data),
 		ContentType: aws.String(ct), CacheControl: aws.String("public, max-age=31536000, immutable"),
 		IfNoneMatch: aws.String("*")}
-	if _, err := c.PutObject(ctx, in); err != nil {
+	if _, err := c.PutObject(ctx, in, opts...); err != nil {
 		return fmt.Errorf("%s: %w", key, err)
 	}
 	return nil

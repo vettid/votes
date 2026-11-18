@@ -210,6 +210,22 @@ has a default.
    `v1/services/<version>.bundle`, before the signature and the list, so
    that no list is served without its entry.
 
+   **Every list anchor key signature is recorded** (GC #12986), as
+   soon as KMS returns it and before it is checked or entered in Rekor:
+   `v1/services/signs/<digest>/<r>.json` (lowercase hex) holds the key's
+   SubjectPublicKeyInfo, the digest and the signature, written
+   write-once like the bundles. A rerun's, a lost race's and an abandoned
+   publish's signatures are recorded too; they are the input of the
+   offline check for a reused nonce. The record is written in one
+   attempt. If it can't be written, nothing is logged and the publish
+   fails: run it again. If its name is already taken, an earlier
+   signature had the same r over the same digest: votesctl prints an
+   `ANOMALY` (KMS returned the same signature again, or a second one
+   with the same r). Nothing is logged; don't publish again, and tell
+   the owner. The records are public, like the bundles: each holds a
+   digest and a signature, never a list. So the digests of abandoned
+   publishes are public too.
+
    Before anything is signed it checks:
    - the key's public key is `-list-anchor-pub` (its SubjectPublicKeyInfo,
      base64). **Take it from an independent pin**, the monitor's

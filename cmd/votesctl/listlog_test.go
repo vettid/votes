@@ -246,7 +246,7 @@ func TestRekorLogRefuses(t *testing.T) {
 		{testAnchorARN, "prod", pin, "-sigstore"},
 		{testAnchorARN, "staging", nil, "-list-anchor-pub"},
 	} {
-		if _, err := newRekorLog(ctx, f, c.key, testKeyARN, c.instance, c.pin); err == nil || !strings.Contains(err.Error(), c.want) {
+		if _, err := newRekorLog(ctx, f, newFakeS3(), "bucket", c.key, testKeyARN, c.instance, c.pin); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s %q: %v, want %q", c.key, c.instance, err, c.want)
 		}
 	}
@@ -256,15 +256,15 @@ func TestRekorLogRefuses(t *testing.T) {
 	// KMS's answer: for another key, or a key that doesn't sign with
 	// ECDSA_SHA_256 (the fake is Ed25519), or not P-256 (awsio.NewKeyFrom).
 	f.keyID = testKeyARN
-	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging", pin); err == nil || !strings.Contains(err.Error(), "answered for key") {
+	if _, err := newRekorLog(ctx, f, newFakeS3(), "bucket", testAnchorARN, testKeyARN, "staging", pin); err == nil || !strings.Contains(err.Error(), "answered for key") {
 		t.Fatalf("another key's answer: %v", err)
 	}
 	f.keyID = ""
-	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging", pin); err == nil || !strings.Contains(err.Error(), "ECDSA_SHA_256") {
+	if _, err := newRekorLog(ctx, f, newFakeS3(), "bucket", testAnchorARN, testKeyARN, "staging", pin); err == nil || !strings.Contains(err.Error(), "ECDSA_SHA_256") {
 		t.Fatalf("an Ed25519 key: %v", err)
 	}
 	f.algs = append(f.algs, kmstypes.SigningAlgorithmSpecEcdsaSha256)
-	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging", pin); err == nil || !strings.Contains(err.Error(), "ECC_NIST_P256") {
+	if _, err := newRekorLog(ctx, f, newFakeS3(), "bucket", testAnchorARN, testKeyARN, "staging", pin); err == nil || !strings.Contains(err.Error(), "ECC_NIST_P256") {
 		t.Fatalf("not a P-256 key: %v", err)
 	}
 	if len(f.signs) != 0 || f.publicReads != 3 {
@@ -330,14 +330,14 @@ func TestRekorLogPinAndTag(t *testing.T) {
 	f := &anchorFake{fakeKMS: newFakeKMS(testKey("site")), ec: ec}
 	spki, _ := x509.MarshalPKIXPublicKey(&ec.PublicKey)
 	other, _ := x509.MarshalPKIXPublicKey(&testECKey(t).PublicKey)
-	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging", other); err == nil || !strings.Contains(err.Error(), "not -list-anchor-pub") || f.tagReads != 0 {
+	if _, err := newRekorLog(ctx, f, newFakeS3(), "bucket", testAnchorARN, testKeyARN, "staging", other); err == nil || !strings.Contains(err.Error(), "not -list-anchor-pub") || f.tagReads != 0 {
 		t.Fatalf("another pin: %v (%d tag reads)", err, f.tagReads)
 	}
-	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging", spki); err == nil || !strings.Contains(err.Error(), "no vettid:sigstore tag") {
+	if _, err := newRekorLog(ctx, f, newFakeS3(), "bucket", testAnchorARN, testKeyARN, "staging", spki); err == nil || !strings.Contains(err.Error(), "no vettid:sigstore tag") {
 		t.Fatalf("no tag: %v", err)
 	}
 	f.tags = []kmstypes.Tag{{TagKey: aws.String("other"), TagValue: aws.String("staging")}, {TagKey: aws.String(sigstoreTag), TagValue: aws.String("production")}}
-	if _, err := newRekorLog(ctx, f, testAnchorARN, testKeyARN, "staging", spki); err == nil || !strings.Contains(err.Error(), "tag says production, -sigstore says staging") {
+	if _, err := newRekorLog(ctx, f, newFakeS3(), "bucket", testAnchorARN, testKeyARN, "staging", spki); err == nil || !strings.Contains(err.Error(), "tag says production, -sigstore says staging") {
 		t.Fatalf("another instance's tag: %v", err)
 	}
 	if len(f.signs) != 0 {
