@@ -37,7 +37,7 @@ export const WRITE_PATHS = ['v1/p/*', 'v1/index.json', 'v1/archive/*'] as const;
  * environment's namespace (`VettID/Votes/<env>`, so one environment's role
  * can't put another's), with the dimension env; twelve hours without one
  * raise the heartbeat alarm. GitHub runs the hourly schedule only every
- * few hours (5 to 10 observed), so a shorter window would fire on a
+ * few hours (5 to 11 observed), so a shorter window would fire on a
  * healthy monitor (the owner's a, GC #13328). */
 export const HEARTBEAT = { namespacePrefix: 'VettID/Votes/', metricName: 'MonitorHeartbeat', hours: 12 } as const;
 

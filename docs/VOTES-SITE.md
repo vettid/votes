@@ -506,10 +506,9 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   resets. Below 3 it is neither a failed
   check nor a mismatch: the run exits `0` if the rest held, and puts the
   heartbeat. At 3 consecutive runs it is a mismatch, `rekor: search
-  unavailable` **(the owner's (a) of 2026-11-05: 3, as the heartbeat
-  alarm's 3 hours: an outage of an hour or two, within Rekor's 99.5%
-  availability objective, passes, and one that lasts is raised as soon
-  as a stopped monitor would be)**.
+  unavailable` **(the owner's (a) of 2026-11-05: 3)**. GitHub runs the hourly
+  schedule only every 5 to 11 hours, so 3 runs is about 15 to 33 hours:
+  a short Rekor outage, within its 99.5% availability objective, passes.
 - **Pacing:** Rekor's rate limits are undocumented. Requests go one at
   a time, at least 250 ms apart, at most 1,000 an instance a run, within
   10 minutes an instance a run; a network error, a `429` or a `5xx` is
@@ -738,7 +737,7 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   are retried; documented exit codes; a scheduled workflow runs it
   hourly on staging and production, publishes a failed run to an SNS
   topic through a role it assumes by GitHub OIDC, and puts a heartbeat
-  whose alarm, after 12 hours without one, notifies the same topic (the
+  whose alarm, after 3 hours without one, notifies the same topic (the
   stack's `alarmTopicArn` and `githubOidcProviderArn`). The trusted root is embedded in the
   build and refreshed through TUF at most once a day, the fetch made
   outside the lock so other checks go on with the root in use; a start that
