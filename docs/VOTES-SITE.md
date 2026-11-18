@@ -1,6 +1,6 @@
 # votes.vettid.org
 
-**Status:** 0.2.14 (2026-11-17), draft. The protocol this site serves is
+**Status:** 0.2.15 (2026-11-17), draft. The protocol this site serves is
 [BALLOT-PROTOCOL](https://github.com/vettid/service-vault/blob/main/docs/BALLOT-PROTOCOL.md)
 (0.11.0); its §3.3 is this site's contract and §8.5 has the document
 schemas. Where this document and the protocol differ, the protocol wins
@@ -320,7 +320,7 @@ reports to AWS (**Alerts**, below).
   to the topic, naming the environment, the exit code and the run. A run
   whose check succeeded puts the heartbeat: `MonitorHeartbeat` in
   `VettID/Votes/<env>`, dimension `env`, value 1. The stack's alarm
-  `vettid-votes-<env>-monitor-heartbeat` (the hourly sum below 1 for 3
+  `vettid-votes-<env>-monitor-heartbeat` (the hourly sum below 1 for 12
   hours in a row, missing data breaching) notifies the same topic, and
   again when it clears: it catches a schedule GitHub disabled, runs that
   can't reach AWS, a skipped check (production before its site key is
@@ -672,6 +672,9 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
 
 ## Changes
 
+- **0.2.15 (2026-11-17):** the monitor heartbeat alarm fires after 12
+  hours without a heartbeat, not 3: GitHub runs the hourly schedule only
+  every few hours (the owner's a, GC #13328).
 - **0.2.14 (2026-11-17):** the monitor checks the service list's Rekor
   log (§7, GC #12646 task 4): from the pinned first logged version on,
   every version's bundle verifies under the pinned list anchor key for
@@ -735,7 +738,7 @@ each entry reported (`unknown`, `pending`, `acknowledged`), `warnings`,
   are retried; documented exit codes; a scheduled workflow runs it
   hourly on staging and production, publishes a failed run to an SNS
   topic through a role it assumes by GitHub OIDC, and puts a heartbeat
-  whose alarm, after 3 hours without one, notifies the same topic (the
+  whose alarm, after 12 hours without one, notifies the same topic (the
   stack's `alarmTopicArn` and `githubOidcProviderArn`). The trusted root is embedded in the
   build and refreshed through TUF at most once a day, the fetch made
   outside the lock so other checks go on with the root in use; a start that

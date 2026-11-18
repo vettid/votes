@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import { API_RATE_LIMIT, API_RATE_WINDOW_SECONDS, HEARTBEAT, heartbeatNamespace, KEY_USE_EVENTS, KEY_WATCH_PATTERN_MAX, LAMBDA_TIMEOUT_SECONDS, MONITOR_OIDC, PUBLISH_ROLE_EVENTS, VotesStack, validRoleArn, validSiteKey, WATCH_EVENTS } from '../lib/votes-stack';
+import { API_RATE_LIMIT, API_RATE_WINDOW_SECONDS, HEARTBEAT, heartbeatNamespace, KEY_USE_EVENTS, KEY_WATCH_HEARTBEAT_HOURS, KEY_WATCH_PATTERN_MAX, LAMBDA_TIMEOUT_SECONDS, MONITOR_OIDC, PUBLISH_ROLE_EVENTS, VotesStack, validRoleArn, validSiteKey, WATCH_EVENTS } from '../lib/votes-stack';
 
 // A fixed public test value, not a real key: 32 bytes of 0x07.
 const SITE_KEY = Buffer.alloc(32, 7).toString('base64');
@@ -270,12 +270,12 @@ describe('monitor alerts', () => {
     expect(monitorRole().Properties.Policies).toBeUndefined();
   });
 
-  test('the heartbeat alarm: three hours without a successful run, missing data breaching, to the topic', () => {
+  test('the heartbeat alarm: twelve hours without a successful run, missing data breaching, to the topic', () => {
     m.resourceCountIs('AWS::CloudWatch::Alarm', 4); // and the key-use, feed and key watch heartbeat alarms (site keys, below)
     m.hasResourceProperties('AWS::CloudWatch::Alarm', {
       AlarmName: 'vettid-votes-staging-monitor-heartbeat',
       Namespace: heartbeatNamespace('staging'), MetricName: 'MonitorHeartbeat', Dimensions: [{ Name: 'env', Value: 'staging' }],
-      Statistic: 'Sum', Period: 3600, EvaluationPeriods: 3, DatapointsToAlarm: 3,
+      Statistic: 'Sum', Period: 3600, EvaluationPeriods: 12, DatapointsToAlarm: 12,
       Threshold: 1, ComparisonOperator: 'LessThanThreshold', TreatMissingData: 'breaching',
       AlarmActions: [TOPIC], OKActions: [TOPIC],
     });
@@ -789,7 +789,8 @@ describe('site keys (VOTE-SITE-KEY-COMPROMISE §6)', () => {
       AlarmActions: [TOPIC, { Ref: topicA }, { Ref: topicB }],
       OKActions: [TOPIC],
     });
-    expect(HEARTBEAT.hours).toBe(3);
+    expect(KEY_WATCH_HEARTBEAT_HOURS).toBe(3);
+    expect(HEARTBEAT.hours).toBe(12);
   });
 
   test('outputs', () => {
