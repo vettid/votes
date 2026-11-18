@@ -217,10 +217,13 @@ has a default.
    write-once like the bundles. A rerun's, a lost race's and an abandoned
    publish's signatures are recorded too; they are the input of the
    offline check for a reused nonce. If the record can't be written,
-   nothing is logged and the publish fails: run it again. "An identical
-   one is already recorded" isn't an alarm; run it again too. The
-   records are public, like the bundles: each holds a digest and a
-   signature, never a list.
+   nothing is logged and the publish fails: run it again. "This
+   signature is already recorded" (a write that landed, retried) isn't
+   an alarm; run it again too. An `ALARM` that the key signed the digest
+   twice with the same r is a repeated nonce: don't publish again, and
+   tell the owner. The records are public, like the bundles: each holds
+   a digest and a signature, never a list. So the digests of abandoned
+   publishes are public too.
 
    Before anything is signed it checks:
    - the key's public key is `-list-anchor-pub` (its SubjectPublicKeyInfo,

@@ -180,6 +180,22 @@ func newRekorLog(ctx context.Context, k anchorKeyAPI, c s3API, bucket, keyARN, s
 		// Not "use the tag's": an administrator could have retagged the key.
 		return nil, fmt.Errorf("the list anchor key's %s tag says %s, -sigstore says %s: refusing to log. Don't change -sigstore to match the tag: check the stack's sigstore and the key watch's mail for a TagResource (README)", sigstoreTag, tagged, instance)
 	}
+	anch, err := listAnchorer(instance, key, pin, c, bucket)
+	if err != nil {
+		return nil, err
+	}
+	ver, err := site.NewAnchors(instance)
+	if err != nil {
+		return nil, err
+	}
+	return &rekorLog{a: anch, v: ver, spki: pin, instance: instance}, nil
+}
+
+// listAnchorer is the Anchorer for the list anchor key (key, whose
+// SubjectPublicKeyInfo is pin): it signs only through a recordingSigner,
+// so that every signature is recorded in bucket before anything else
+// sees it.
+func listAnchorer(instance string, key anchor.DigestSigner, pin []byte, c s3API, bucket string) (*anchor.Anchorer, error) {
 	anch, err := anchor.NewSigner(instance, &recordingSigner{key: key, spki: pin, c: c, bucket: bucket})
 	if err != nil {
 		return nil, err
@@ -189,11 +205,7 @@ func newRekorLog(ctx context.Context, k anchorKeyAPI, c s3API, bucket, keyARN, s
 	if !bytes.Equal(anch.PublicKeyDER(), pin) {
 		return nil, errors.New("the list anchor key's public key is not -list-anchor-pub: refusing to log")
 	}
-	ver, err := site.NewAnchors(instance)
-	if err != nil {
-		return nil, err
-	}
-	return &rekorLog{a: anch, v: ver, spki: pin, instance: instance}, nil
+	return anch, nil
 }
 
 // recordingSigner is the list anchor key as the Anchorer signs with it:
@@ -221,9 +233,10 @@ type signRecord struct {
 }
 
 // signRecordKey names a record by its digest and r, both lowercase hex,
-// r as signer.RFromDER gives it (big-endian, no leading zero bytes). Two
-// records under one name would be the same r over the same digest: the
-// same signature, since s follows from them.
+// r as signer.RFromDER gives it (big-endian, no leading zero bytes). A
+// name is taken twice only by the same signature written again, or by a
+// second signature with the same r over the same digest: a repeated
+// nonce (SignDigest tells them apart).
 func signRecordKey(digest, r []byte) string {
 	return "v1/services/signs/" + hex.EncodeToString(digest) + "/" + hex.EncodeToString(r) + ".json"
 }
@@ -247,13 +260,23 @@ func (s *recordingSigner) SignDigest(ctx context.Context, digest []byte) ([]byte
 	if err != nil {
 		return nil, err
 	}
-	if err := writeOnce(ctx, s.c, s.bucket, signRecordKey(digest, r), b, "application/json"); err != nil {
+	name := signRecordKey(digest, r)
+	if err := writeOnce(ctx, s.c, s.bucket, name, b, "application/json"); err != nil {
 		var api interface{ ErrorCode() string }
-		if errors.As(err, &api) && api.ErrorCode() == "PreconditionFailed" {
-			// Not an alarm: that signature is recorded already.
-			return nil, fmt.Errorf("recording the list anchor key's signature: an identical one is already recorded; nothing logged, run the publish again: %w", err)
+		if !errors.As(err, &api) || api.ErrorCode() != "PreconditionFailed" {
+			return nil, fmt.Errorf("recording the list anchor key's signature: nothing logged: %w", err)
 		}
-		return nil, fmt.Errorf("recording the list anchor key's signature: nothing logged: %w", err)
+		// The name is taken: by this record (a write that landed, retried),
+		// or by another signature with the same r over this digest.
+		have, gerr := get(ctx, s.c, s.bucket, name)
+		switch {
+		case gerr != nil || have.data == nil:
+			return nil, fmt.Errorf("recording the list anchor key's signature: %s is taken and can't be read (%v): nothing logged", name, gerr)
+		case bytes.Equal(have.data, b):
+			return nil, fmt.Errorf("recording the list anchor key's signature: this signature is already recorded (%s); nothing logged, run the publish again", name)
+		default:
+			return nil, fmt.Errorf("ALARM: the list anchor key signed this digest twice with the same r, a repeated nonce (%s holds the other signature): nothing logged. Don't publish again, and tell the owner: the key is to be rotated", name)
+		}
 	}
 	return sig, nil
 }

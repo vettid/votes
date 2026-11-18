@@ -8,11 +8,16 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"strings"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/service/kms"
+	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
@@ -104,12 +109,13 @@ func (f failingS3) PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Op
 }
 
 func TestRecordFailureNoSignature(t *testing.T) {
+	precond := &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "At least one of the pre-conditions you specified did not hold"}
 	for _, c := range []struct {
 		name, want string
 		err        error
 	}{
 		{"denied", "nothing logged", errors.New("AccessDenied")},
-		{"already recorded", "already recorded", &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "At least one of the pre-conditions you specified did not hold"}},
+		{"taken, unreadable", "can't be read", precond},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			rs, _ := testRecorder(t, failingS3{newFakeS3(), c.err})
@@ -119,6 +125,94 @@ func TestRecordFailureNoSignature(t *testing.T) {
 				t.Fatalf("SignDigest = %x, %v: want no signature and an error saying %q", sig, err, c.want)
 			}
 		})
+	}
+}
+
+// s3412 answers a put of an existing name with S3's own 412.
+type s3412 struct{ *fakeS3 }
+
+func (f s3412) PutObject(ctx context.Context, in *s3.PutObjectInput, o ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	if _, ok := f.objs[*in.Key]; ok {
+		return nil, &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "At least one of the pre-conditions you specified did not hold"}
+	}
+	return f.fakeS3.PutObject(ctx, in, o...)
+}
+
+// fixedSigner answers every sign with sig.
+type fixedSigner struct {
+	pub *ecdsa.PublicKey
+	sig []byte
+}
+
+func (f fixedSigner) Public() *ecdsa.PublicKey { return f.pub }
+
+func (f fixedSigner) SignDigest(context.Context, []byte) ([]byte, error) { return f.sig, nil }
+
+// A taken name: the same signature again is a write that landed (not an
+// alarm), and another signature with the same r over the digest, here
+// (r, N-s), is a repeated nonce, an ALARM. Neither returns a signature.
+func TestRecordTakenName(t *testing.T) {
+	ctx := context.Background()
+	f := s3412{newFakeS3()}
+	rs, k := testRecorder(t, f)
+	d := sha256.Sum256([]byte("a list"))
+	sig, err := ecdsa.SignASN1(rand.Reader, k, d[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs.key = fixedSigner{&k.PublicKey, sig}
+	if got, err := rs.SignDigest(ctx, d[:]); err != nil || !bytes.Equal(got, sig) {
+		t.Fatalf("first sign: %x, %v", got, err)
+	}
+	if got, err := rs.SignDigest(ctx, d[:]); got != nil || err == nil || !strings.Contains(err.Error(), "already recorded") || strings.Contains(err.Error(), "ALARM") {
+		t.Fatalf("the same signature again: %x, %v", got, err)
+	}
+	var v struct{ R, S *big.Int }
+	if _, err := asn1.Unmarshal(sig, &v); err != nil {
+		t.Fatal(err)
+	}
+	v.S.Sub(elliptic.P256().Params().N, v.S)
+	neg, _ := asn1.Marshal(v)
+	if !ecdsa.VerifyASN1(&k.PublicKey, d[:], neg) {
+		t.Fatal("(r, N-s) doesn't verify")
+	}
+	rs.key = fixedSigner{&k.PublicKey, neg}
+	if got, err := rs.SignDigest(ctx, d[:]); got != nil || err == nil || !strings.Contains(err.Error(), "ALARM") {
+		t.Fatalf("another signature with the same r: %x, %v", got, err)
+	}
+	if len(f.objs) != 1 {
+		t.Fatalf("want the first record only, have %d", len(f.objs))
+	}
+}
+
+// The list anchor key as publish-services builds it (listAnchorer, from
+// newRekorLog, over the KMS key anchorPublicKey returns) records each
+// signature: a real Anchorer.Sign through a fake KMS leaves its record.
+func TestListAnchorerRecords(t *testing.T) {
+	ctx := context.Background()
+	ec := testECKey(t)
+	f := &anchorFake{fakeKMS: newFakeKMS(testKey("site")), ec: ec}
+	key, spki, err := anchorPublicKey(ctx, f, testAnchorARN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := newFakeS3()
+	a, err := listAnchorer("staging", key, spki, b, "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, sig, err := a.Sign(ctx, []byte("a list"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _ := signer.RFromDER(sig)
+	o, ok := b.objs[signRecordKey(digest, r)]
+	if !ok || len(b.objs) != 1 || len(f.signs) != 1 {
+		t.Fatalf("want one KMS sign and its record, have %d signs, records %v", len(f.signs), b.objs)
+	}
+	var rec signRecord
+	if err := json.Unmarshal(o.data, &rec); err != nil || !bytes.Equal(rec.Signature, sig) || !bytes.Equal(rec.KeySPKI, spki) {
+		t.Fatalf("record %+v, %v", rec, err)
 	}
 }
 
@@ -180,6 +274,23 @@ func TestRecordBeforeAnchorerCheck(t *testing.T) {
 	if sig, err := rs2.SignDigest(context.Background(), make([]byte, 32)); sig != nil || err == nil || len(g.objs) != 0 {
 		t.Fatalf("a failed sign: want no signature and no record, have %x, %v, %d records", sig, err, len(g.objs))
 	}
+}
+
+// Sign is KMS's for anchorFake's P-256 key: ECDSA_SHA_256 over a DIGEST,
+// as awsio.Key asks. Without ec it is fakeKMS's.
+func (a *anchorFake) Sign(ctx context.Context, in *kms.SignInput, o ...func(*kms.Options)) (*kms.SignOutput, error) {
+	if a.ec == nil {
+		return a.fakeKMS.Sign(ctx, in, o...)
+	}
+	a.signs = append(a.signs, in)
+	if in.MessageType != kmstypes.MessageTypeDigest || in.SigningAlgorithm != kmstypes.SigningAlgorithmSpecEcdsaSha256 || len(in.Message) != 32 {
+		return nil, errors.New("ValidationException: unsupported message type or algorithm")
+	}
+	sig, err := ecdsa.SignASN1(rand.Reader, a.ec, in.Message)
+	if err != nil {
+		return nil, err
+	}
+	return &kms.SignOutput{KeyId: in.KeyId, Signature: sig, SigningAlgorithm: kmstypes.SigningAlgorithmSpecEcdsaSha256}, nil
 }
 
 type errSigner struct{ pub *ecdsa.PublicKey }
