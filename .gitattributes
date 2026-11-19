@@ -1,0 +1,2 @@
+deploy/*.json -text
+monitor/acknowledged-signs-*.json -text

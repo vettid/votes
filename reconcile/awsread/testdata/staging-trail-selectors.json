@@ -1,0 +1,67 @@
+{
+    "AdvancedEventSelectors": [
+        {
+            "Name": "Signer invokes",
+            "FieldSelectors": [
+                {
+                    "Field": "eventCategory",
+                    "Equals": [
+                        "Data"
+                    ]
+                },
+                {
+                    "Field": "resources.ARN",
+                    "StartsWith": [
+                        "arn:aws:lambda:us-east-1:444455556666:function:vettid-anchor-signer-staging"
+                    ]
+                },
+                {
+                    "Field": "resources.type",
+                    "Equals": [
+                        "AWS::Lambda::Function"
+                    ]
+                }
+            ]
+        },
+        {
+            "Name": "Management events, read and write",
+            "FieldSelectors": [
+                {
+                    "Field": "eventCategory",
+                    "Equals": [
+                        "Management"
+                    ]
+                }
+            ]
+        },
+        {
+            "Name": "Claim table writes",
+            "FieldSelectors": [
+                {
+                    "Field": "eventCategory",
+                    "Equals": [
+                        "Data"
+                    ]
+                },
+                {
+                    "Field": "resources.ARN",
+                    "Equals": [
+                        "arn:aws:dynamodb:us-east-1:444455556666:table/vettid-anchor-claims-staging"
+                    ]
+                },
+                {
+                    "Field": "readOnly",
+                    "Equals": [
+                        "false"
+                    ]
+                },
+                {
+                    "Field": "resources.type",
+                    "Equals": [
+                        "AWS::DynamoDB::Table"
+                    ]
+                }
+            ]
+        }
+    ]
+}
