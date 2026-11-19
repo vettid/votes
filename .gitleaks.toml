@@ -36,3 +36,12 @@ regexes = ['''m3x8G8MlAnzaOoHr0eg0M2j38mE4d15hkNekqdOAios=''', '''MFkwEwYHKoZIzj
 [[allowlists]]
 description = "a made-up KMS key id in votesctl's tests"
 regexes = ['''0123abcd-4567-89ab-cdef-0123456789ab''']
+
+# A made-up proposal id (a ULID) in the reconciler's site-check test
+# (reconcile/awsread/awsread_test.go, votes PR #32): random-looking
+# letters, not a key or token of anything. The test now uses a plain id;
+# this covers the commit that first had it, which the scan sees in the
+# branch's history.
+[[allowlists]]
+description = "a made-up proposal id in the reconciler's tests"
+regexes = ['''01HZX3K8M9N0P1Q2R3S4T5V6W7''']

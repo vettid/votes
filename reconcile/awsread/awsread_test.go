@@ -446,11 +446,11 @@ func TestSiteCheck(t *testing.T) {
 	ctx := context.Background()
 	key := make([]byte, 32)
 	// A read that fails: an error (the proposal not checked), not a refusal.
-	if refused, err := SiteCheck(ctx, failStore{}, nil, key, "01HZX3K8M9N0P1Q2R3S4T5V6W7", from); err == nil || refused != "" {
+	if refused, err := SiteCheck(ctx, failStore{}, nil, key, "00000000000000000000000001", from); err == nil || refused != "" {
 		t.Fatalf("a failed read: %q %v", refused, err)
 	}
 	// What the check refuses (here services.json missing): a refusal.
-	refused, err := SiteCheck(ctx, &site.MemStorage{Objects: map[string][]byte{}}, nil, key, "01HZX3K8M9N0P1Q2R3S4T5V6W7", from)
+	refused, err := SiteCheck(ctx, &site.MemStorage{Objects: map[string][]byte{}}, nil, key, "00000000000000000000000001", from)
 	if err != nil || refused == "" {
 		t.Fatalf("refused: %q %v", refused, err)
 	}
