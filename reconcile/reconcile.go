@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/hex"
@@ -42,7 +43,7 @@ const (
 	// message type. A Sign a note of its request id names (the outcome
 	// unknown, or a signature not kept), or one inside a sign_intent's
 	// lease whose attempt has no sign entry (each intent excusing one), is
-	// a notice.
+	// still an alarm (LostAnswerSeverity), acknowledged by its request id.
 	RuleUnattributed = "unattributed_sign"
 	// RuleSignRefused: a failed Sign by another principal than the signer
 	// role: a probe (notice).
@@ -50,14 +51,21 @@ const (
 	// RuleTrailMissing: a journaled sign with no KMS Sign of its request
 	// id in the trail, once the trail has had time to deliver it.
 	RuleTrailMissing = "trail_missing"
-	// RuleTrailDelivery: the trail isn't logging, or isn't delivering to
-	// its log group.
+	// RuleTrailDelivery: the trail isn't logging, isn't delivering to its
+	// log group, or its selectors aren't the stack's.
 	RuleTrailDelivery = "trail_delivery"
+	// RuleTrailConflict: a trail record that isn't CloudTrail's own (the
+	// wrong stream, account or event type), or one request id recorded
+	// with differing content.
+	RuleTrailConflict = "trail_conflict"
 	// RuleJournalConflict: journal entries that disagree with each other
-	// or with the claim: one request id for two signatures, one signature
-	// under two request ids, a kept signature journaled under another
-	// request id than the claim's, a sign for another digest than the
-	// slot's claim. A copied or forged entry.
+	// or with the claim, over the journal's whole retention: one request
+	// id for two signatures, one (digest, r) under two request ids or
+	// signatures, one sign journaled for two slots, a kept signature the
+	// claim names under another request id or signature than the
+	// journal's (or that a journaled claim has no entry for), a sign for
+	// another digest than the slot's claim, an entry that can't be read.
+	// A copied, forged or rewritten record.
 	RuleJournalConflict = "journal_conflict"
 	// RuleUnclaimed: a journaled sign for a slot with no claim.
 	RuleUnclaimed = "unclaimed_sign"
@@ -105,6 +113,9 @@ type Finding struct {
 	Digest    string `json:"digest,omitempty"` // hex
 	R         string `json:"r,omitempty"`      // hex
 	RequestID string `json:"kms_request_id,omitempty"`
+	// SigSHA256 is the hex SHA-256 of the signature a finding is about,
+	// when it has no request id (a site bundle's).
+	SigSHA256 string `json:"sig_sha256,omitempty"`
 	Detail    string `json:"detail"`
 	// Acknowledged: listed in the acknowledged signs (reported, not alarmed).
 	Acknowledged bool `json:"acknowledged,omitempty"`
@@ -128,6 +139,9 @@ type Claim struct {
 	Sig       []byte // the kept signature, if any
 	R         []byte
 	RequestID string
+	// Journaled: the claim says its kept signature's sign entry is in the
+	// journal (the signer sets it after the write).
+	Journaled bool
 }
 
 // Published is what the site holds for a slot.
@@ -137,6 +151,9 @@ type Published struct {
 	// the adapter under the anchor key; VerifyErr when it didn't verify.
 	Signature []byte
 	VerifyErr string
+	// AnchoredAt is the verified bundle's timestamp (zero when it didn't
+	// verify).
+	AnchoredAt time.Time
 }
 
 // Release is the signer function as deployed, against its release record.
@@ -145,16 +162,35 @@ type Release struct {
 	WantPolicy, GotPolicy         string // the resource policy, canonical JSON
 	// Versions and Aliases other than $LATEST: a release has none.
 	Versions, Aliases []string
+	// The function's configuration as deployed: AnchorSigner-<env> sets
+	// the runtime, handler, architecture and role, and no layers and no
+	// environment (WantRuntime and the rest).
+	Runtime, Handler, Role string
+	Architectures          []string
+	Layers, EnvNames       []string
 }
 
-// Acknowledgement excuses one finding (by rule, slot, digest and r), listed
-// in the reviewed file monitor/acknowledged-signs-<env>.json.
+// What AnchorSigner-<env> deploys the signer function as.
+const (
+	WantRuntime      = "provided.al2023"
+	WantHandler      = "bootstrap"
+	WantArchitecture = "arm64"
+)
+
+// Acknowledgement excuses one finding, listed in the reviewed file
+// monitor/acknowledged-signs-<env>.json. It names the finding whole: its
+// rule, slot, digest and r, its KMS request id when it has one, and its
+// signature's hash when it has one and no request id. A finding matches
+// only when every one of them is equal, so one acknowledgement excuses
+// one Sign (or one bundle), never another with the same slot and digest.
 type Acknowledgement struct {
-	Rule   string `json:"rule"`
-	Slot   string `json:"slot"`
-	Digest string `json:"digest"` // hex
-	R      string `json:"r"`      // hex; "" for a finding with none
-	Reason string `json:"reason"`
+	Rule      string `json:"rule"`
+	Slot      string `json:"slot"`
+	Digest    string `json:"digest"`         // hex
+	R         string `json:"r"`              // hex; "" for a finding with none
+	RequestID string `json:"kms_request_id"` // "" for a finding with none
+	SigSHA256 string `json:"sig_sha256"`     // hex; "" for a finding with none
+	Reason    string `json:"reason"`
 }
 
 // Input is everything one pass reads.
@@ -168,10 +204,30 @@ type Input struct {
 	TrailLag time.Duration
 
 	Signs []signer.SignEntry
+	// History is every sign entry in the journal's whole retention (a
+	// year): a (digest, r) is unique, and a claim's kept signature is
+	// journaled under its request id, over all of it, not just the
+	// period; and a kept sign is checked for publication until it is
+	// published, whenever it was made.
+	History []signer.SignEntry
+	// HistoryFrom is where History begins (the journal's retention).
+	HistoryFrom time.Time
 	// Ingested is each sign entry's ingestion time (by SignKey), set by
 	// CloudWatch Logs: the entry's own At is the writer's, and the writer
-	// is the role the pass watches.
-	Ingested    map[string]time.Time
+	// is the role the pass watches. It covers History's entries too.
+	Ingested map[string]time.Time
+	// JournalUnreadable describes each journal entry the read couldn't
+	// decode: reported, and the rest of the journal still read.
+	JournalUnreadable []string
+	// TrailConflicts describes each trail record the read refused (not
+	// CloudTrail's stream, account or event type).
+	TrailConflicts []string
+	// SiteChecks is the observer check of each proposal the site holds
+	// (site.Check: services.json under the site key, each document's IK
+	// signature and bundle), by proposal id: "" when it passed, else what
+	// it refused. A proposal missing from it wasn't checked; one that
+	// couldn't be read is in Incomplete.
+	SiteChecks  map[string]string
 	Completions []signer.CompletionEntry
 	Notes       []signer.NoteEntry
 	KMSSigns    []KMSSign
@@ -237,25 +293,60 @@ func Run(in Input) []Finding {
 		add(Finding{Rule: RuleIncomplete, Severity: Alarm, Detail: "the anchor key: " + err.Error()})
 	}
 
-	// The journal's signs, each distinct entry once; then the entries'
-	// agreement with each other and with the claims.
+	for _, what := range in.JournalUnreadable {
+		add(Finding{Rule: RuleJournalConflict, Severity: Alarm, Detail: "a journal entry that can't be read: " + what})
+	}
+	for _, what := range in.TrailConflicts {
+		add(Finding{Rule: RuleTrailConflict, Severity: Alarm, Detail: what})
+	}
+
+	// The journal's signs: the period's (signs), and the whole
+	// retention's (all), each distinct entry once. The signer journals a
+	// kept signature again when marking it failed (journalSign), so an
+	// entry may repeat with another At and attempt, never another slot.
 	type ident struct{ id, digest, r, sig string }
-	var signs []signer.SignEntry
-	seen := map[ident]bool{}
+	identOf := func(s signer.SignEntry) ident { return ident{s.KMSRequestID, h(s.Digest), h(s.R), h(s.Signature)} }
+	slotOf := map[ident]string{}
+	twoSlots := map[ident]bool{}
+	distinct := func(s signer.SignEntry) bool {
+		k, slot := identOf(s), s.ProposalID+"/"+s.Name
+		prev, ok := slotOf[k]
+		if !ok {
+			slotOf[k] = slot
+			return true
+		}
+		if prev != slot && !twoSlots[k] {
+			twoSlots[k] = true
+			add(Finding{Rule: RuleJournalConflict, Severity: Alarm, Slot: prev, Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID,
+				Detail: "one sign journaled for two slots (" + prev + " and " + slot + ")"})
+		}
+		return false
+	}
+	var signs, all []signer.SignEntry
+	inPeriod := map[ident]bool{}
 	for _, s := range in.Signs {
-		k := ident{s.KMSRequestID, h(s.Digest), h(s.R), h(s.Signature)}
-		if !seen[k] {
-			seen[k] = true
+		if distinct(s) {
 			signs = append(signs, s)
+			inPeriod[identOf(s)] = true
+		}
+	}
+	all = append(all, signs...)
+	for _, s := range in.History {
+		if distinct(s) {
+			all = append(all, s)
 		}
 	}
 	byID := map[string][]signer.SignEntry{}
 	byDR := map[string][]signer.SignEntry{}
-	for _, s := range signs {
-		slot := s.ProposalID + "/" + s.Name
+	for _, s := range all {
 		byID[s.KMSRequestID] = append(byID[s.KMSRequestID], s)
 		dr := h(s.Digest) + "/" + h(s.R)
 		byDR[dr] = append(byDR[dr], s)
+	}
+	// The period's entries are checked one by one (an earlier entry was
+	// in its own periods, under the key of its time).
+	for _, s := range signs {
+		slot := s.ProposalID + "/" + s.Name
 		if s.KMSRequestID == "" {
 			add(Finding{Rule: RuleJournalConflict, Severity: Alarm, Slot: slot, Digest: h(s.Digest), R: h(s.R), Detail: "a sign entry with no request id"})
 		}
@@ -274,34 +365,60 @@ func Run(in Input) []Finding {
 	}
 	for _, dr := range sortedKeys(byDR) {
 		if es := byDR[dr]; len(es) > 1 {
+			// Over the whole retention: a second request id for a (digest,
+			// r) journaled long ago is a replayed signature covering
+			// another Sign.
 			add(Finding{Rule: RuleJournalConflict, Severity: Alarm, Slot: es[0].ProposalID + "/" + es[0].Name, Digest: h(es[0].Digest), R: h(es[0].R),
 				Detail: fmt.Sprintf("one signature journaled %d ways (request ids or signatures differ)", len(es))})
 		}
 	}
 
-	// Each sign's time, from what the signer role can't write: KMS's own
-	// time for its request id, else the entry's ingestion time. Its At must
-	// agree, and isn't ahead of now: a forward-dated entry would otherwise
-	// put off every age check.
-	kmsAt := map[string]time.Time{}
+	// KMS's Sign calls, one per request id: a request id recorded twice
+	// with differing content is a record that isn't CloudTrail's.
+	var kmsSigns []KMSSign
+	kmsRec := map[string]KMSSign{}
 	for _, k := range in.KMSSigns {
+		prev, ok := kmsRec[k.RequestID]
+		if !ok {
+			kmsRec[k.RequestID] = k
+			kmsSigns = append(kmsSigns, k)
+			if k.At.Sub(in.Now) > ClockSkew {
+				add(Finding{Rule: RuleTrailConflict, Severity: Alarm, RequestID: k.RequestID, Detail: "a Sign record dated ahead of now"})
+			}
+			continue
+		}
+		if !prev.At.Equal(k.At) || prev.KeyARN != k.KeyARN || prev.Principal != k.Principal || prev.Algorithm != k.Algorithm ||
+			prev.MessageType != k.MessageType || prev.ErrorCode != k.ErrorCode {
+			add(Finding{Rule: RuleTrailConflict, Severity: Alarm, RequestID: k.RequestID, Detail: "one request id recorded twice with differing content"})
+		}
+	}
+
+	// Each sign's time, from what the signer role can't write: the earlier
+	// of KMS's own time for its request id and the entry's ingestion time,
+	// so that neither a record nor an entry dated late puts off an age
+	// check. The entry's At must agree with KMS's, and is never ahead of
+	// now, whatever KMS's time.
+	kmsAt := map[string]time.Time{}
+	for _, k := range kmsSigns {
 		if k.ErrorCode == "" {
 			kmsAt[k.RequestID] = k.At
 		}
 	}
 	signedAt := func(s signer.SignEntry) (time.Time, bool) {
-		if t, ok := kmsAt[s.KMSRequestID]; ok {
-			return t, true
-		}
 		t, ok := in.Ingested[SignKey(s)]
-		return t, ok && !t.IsZero()
+		ok = ok && !t.IsZero()
+		if k, kok := kmsAt[s.KMSRequestID]; kok && (!ok || k.Before(t)) {
+			return k, true
+		}
+		return t, ok
 	}
 	for _, s := range signs {
 		f := Finding{Rule: RuleJournalConflict, Severity: Alarm, Slot: s.ProposalID + "/" + s.Name, Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID}
 		if t, ok := kmsAt[s.KMSRequestID]; ok && (s.At.Sub(t) > ClockSkew || t.Sub(s.At) > ClockSkew) {
 			f.Detail = fmt.Sprintf("a sign entry dated %s, its KMS Sign at %s", s.At.UTC().Format(time.RFC3339), t.UTC().Format(time.RFC3339))
 			add(f)
-		} else if s.At.Sub(in.Now) > ClockSkew {
+		}
+		if s.At.Sub(in.Now) > ClockSkew {
 			f.Detail = "a sign entry dated ahead of now"
 			add(f)
 		}
@@ -316,12 +433,13 @@ func Run(in Input) []Finding {
 		return in.Now.Sub(s.At) // reported incomplete above
 	}
 
-	// Each sign against its slot's claim, the long-term record: the kept
-	// signature must be journaled under the claim's request id; any sign
-	// is for the claim's digest.
+	// Each sign of the whole retention against its slot's claim, the
+	// long-term record: the kept signature must be journaled under the
+	// claim's request id; any sign is for the claim's digest; one never
+	// kept alarms (unkept_sign) for as long as the journal holds it.
 	kept := map[string]bool{}        // h(signature) of journaled signs that are their slot's kept one
 	secondNoted := map[string]bool{} // slot/r already reported as a second sign
-	for _, s := range signs {
+	for _, s := range all {
 		slot := s.ProposalID + "/" + s.Name
 		f := Finding{Slot: slot, Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID}
 		c, read := in.Claims[slot]
@@ -339,8 +457,12 @@ func Run(in Input) []Finding {
 			continue
 		case len(c.Sig) > 0:
 			// The slot kept another signature of this digest: this one is a
-			// second sign, reported from the claim (whatever the period),
-			// once per slot and r.
+			// second sign, a notice once per slot and r while its entry is
+			// in the period. Its (digest, r) stays unique over the whole
+			// retention (above): replaying it for another Sign is a conflict.
+			if !inPeriod[identOf(s)] {
+				continue
+			}
 			if k := slot + "/" + h(s.R); !secondNoted[k] {
 				secondNoted[k] = true
 				f.Rule, f.Severity, f.Detail = RuleSecondSign, Notice, "a signature of the slot's digest other than the one its claim kept"
@@ -358,6 +480,26 @@ func Run(in Input) []Finding {
 		add(f)
 	}
 
+	// Each claim's kept signature, against the journal's whole retention:
+	// a claim marked journaled has an entry for it. (An entry that
+	// disagrees with the claim is a conflict above; this catches a claim
+	// whose request id was rewritten, its entry anywhere in the year.) A
+	// claim not yet marked is one the signer journals on the slot's next
+	// call; its Sign has no entry meanwhile, an unattributed_sign while in
+	// the period. A slot anchored before the history begins is out of
+	// the journal's retention, and not checked here.
+	for _, slot := range sortedKeys(in.Claims) {
+		c := in.Claims[slot]
+		if !c.Exists || len(c.Sig) == 0 || !c.Journaled || len(byDR[h(c.Digest)+"/"+h(c.R)]) > 0 {
+			continue
+		}
+		if p := in.Published[slot]; p.Held && !p.AnchoredAt.IsZero() && p.AnchoredAt.Before(in.HistoryFrom) {
+			continue
+		}
+		add(Finding{Rule: RuleJournalConflict, Severity: Alarm, Slot: slot, Digest: h(c.Digest), R: h(c.R), RequestID: c.RequestID,
+			Detail: "the claim says its kept signature is journaled, and the journal has no entry for it"})
+	}
+
 	// unattributed_sign: every KMS Sign accounted for, one to one.
 	settled := in.To.Add(-in.TrailLag)
 	attemptSigned := map[string]bool{}
@@ -367,7 +509,7 @@ func Run(in Input) []Finding {
 		}
 	}
 	usedNote := map[int]bool{}
-	for _, k := range in.KMSSigns {
+	for _, k := range kmsSigns {
 		if k.At.After(settled) {
 			continue
 		}
@@ -412,8 +554,9 @@ func Run(in Input) []Finding {
 				f.Rule, f.Detail = RuleIncomplete, "the claim of a note's slot was not read"
 			case !c.Exists || !bytes.Equal(c.Digest, n.Digest):
 				f.Detail = "a Sign a note explains, for a slot whose claim doesn't bear the note out (" + how + ")"
-			case n.Kind == signer.NoteUnkept && (pub == nil || len(n.Signature) == 0 || !ecdsa.VerifyASN1(pub, c.Digest, n.Signature)):
-				f.Rule, f.Detail = RuleSignatureMismatch, "a signature journaled as not kept that doesn't verify over its slot's digest"
+			case n.Kind == signer.NoteUnkept && (pub == nil || len(n.Signature) == 0 || !ecdsa.VerifyASN1(pub, c.Digest, n.Signature) ||
+				!bytes.Equal(rOf(n.Signature), n.R)):
+				f.Rule, f.Detail = RuleSignatureMismatch, "a signature journaled as not kept that doesn't verify over its slot's digest, or whose r isn't the note's"
 			default:
 				f.Severity = LostAnswerSeverity
 				f.Detail = "a Sign the journal has no entry for, " + how + " (an answer lost): what it signed isn't known"
@@ -424,7 +567,7 @@ func Run(in Input) []Finding {
 
 	// trail_missing: every journaled sign in the trail.
 	kmsByID := map[string]bool{}
-	for _, k := range in.KMSSigns {
+	for _, k := range kmsSigns {
 		if k.ErrorCode == "" {
 			kmsByID[k.RequestID] = true
 		}
@@ -443,8 +586,9 @@ func Run(in Input) []Finding {
 			Digest: h(s.Digest), R: h(s.R), RequestID: s.KMSRequestID, Detail: "a journaled sign the trail doesn't show"})
 	}
 
-	// unpublished_sign: each kept sign, an hour on, held by the site.
-	for _, s := range signs {
+	// unpublished_sign: each kept sign of the whole retention, an hour on,
+	// held by the site: one the period has left is still rechecked.
+	for _, s := range all {
 		slot := s.ProposalID + "/" + s.Name
 		if !kept[h(s.Signature)] || age(s) < UnpublishedAfter {
 			continue
@@ -472,6 +616,11 @@ func Run(in Input) []Finding {
 			continue
 		}
 		f := Finding{Rule: RuleSignatureMismatch, Severity: Alarm, Slot: slot}
+		if len(p.Signature) > 0 {
+			// No request id: an acknowledgement names the bundle's signature.
+			sum := sha256.Sum256(p.Signature)
+			f.SigSHA256 = h(sum[:])
+		}
 		c, read := in.Claims[slot]
 		switch {
 		case p.VerifyErr != "":
@@ -502,6 +651,31 @@ func Run(in Input) []Finding {
 		}
 		if r.WantPolicy == "" || r.GotPolicy != r.WantPolicy {
 			add(Finding{Rule: RulePolicyDrift, Severity: Alarm, Detail: "the function's resource policy isn't the release's"})
+		}
+		// The rest of the configuration: each of these runs other code or
+		// as another principal than the release's, with the same CodeSha256.
+		switch {
+		case r.Runtime != WantRuntime || r.Handler != WantHandler:
+			add(Finding{Rule: RuleCodeDrift, Severity: Alarm, Detail: "the function's runtime " + r.Runtime + " and handler " + r.Handler + " aren't the release's"})
+		case len(r.Architectures) != 1 || r.Architectures[0] != WantArchitecture:
+			add(Finding{Rule: RuleCodeDrift, Severity: Alarm, Detail: fmt.Sprintf("the function's architectures %v aren't the release's", r.Architectures)})
+		}
+		if len(r.Layers) > 0 {
+			add(Finding{Rule: RuleCodeDrift, Severity: Alarm, Detail: fmt.Sprintf("the function has layers %v; a release has none", r.Layers)})
+		}
+		if r.Role != in.SignerRole {
+			add(Finding{Rule: RuleCodeDrift, Severity: Alarm, Detail: "the function runs as " + r.Role + ", not the signer role"})
+		}
+		if len(r.EnvNames) > 0 {
+			add(Finding{Rule: RuleCodeDrift, Severity: Alarm, Detail: fmt.Sprintf("the function has environment variables %v; a release has none", r.EnvNames)})
+		}
+	}
+
+	// The observer check of every proposal the site holds. Not
+	// acknowledgeable (no slot): the site is put right instead.
+	for _, id := range sortedKeys(in.SiteChecks) {
+		if why := in.SiteChecks[id]; why != "" {
+			add(Finding{Rule: RuleSignatureMismatch, Severity: Alarm, Detail: "the site's proposal " + id + " fails the observer check: " + why})
 		}
 	}
 
@@ -611,12 +785,26 @@ func verifySign(pub *ecdsa.PublicKey, s signer.SignEntry) error {
 	return nil
 }
 
-// acknowledge marks the findings an acknowledgement lists (rule, slot,
-// digest and r all equal): they stay in the report, as notices.
+// rOf is a DER ECDSA signature's r (big-endian, no leading zeros), nil
+// when it isn't one.
+func rOf(sig []byte) []byte {
+	var s struct{ R, S *big.Int }
+	if rest, err := asn1.Unmarshal(sig, &s); err != nil || len(rest) != 0 || s.R == nil {
+		return nil
+	}
+	return s.R.Bytes()
+}
+
+// acknowledge marks the findings an acknowledgement names whole (rule,
+// slot, digest, r, request id and signature hash all equal): they stay
+// in the report, as notices. A finding with no slot can't be
+// acknowledged.
 func acknowledge(fs []Finding, acks []Acknowledgement) {
 	for i := range fs {
+		f := fs[i]
 		for _, a := range acks {
-			if a.Slot != "" && a.Rule == fs[i].Rule && a.Slot == fs[i].Slot && a.Digest == fs[i].Digest && a.R == fs[i].R {
+			if a.Slot != "" && a.Rule == f.Rule && a.Slot == f.Slot && a.Digest == f.Digest && a.R == f.R &&
+				a.RequestID == f.RequestID && a.SigSHA256 == f.SigSHA256 {
 				fs[i].Acknowledged, fs[i].Severity = true, Notice
 			}
 		}

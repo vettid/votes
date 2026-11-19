@@ -29,7 +29,7 @@ get() {
 	printf '%s' "$v"
 }
 ld="-s -w -buildid="
-for k in Region KeyAlias KeyARN KeySPKISHA256 ClaimsTable TrailName JournalGroup JournalStream TrailGroup VotesBucket Sigstore SignerFunction SignerRole CodeSha256; do
+for k in Region KeyAlias KeyARN KeySPKISHA256 ClaimsTable TrailName JournalGroup JournalStream TrailGroup VotesBucket Sigstore SignerFunction SignerRole CodeSha256 SiteKey OwnLogGroup; do
 	ld="$ld -X main.compiled$k=$(get "$k")"
 done
 # base64 without line breaks, on GNU and BSD alike; the files are checked

@@ -9,9 +9,11 @@
 #   as released (Lambda GetPolicy's Policy, as JSON). A difference alarms
 #   (policy_drift).
 # - monitor/acknowledged-signs-<env>.json: the acknowledged signs, a JSON
-#   array of {rule, slot, digest, r, reason} (r "" for a finding with
-#   none); [] for none. A change is a new
-#   signed release.
+#   array of {rule, slot, digest, r, kms_request_id, sig_sha256, reason}
+#   (r "" for a finding with none). Each names the one Sign (its
+#   kms_request_id) or the one bundle (its sig_sha256) it excuses, as the
+#   finding's line shows them: it never excuses another Sign of the same
+#   slot and digest. [] for none. A change is a new signed release.
 #
 # Region: the signer account's region.
 Region=us-east-1
@@ -40,3 +42,12 @@ SignerRole=arn:aws:iam::000000000000:role/vettid-anchor-signer-staging
 # (the release record). A difference alarms (code_drift). Each signer
 # release is followed by a reconciler release that names it.
 CodeSha256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+# SiteKey: the votes site's public key (base64 Ed25519), as votesctl check
+# takes it: each run checks services.json under it, and each proposal the
+# site holds (its IK signatures and bundles), as an observer would.
+SiteKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+# OwnLogGroup: the reconciler function's own log group (part c's stack).
+# Each run starts its period at the last complete run it finds there, so
+# a stop doesn't leave Signs unreconciled. Only the reconciler's role may
+# write it.
+OwnLogGroup=/aws/lambda/vettid-anchor-reconciler-staging

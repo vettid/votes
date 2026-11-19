@@ -52,7 +52,7 @@ func Check(environ []string, log *slog.Logger) error {
 			}
 		}
 		if !Known[name] && !strings.HasPrefix(name, "AWS_LAMBDA_LOG_") {
-			log.Warn("an unknown environment variable is set", "name", name)
+			log.Warn("an unknown environment variable is set", "notice", "unknown_env", "name", name)
 		}
 	}
 	return nil
