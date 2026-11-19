@@ -6,12 +6,30 @@ name: monitor
 # archive. The job fails on a failed check (exit 1) or a mismatch (exit 3,
 # "ok": false), and the report is in its log.
 #
-# The site keys are public. Staging's is the member vaults' release config
-# (vettid-vault, enclave/releasecfg/staging.json, vote_site_key), used
-# unless the repository variable VOTES_STAGING_SITE_KEY overrides it.
+# The site keys are public. Staging's is pinned below (default_key), the
+# key the member vaults' release config pins too (vettid-vault,
+# enclave/releasecfg/staging.json, vote_site_key), and only here: no
+# repository variable overrides it (its key_var is empty), so a change of
+# it is a reviewed PR, like the log pins.
 # Production's is not published yet: set the repository variable
 # VOTES_PROD_SITE_KEY to it (`votesctl site-key`) once production is
-# deployed; until then its check is skipped with a warning.
+# deployed; until then its check is skipped with a warning. Only a row
+# whose key comes from a repository variable is ever skipped, and only
+# while it has no log pins (it isn't deployed): a row with an empty key_var
+# (its key pinned here) or with a log pin fails the run without a site key.
+#
+# The service list's Rekor log (docs/VOTES-SITE.md §3, §7): each
+# environment's list anchor key (its SubjectPublicKeyInfo, base64, as
+# `votesctl list-anchor-key` prints it) and the first version logged with
+# it are pinned here, in this file, so that a change of either is a
+# reviewed PR, never a repository variable. Both are set by a PR before
+# the environment's first publish with -kms, with first_logged "1" (a
+# fresh list; staging started fresh under its KMS keys, GC #12656, docs/
+# STAGING-FLAG-DAY.md); until then the log isn't checked, with a warning,
+# and one set without the other fails the run. An environment with
+# log_required fails without both pins once its site key is set (staging
+# since its fresh start; production from its first deploy, which has its
+# KMS keys).
 #
 # Partial uploads the site can never complete are listed, each by PR with
 # its reason, in monitor/acknowledged-<env>.json (docs/VOTES-SITE.md §7).
@@ -22,7 +40,7 @@ name: monitor
 # it assumes the stack's monitor role through GitHub's OIDC provider
 # (only this workflow, on main, may), then publishes a failed run (a
 # mismatch or an error) to the alert topic, or puts the heartbeat after a
-# successful check. The heartbeat's alarm, three hours without one,
+# successful check. The heartbeat's alarm, twelve hours without one,
 # notifies the same topic: it catches a schedule that stopped. The role
 # and the topic are repository variables (not secrets: neither is one),
 # per environment: VOTES_<STAGING|PROD>_MONITOR_ROLE_ARN (the stack's
@@ -62,8 +80,15 @@ jobs:
           - env: staging
             site: https://votes.staging.vettid.org
             sigstore: staging
-            key_var: VOTES_STAGING_SITE_KEY
-            default_key: c4dqg2ssGVylbO9Xnpdv4zopmzx9S++4KgxMWOyhXJQ=
+            key_var: "" # no override: the pin below is the only source
+            # The KMS site key (alias/vettid-votes-staging-site) since the
+            # fresh start; the vaults pin the same key (vote_site_key).
+            default_key: m3x8G8MlAnzaOoHr0eg0M2j38mE4d15hkNekqdOAios=
+            # The list anchor key (alias/vettid-votes-staging-list-anchor).
+            list_anchor_pub: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEVhK17Y0fK2EG4KYQPzr2h5AVhO/BkVMQuQ9LTQVH6+02DFyVqD3hJMwZHHxke9bHEdocFFhd7FqqMOAnqxMFA==
+            # first_logged stays a quoted decimal string.
+            first_logged: "1"
+            log_required: true
             role_var: VOTES_STAGING_MONITOR_ROLE_ARN
             topic_var: VOTES_STAGING_ALERT_TOPIC_ARN
           - env: prod
@@ -71,6 +96,11 @@ jobs:
             sigstore: production
             key_var: VOTES_PROD_SITE_KEY
             default_key: ""
+            list_anchor_pub: ""
+            first_logged: ""
+            # Production has its KMS keys from its first deploy: once its
+            # site is checked at all, its log must be too.
+            log_required: true
             role_var: VOTES_PROD_MONITOR_ROLE_ARN
             topic_var: VOTES_PROD_ALERT_TOPIC_ARN
     defaults:
@@ -97,16 +127,36 @@ jobs:
         env:
           SITE: ${{ matrix.site }}
           SIGSTORE: ${{ matrix.sigstore }}
-          SITE_KEY: ${{ vars[matrix.key_var] || matrix.default_key }}
+          SITE_KEY: ${{ (matrix.key_var && vars[matrix.key_var]) || matrix.default_key }}
           KEY_VAR: ${{ matrix.key_var }}
+          LIST_ANCHOR_PUB: ${{ matrix.list_anchor_pub }}
+          FIRST_LOGGED: ${{ matrix.first_logged }}
+          LOG_REQUIRED: ${{ matrix.log_required }}
         run: |
           if [ -z "$SITE_KEY" ]; then
+            # Skipped only while the key is a repository variable not yet
+            # set and nothing else is pinned: an environment not deployed.
+            if [ -z "$KEY_VAR" ] || [ -n "$LIST_ANCHOR_PUB$FIRST_LOGGED" ]; then
+              echo "::error::$SITE: no site key, though its key is pinned in monitor.yml or its log is: the check can't run"
+              echo "code=config" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
             echo "::warning::$SITE not checked: set the repository variable $KEY_VAR to its site key"
             exit 0
           fi
+          log=()
+          if [ -n "$LIST_ANCHOR_PUB" ] && [ -n "$FIRST_LOGGED" ]; then
+            log=(-list-anchor-pub "$LIST_ANCHOR_PUB" -first-logged "$FIRST_LOGGED")
+          elif [ -n "$LIST_ANCHOR_PUB$FIRST_LOGGED" ] || [ "$LOG_REQUIRED" = "true" ]; then
+            echo "::error::$SITE: list_anchor_pub and first_logged must both be pinned in monitor.yml (required for this environment: $LOG_REQUIRED)"
+            echo "code=config" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "::warning::$SITE: the service list's Rekor log isn't checked: its list anchor key isn't pinned in monitor.yml yet"
+          fi
           code=0
           "$RUNNER_TEMP/votesctl" check -all -site "$SITE" -sigstore "$SIGSTORE" -site-key "$SITE_KEY" \
-            -acknowledged "monitor/acknowledged-${{ matrix.env }}.json" || code=$?
+            "${log[@]}" -acknowledged "monitor/acknowledged-${{ matrix.env }}.json" || code=$?
           echo "checked=true" >> "$GITHUB_OUTPUT"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           exit "$code"
@@ -141,6 +191,7 @@ jobs:
           case "$CODE" in
             3) what="mismatches (votesctl check exit 3)" ;;
             1) what="a check failed (votesctl check exit 1)" ;;
+            config) what="the monitor is misconfigured (no site key or log pins; votesctl did not run)" ;;
             "") what="the run failed before the check" ;;
             *) what="votesctl check exit $CODE" ;;
           esac

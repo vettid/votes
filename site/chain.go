@@ -27,7 +27,29 @@ type ChainReport struct {
 	// list: never expected under an anchor key (the Rekor check's
 	// "unexpected digest").
 	Digests [][]byte
+	// Logged is how many versions' Rekor bundles were verified (with a
+	// ListLog; services/<version>.bundle).
+	Logged int
 }
+
+// ListLog is what a walk checks of the service list's Rekor log (§3,
+// services/<version>.bundle): every version from First on has a bundle
+// that anchors its bytes under the list anchor key whose
+// SubjectPublicKeyInfo is SPKI, on Anchors' instance. First and SPKI are
+// pinned configuration, never read from the site or a bundle.
+type ListLog struct {
+	Anchors BundleVerifier
+	SPKI    []byte
+	First   int64
+}
+
+// BundleVerifier checks a bundle over doc under the key spki: *Anchors.
+type BundleVerifier interface {
+	Verify(bundleJSON, doc, spki []byte) (time.Time, error)
+}
+
+// bundlePath is a version's Rekor bundle.
+func bundlePath(v int64) string { return "v1/services/" + strconv.FormatInt(v, 10) + ".bundle" }
 
 // CheckServiceChain walks the kept versions of the service list,
 // services/1 to the current one: each copy's signature verifies under the
@@ -41,6 +63,23 @@ type ChainReport struct {
 // modified, as modified says (nil, or an error: at once).
 func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.PublicKey, now time.Time,
 	modified func(ctx context.Context, path string) (time.Time, error)) (*ChainReport, error) {
+	return CheckServiceChainLogged(ctx, fetch, siteKey, now, modified, nil)
+}
+
+// CheckServiceChainLogged is CheckServiceChain that, with lg, also checks
+// the list's Rekor log: from lg.First to the current version, each
+// version's bundle must anchor its bytes (the current version's, the
+// current list's), under lg.SPKI. A missing bundle is a mismatch at once
+// (publish-services writes it before the list moves); one that doesn't
+// verify is an error. A bundle past the current version is a list logged
+// but never served (a publish lost a race or was abandoned, or one not
+// served at all): a mismatch, unless it was written within ListingGrace
+// (a publish in progress), as modified says of it. A First past the
+// current version is an error (a rollback to before logging began, or a
+// wrong pin). A bundle at First-1 is a mismatch (the pin is past the real
+// first logged version).
+func CheckServiceChainLogged(ctx context.Context, fetch Fetcher, siteKey ed25519.PublicKey, now time.Time,
+	modified func(ctx context.Context, path string) (time.Time, error), lg *ListLog) (*ChainReport, error) {
 	cur, curSig, err := fetchPair(ctx, fetch, "v1/services.json")
 	if err != nil {
 		return nil, err
@@ -53,6 +92,30 @@ func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.Publi
 		return nil, fmt.Errorf("site: services.json: %w", err)
 	}
 	rep := &ChainReport{Version: current.Version}
+	if lg != nil {
+		if lg.First < 1 || lg.First > current.Version || len(lg.SPKI) == 0 || lg.Anchors == nil {
+			return nil, fmt.Errorf("site: the list log's pins: first logged version %d with current version %d (or no key): a rollback to before logging began, or a wrong pin", lg.First, current.Version)
+		}
+	}
+	// logged checks version v's bundle against its bytes.
+	logged := func(v int64, data []byte) error {
+		if lg == nil || v < lg.First {
+			return nil
+		}
+		b, err := fetch(ctx, bundlePath(v))
+		if err != nil {
+			return err
+		}
+		if b == nil {
+			rep.Mismatches = append(rep.Mismatches, "services/"+strconv.FormatInt(v, 10)+": no bundle (not logged in Rekor)")
+			return nil
+		}
+		if _, err := lg.Anchors.Verify(b, data, lg.SPKI); err != nil {
+			return fmt.Errorf("site: %s: %w", bundlePath(v), err)
+		}
+		rep.Logged++
+		return nil
+	}
 	curSum := sha256.Sum256(cur)
 	rep.Digests = append(rep.Digests, curSum[:])
 	var prev *ServiceList
@@ -85,8 +148,12 @@ func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.Publi
 				rep.Mismatches = append(rep.Mismatches, "services/"+strconv.FormatInt(v, 10)+": not published")
 			}
 			if v == current.Version {
-				// The list itself still chains to the copy before it.
+				// The list itself still chains to the copy before it, and
+				// is logged before it is served.
 				if err := link("services.json", current, cur); err != nil {
+					return nil, err
+				}
+				if err := logged(v, cur); err != nil {
 					return nil, err
 				}
 				break
@@ -111,6 +178,33 @@ func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.Publi
 		if v == current.Version && (!bytes.Equal(data, cur) || !bytes.Equal(sig, curSig)) {
 			return nil, fmt.Errorf("site: %s isn't the current services.json", path)
 		}
+		if err := logged(v, data); err != nil {
+			return nil, err
+		}
+	}
+	if lg != nil && lg.First > 1 {
+		// Versions before the first logged one have no bundle (§3): one
+		// there means the pin is past the real first logged version, and
+		// the versions between would go unchecked.
+		pb := bundlePath(lg.First - 1)
+		b, err := fetch(ctx, pb)
+		if err != nil {
+			return nil, err
+		}
+		if b != nil {
+			rep.Mismatches = append(rep.Mismatches, "services/"+strconv.FormatInt(lg.First-1, 10)+": has a bundle, so the pinned first logged version is past the real one")
+		}
+	}
+	if lg != nil {
+		// A bundle past the current version: a list logged, not served.
+		nb := bundlePath(current.Version + 1)
+		b, err := fetch(ctx, nb)
+		if err != nil {
+			return nil, err
+		}
+		if b != nil && !recentPath(ctx, modified, nb, now) {
+			rep.Mismatches = append(rep.Mismatches, "services/"+strconv.FormatInt(current.Version+1, 10)+": a bundle past the current version (a list logged in Rekor but not served)")
+		}
 	}
 	next := "v1/services/" + strconv.FormatInt(current.Version+1, 10) + ".json"
 	if data, sig, err := fetchPair(ctx, fetch, next); err != nil {
@@ -123,12 +217,26 @@ func CheckServiceChain(ctx context.Context, fetch Fetcher, siteKey ed25519.Publi
 
 // recent reports whether services.json changed within ListingGrace.
 func recent(ctx context.Context, modified func(context.Context, string) (time.Time, error), now time.Time) bool {
+	return recentPath(ctx, modified, "v1/services.json", now)
+}
+
+// recentPath reports whether path changed within ListingGrace (never, if
+// modified is nil or fails, or names a time more than futureSkew ahead of
+// now: a Last-Modified in the future would hold the grace open).
+func recentPath(ctx context.Context, modified func(context.Context, string) (time.Time, error), path string, now time.Time) bool {
 	if modified == nil {
 		return false
 	}
-	t, err := modified(ctx, "v1/services.json")
-	return err == nil && !t.IsZero() && now.Sub(t) <= ListingGrace
+	t, err := modified(ctx, path)
+	if err != nil || t.IsZero() || t.After(now.Add(futureSkew)) {
+		return false
+	}
+	return now.Sub(t) <= ListingGrace
 }
+
+// futureSkew is how far ahead of the monitor's clock a Last-Modified may
+// be and still count.
+const futureSkew = time.Minute
 
 // fetchPair fetches a list and its signature (path + ".sig").
 func fetchPair(ctx context.Context, fetch Fetcher, path string) (data, sig []byte, err error) {

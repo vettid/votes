@@ -93,8 +93,33 @@ false. The `monitor` workflow runs `check -all` hourly on staging and
 production and fails on `1` or `3` (VOTES-SITE §7; it needs the
 repository variable `VOTES_PROD_SITE_KEY` before production is checked).
 A failed run is published to the alert topic, and a successful one puts
-a heartbeat whose alarm fires after 3 hours without one ("Deployment",
+a heartbeat whose alarm fires after 12 hours without one ("Deployment",
 step 6).
+
+**The service list's Rekor log:** with `-all`,
+`-list-anchor-pub <base64 SPKI> -first-logged <version>` (both, or
+neither) also check that every version from the first logged one on has
+a bundle that verifies under that key for its bytes, and that no bundle
+sits past the current version (VOTES-SITE §7). The report's
+`services.log` says `from version <n>` and `services.logged` how many
+bundles verified, or `not pinned`. The `monitor` workflow takes both from
+`list_anchor_pub` and `first_logged` in its own matrix, pinned by PR
+before each environment's first publish with `-kms`, with
+`first_logged: "1"` (a fresh list: staging started fresh under its KMS
+keys, docs/STAGING-FLAG-DAY.md). Until then it warns, or, with
+`log_required` (staging since its fresh start, production), fails once
+the site key is set. `-list-anchor-pub` must be a P-256 key's
+SubjectPublicKeyInfo and `-first-logged` a decimal version from 1; a pin
+past the real first logged version (the version before it has a bundle)
+is a mismatch, and a `-first-logged` past the current version is an
+error.
+
+**Production's site key** is a repository variable today
+(`VOTES_PROD_SITE_KEY`), and its check is skipped with a warning while
+it is unset; at production's launch, pin it in the workflow's matrix
+(`default_key`) and empty its `key_var`, by PR, as staging's is, along
+with its list anchor key. A row with an empty `key_var`, or with a log
+pin, fails the run without a site key.
 
 **The trusted root:** Sigstore's, for `-sigstore` (`production` by
 default), fetched through its TUF repository, or, if that fails, the one
@@ -112,19 +137,25 @@ The deploying machine needs Node 22 and Go: the function is built at
 synth by `scripts/build-api.sh`, the build CI hashes.
 
 Every deploy passes, from `cdk/` after `npm ci`:
-`-c envName=<staging|prod> -c hostName=<name> -c hostedZoneId=<id> -c zoneName=vettid.org -c sigstore=<staging|production>`,
+`-c envName=<staging|prod> -c hostName=<name> -c hostedZoneId=<id> -c zoneName=vettid.org -c sigstore=<staging|production> -c publisherPrincipalArn=<role ARN> -c alarmTopicArn=<SNS topic ARN> -c githubOidcProviderArn=<ARN> -c keyWatchEmail=<address>`,
 where `sigstore` matches the service vaults' `SV_SIGSTORE` for that
-environment. None has a default.
+environment; `publisherPrincipalArn` is the role, in this account, of
+the publisher's own IAM Identity Center permission set (below, "The
+publisher is a permission set of its own"): the only principal that may
+assume the publish role; `alarmTopicArn` and `githubOidcProviderArn` are step 6's;
+and `keyWatchEmail` is where the key watch sends each event directly
+(below; it is in the deployed template, never in this repository). None
+has a default.
 
 1. **Once per account:** `npx cdk bootstrap aws://<account>/us-east-1`.
 2. **First deploy:** `npx cdk deploy <context> -c firstDeploy=true`.
    It makes the bucket, the function, the API, the certificate, the
-   CloudFront distribution, the name's records and the site key's
-   secret (output `SiteKeySecret`). Uploads are refused until step 4.
+   CloudFront distribution, the name's records and the site key in KMS
+   (output `SiteSigningKeyArn`). Uploads are refused until step 4.
 3. **The site key:** build votesctl (`go build -o votesctl ./cmd/votesctl`
-   at the root), then `./votesctl site-key -secret <SiteKeySecret>`
-   prints its public key. It also goes in the member vaults' release
-   config (BALLOT-PROTOCOL §3.3).
+   at the root), then `./votesctl site-key -kms <SiteSigningKeyArn>`
+   (as the publish role, below) prints its public key. It also goes in the
+   member vaults' release config (BALLOT-PROTOCOL §3.3).
 4. **Deploy again** with `-c siteKey=<that key>`, and pass it on every
    deploy from then on (a deploy without it is refused).
 5. **The service list:** `services.json` holds
@@ -139,7 +170,107 @@ environment. None has a default.
    from the service vault's `GET /v1/anchor-key`. Each later list has the
    next `version` and, as `previous`, the base64 SHA-256 of the published
    `v1/services.json`. Publish it with
-   `./votesctl publish-services -secret <SiteKeySecret> -bucket <BucketName> -in services.json`.
+   `./votesctl publish-services -kms <SiteSigningKeyArn> -site-key <that key> -watch-topics <KeyWatchTopicArn>,<KeyWatchTopicBArn> -list-anchor-key <ListAnchorKeyArn> -list-anchor-pub <its pinned key> -sigstore <the stack's sigstore> -bucket <BucketName> -in services.json`,
+   as the publish role.
+   It takes the key's ARN only, never an alias, and uses the
+   ARN's region; it refuses a key that isn't an Ed25519 signing key
+   whose public key is `-site-key`. **Take `-site-key` from an
+   independent pin** (the stack's deployed `siteKey`, or `vote_site_key`
+   in the member vaults' release config), never from `site-key -kms`
+   itself, which would only compare the key with itself. It refuses to
+   publish unless `-watch-topics` names the stack's two key watch
+   topics (in that order, in the key's account and region) and each has
+   exactly one email subscription, confirmed by a signed-in call
+   (`ConfirmationWasAuthenticated`) and with no filter policy (README
+   "The watch"), since nobody would be told of the signature. Every check that can
+   refuse the list (its form, the first-list rule, that it extends the
+   published list by one version, and that no other bytes sit at its
+   version's copy) runs before it is signed, so no signature is made, or
+   emailed, for a list that is refused; a rerun of a list already signed
+   (published, interrupted half-way, or with its copy kept) uses the
+   bucket's signature and signs nothing (so republishing a version
+   rolled back, whose signature is kept, makes no KMS call and no email:
+   it was emailed when it was made). A signature can still go
+   unpublished, and so be emailed for nothing, only when something fails
+   after it is made: a transient S3 error, another publish winning the
+   conditional write, the 3-minute deadline passing, or KMS's answer
+   being lost. Each costs an email, never a wrong publish; run the same
+   command again. It signs through KMS once (no
+   retry: run it again if it fails), `ED25519_SHA_512` over the label
+   and the list's SHA-256, checks the signature under `-site-key` before
+   anything is written, and gives up after 3 minutes.
+
+   **Each list is logged in Rekor** (VOTES-SITE §3, GC #12646 task 3):
+   once signed, and before it is moved, its SHA-256 is signed with the
+   list anchor key (`-list-anchor-key`, by ARN only, in the site key's
+   account and region; an ECDSA P-256 key, since Rekor takes no pure
+   Ed25519), timestamped and entered in Rekor on the `-sigstore`
+   instance, in the Rekor profile of BALLOT-PROTOCOL §8.5. The bundle is
+   checked under that instance's trusted root and kept write-once as
+   `v1/services/<version>.bundle`, before the signature and the list, so
+   that no list is served without its entry.
+
+   **Every list anchor key signature is recorded** (GC #12986), as
+   soon as KMS returns it and before it is checked or entered in Rekor:
+   `v1/services/signs/<digest>/<r>.json` (lowercase hex) holds the key's
+   SubjectPublicKeyInfo, the digest and the signature, written
+   write-once like the bundles. A rerun's, a lost race's and an abandoned
+   publish's signatures are recorded too; they are the input of the
+   offline check for a reused nonce. The record is written in one
+   attempt. If it can't be written, nothing is logged and the publish
+   fails: run it again. If its name is already taken, an earlier
+   signature had the same r over the same digest: votesctl prints an
+   `ANOMALY` (KMS returned the same signature again, or a second one
+   with the same r). Nothing is logged; don't publish again, and tell
+   the owner. The records are public, like the bundles: each holds a
+   digest and a signature, never a list. So the digests of abandoned
+   publishes are public too.
+
+   Before anything is signed it checks:
+   - the key's public key is `-list-anchor-pub` (its SubjectPublicKeyInfo,
+     base64). **Take it from an independent pin**, the monitor's
+     `list_anchor_pub` in `.github/workflows/monitor.yml`. The first
+     time, print it with
+     `./votesctl list-anchor-key -kms <ListAnchorKeyArn>` (as the publish
+     role) and pin it there by PR, with `first_logged: "1"` and the new
+     site key as `default_key`, with the owner's go, before the first
+     publish;
+   - `-sigstore` is the stack's: the key's tag `vettid:sigstore`, which
+     the stack sets to its `sigstore` (a change of the tag is watched).
+     **On this refusal, don't change `-sigstore` to match the tag**: an
+     administrator could have retagged the key. Check the stack's
+     `sigstore` (the deploy context) and the key watch's mail for a
+     `TagResource` first;
+   - the published list's own bundle verifies on that instance under that
+     key. A published list without one is refused ("version N is current
+     without its bundle"): run the command with that version's list first, which
+     logs it with no new site signature;
+   - a bundle already kept for this version anchors this list. One that
+     anchors anything else is refused (clear it as a stray, below); one
+     that does is used, so a rerun logs nothing again.
+
+   A Rekor entry is public and permanent: a list is logged only after it
+   has passed every check and the site key has signed it. **After a
+   failed publish, run the same command with the same file.** If
+   logging failed, nothing was written, and the site key signs again (so
+   that publish is emailed twice); and if Rekor had already accepted the
+   entry (the failure came after it: a lost answer, the bundle's check,
+   or its write), the list anchor key signs again too, and Rekor holds a
+   second entry for the same list (a search of entries is to match them by
+   the list's SHA-256, so that is no mismatch). So every version has a
+   bundle.
+
+   To act as the publish role, add a profile and set
+   `AWS_PROFILE` to it:
+
+   ```ini
+   [profile votes-publish-<env>]
+   role_arn = <PublishRoleArn>
+   source_profile = <your Identity Center profile>
+   ```
+
+   Each publish is emailed (twice) and raises the key-use alarm: that is
+   the watch working.
    Each version is also kept, write-once, as `v1/services/<version>.json`
    and `.sig`, for vaults that missed versions; running the command again
    with the list that is already published writes its copy if it is
@@ -149,9 +280,9 @@ environment. None has a default.
    4,194,304 bytes in all; the number of services and keys is not
    limited, since the list only grows); one interrupted half-way is
    finished by running the same command again.
-6. **The monitor's alerts** (VOTES-SITE §7): deploy with
-   `-c alarmTopicArn=<SNS topic ARN in us-east-1> -c githubOidcProviderArn=<ARN>`,
-   both or neither, on every deploy from then on. The provider is the
+6. **The monitor's alerts** (VOTES-SITE §7): every deploy passes
+   `-c alarmTopicArn=<SNS topic ARN in us-east-1> -c githubOidcProviderArn=<ARN>`
+   (required since the site's signing keys, whose alarms go there too). The provider is the
    account's existing one for `token.actions.githubusercontent.com`
    (`aws iam list-open-id-connect-providers`); the stack doesn't make
    one. If the account has none, create it once, outside the stack
@@ -160,8 +291,264 @@ environment. None has a default.
    `MonitorRoleArn`) and the heartbeat alarm. Then set the repository
    variables (Settings, Variables: not secrets)
    `VOTES_<STAGING|PROD>_MONITOR_ROLE_ARN` to that output and
-   `VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN` to the topic. The alarm fires 3
-   hours after the deploy until the first run that puts a heartbeat.
+   `VOTES_<STAGING|PROD>_ALERT_TOPIC_ARN` to the topic. The alarm can go
+   to ALARM within minutes of its creation (missing data counts as
+   breaching), and stays there until the first run that puts a heartbeat.
+   The deploy also makes the key watch's heartbeat (below, "The
+   heartbeat"): the function and role `vettid-votes-<env>-key-watch-heartbeat`,
+   the rules `vettid-votes-<env>-kw-heartbeat-tick` and
+   `vettid-votes-<env>-kw-heartbeat`, the log groups
+   `/aws/lambda/vettid-votes-<env>-key-watch-heartbeat` and
+   `/vettid/votes/<env>/key-watch-heartbeat`, and the alarm
+   `vettid-votes-<env>-key-watch-heartbeat`; it needs no repository
+   variable. Check that within an hour of the deploy a line appears in
+   `/vettid/votes/<env>/key-watch-heartbeat`, a `DescribeKey` whose
+   `userIdentity` is a session of the function's role:
+   `userIdentity.sessionContext.sessionIssuer.arn` is
+   `arn:aws:iam::<account>:role/vettid-votes-<env>-key-watch-heartbeat`.
+   A newly created alarm whose missing data breaches can go to ALARM
+   within minutes of its creation, before the first line: expect one
+   heartbeat alarm, and its OK, right after the first deploy.
+
+### The site's signing keys
+
+The stack also makes two KMS keys, made inside KMS so that they can
+never be exported (VOTE-SITE-KEY-COMPROMISE §6, GC #12646), and the role
+`vettid-votes-<env>-publish` (output `PublishRoleArn`), which only
+`publisherPrincipalArn` may assume, for an hour at a time:
+
+- the **site key** `alias/vettid-votes-<env>-site` (Ed25519, output
+  `SiteSigningKeyArn`), which is to sign the service list, and
+- the **list anchor key** `alias/vettid-votes-<env>-list-anchor` (ECDSA
+  P-256, output `ListAnchorKeyArn`), which logs each list in Rekor
+  (`publish-services -list-anchor-key`).
+
+Their key policies let the publish role alone sign, each key with its
+own algorithm only (`ED25519_SHA_512`, `ECDSA_SHA_256`; `kms:Sign` is
+denied to every other principal), allow no grants, and let only the
+account's root user schedule their deletion. The account keeps
+administering them: **any administrator of the account** (any principal
+whose IAM policies allow it) may change a key policy, so that the keys
+can't be locked out; no one gets `Sign` that way, and such a change is
+watched (below). The publish role may read each key's public key, its
+description and its tags (the list anchor key's tag `vettid:sigstore` is
+the stack's `sigstore`, which `publish-services` checks), read and write
+`v1/services.json`, `v1/services.json.sig` and `v1/services/*`, and list
+the bucket (so that a missing copy is a 404; every document is public),
+and nothing else.
+
+**The watch.** Six EventBridge rules, three pairs
+(`vettid-votes-<env>-kw-keys`, `-kw-watch` and `-kw-notify`, each with
+its `-b`; split so that each pattern stays under EventBridge's
+2,048-character quota), with the same targets, every one watching all
+six (so switching one off is seen), send every event they match to the
+log group `/vettid/votes/<env>/key-use`, kept for good, and **directly
+to two topics, `vettid-votes-<env>-key-watch` and
+`vettid-votes-<env>-key-watch-b`**, each emailing `keyWatchEmail` on its
+own subscription, so that no alarm sits between an event and a person
+and a subscription removed from one is told on the other. Both are
+email, so both reach the same inbox: a second kind of notifier is the
+cross-account forward (below). Only the six rules may publish to them
+(and CloudWatch alarms of the account). The rules, the topics and the
+subscriptions are kept if removed from the stack (the topic, log and
+queue policies, the alarms and the queue are not), and the stack has
+termination protection. They match:
+
+- every signature with either key, and every grant, key policy change,
+  alias change, tag change, deletion or disabling of either key or its
+  alias;
+- every change to the publish role or the heartbeat's role (below; their
+  trust or permission policies, a boundary, their deletion);
+- every change to the heartbeat's function (below): its code, its
+  configuration, who may invoke it, its concurrency (a concurrency of 0
+  would silence it) and its deletion, by its name or ARN (CloudTrail
+  names these events with an API version, `UpdateFunctionCode20150331v2`,
+  so they are matched by prefix; unqualified, `:$LATEST` or with an alias
+  name). Not watched, each failing closed (no heartbeat line, so its
+  alarm fires): the function's event-invoke configuration (its retries
+  and failure destinations), a specific version or alias (the tick
+  invokes neither), and the function's own log group;
+- every change to the watch: its rules (the six and the heartbeat's two,
+  matched by their names' prefix `vettid-votes-<env>-kw-`) and targets,
+  its alarms (enabling or disabling their actions too), any alarm mute
+  rule, its log group,
+  streams, metric filter and key, any log group resource policy, its dead
+  letters, the alarm topic and the two watch topics and their
+  subscriptions (a data protection policy too);
+- every update, change set, stack policy, termination protection
+  change, rollback or deletion of this stack, since one update can
+  change all of the watch (so a deploy is emailed too), any stack
+  refactor, and any change set run by its ARN alone (no stack name);
+- every change to any event bus (`UpdateEventBus`: a key put on the
+  default bus, then disabled, could stop the rules);
+- every change to any CloudTrail trail (stopping or starting it,
+  deleting it, or changing what it records): the watch gets every event
+  from CloudTrail.
+
+Each event has the operation, what it acted on (the key, role, rule,
+alarm, topic, subscription, log group, stack, queue or function), the caller's identity
+type, role and temporary key id (traceable to its `AssumeRole` in
+CloudTrail) and the CloudTrail event id: never the session name, which
+is an email address. Any logged line also raises the alarm
+`vettid-votes-<env>-key-use` (counted by samples, so a value anyone puts
+in its namespace can only raise it), and a delivery that fails after
+EventBridge's retries goes to the queue `vettid-votes-<env>-key-use-dlq`
+and raises `vettid-votes-<env>-key-use-feed`; both alarms notify the
+alarm topic and both watch topics, so silencing one path is told on
+another.
+
+**The heartbeat.** A feed that stops silently (a trail stopped, the bus
+or its rule changed, the log policy gone) would look like no use until a
+publish. So a rule on the default bus, `vettid-votes-<env>-kw-heartbeat-tick`
+(`rate(1 hour)`), runs a small Lambda function,
+`vettid-votes-<env>-key-watch-heartbeat` (Node.js, inline code, nothing
+bundled), which calls KMS `DescribeKey` on the site key's ARN every
+hour, from AWS, as a role of its own, `vettid-votes-<env>-key-watch-heartbeat`,
+which only Lambda may assume and which may make that read-only call on
+the site key and write the function's own log group
+(`/aws/lambda/vettid-votes-<env>-key-watch-heartbeat`, kept a month),
+and nothing else. Only the tick rule may invoke the function. **A
+failure of the function (a `DescribeKey` error, a timeout) leaves no
+heartbeat line, so the alarm fires: it fails closed.** (EventBridge
+Scheduler can't do this: its universal targets don't make describe
+calls.) GitHub's schedule doesn't matter for it (GitHub runs the hourly
+monitor every 4 to 11 hours); the monitor workflow is unchanged. A
+seventh watching rule, `vettid-votes-<env>-kw-heartbeat`, in the same state as
+the six, matches only that call by that role on that key and sends the
+whole event to the log group `/vettid/votes/<env>/key-watch-heartbeat`
+(kept a month; failures go to the same dead letters), not to the
+key-use log group or the watch topics: it is no use of the key. Three
+hours without a line there raise `vettid-votes-<env>-key-watch-heartbeat`,
+which notifies the alarm topic and both watch topics; its recovery
+(OK) is mailed to the alarm topic. The six rules watch each other, this
+one and the tick; the function, its role, the alarm, the heartbeat log
+group and any metric filter into the watch's metric namespace
+(`VettID/VotesKeys/<env>`) are watched like the watch's own (a change to
+any is emailed, above). **What
+it proves, and what not:** it proves the path of a read-only management
+event through the trail, the default bus and a rule in that state, to a
+log group. Write events go through the same trail's selector, and a
+change to any trail is watched. **It proves honest failures, not an
+administrator faking it:** `PutMetricData` into the watch's namespace,
+or `PutLogEvents` into the heartbeat group, are data-plane calls no
+trail shows, and either could keep the alarm quiet while the feed is
+cut. The cross-account forward (below) is what covers an
+administrator. **3 missed hours raise it whatever the cause**, the
+tick's or the function's too. When it fires, check, in order:
+
+- the tick rule `vettid-votes-<env>-kw-heartbeat-tick`: is it there and
+  `ENABLED`, with its schedule and its one target the stack's
+  (`aws events describe-rule`, `list-targets-by-rule`)? Its failed
+  invocations show in CloudWatch (`AWS/Events`, `FailedInvocations`);
+- the function `vettid-votes-<env>-key-watch-heartbeat`: its `Errors`
+  and `Throttles` (CloudWatch, `AWS/Lambda`) and its log group; its
+  concurrency (`aws lambda get-function-concurrency`: none reserved, and
+  never 0); its code and configuration the stack's
+  (`aws lambda get-function`), and the permission for the tick rule
+  (`aws lambda get-policy`); does its role still exist with its two
+  permissions (`aws iam get-role-policy`)?
+- the trail: is it logging (`aws cloudtrail get-trail-status`), with
+  management events (read and write), and homed in `us-east-1` or an
+  organization trail (below)?
+- the default event bus: its state, and its key (`aws events describe-event-bus`);
+- the rule `vettid-votes-<env>-kw-heartbeat`: its state is
+  `ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS`, its pattern and its
+  target are the stack's (`aws events describe-rule`, `list-targets-by-rule`);
+- the log resource policy `vettid-votes-<env>-key-use`
+  (`aws logs describe-resource-policies`) still lets the rule write the
+  log group, and the log group `/vettid/votes/<env>/key-watch-heartbeat`
+  exists;
+- the dead letters (`vettid-votes-<env>-key-use-dlq`; the feed alarm
+  fires with them).
+
+A broken feed means a signature would go unseen: stop publishing until
+it is found and fixed.
+
+- **Confirm both watch subscriptions** after the first deploy, from the
+  token in each email AWS sends, so that unsubscribing needs a signed-in
+  call (which is watched), not a link in the email:
+  `aws sns confirm-subscription --topic-arn <KeyWatchTopicArn or KeyWatchTopicBArn> --token <token> --authenticate-on-unsubscribe true`.
+  Until then the watch emails no one. Then check that each says
+  `ConfirmationWasAuthenticated` `true`
+  (`aws sns get-subscription-attributes --subscription-arn <arn>`): a
+  confirmation or an unsubscribe by the email's link is not in
+  CloudTrail, so the watch can't see it. Keep `keyWatchEmail` in
+  `~/.cdk.json`, not the tracked `cdk.json`, and out of shell history.
+- **The deploy that brings the `vettid:sigstore` tag** (GC #12646 task
+  3) tags the list anchor key: if the key already exists, expect a
+  `TagResource` mail on both watch topics for it. That is the deploy, not
+  an incident; any other `TagResource` or `UntagResource` on either key
+  is one.
+- **A publish with `-kms` is two signatures (the site key's and the list
+  anchor key's), each logged twice and emailed four times** (a pair of
+  rules, two topics: four lines and eight emails), and raises the key-use
+  alarm; a rerun that finds the list already signed and logged makes
+  none; **a deploy of this stack does
+  too** (it updates the watch). **A publish that does not means the feed
+  is broken: stop publishing and find out why.**
+- The feed needs CloudTrail's management events (read and write) for
+  `us-east-1` in the account, from a trail that is logging and is
+  **homed in `us-east-1`, or an organization trail**: a trail homed in
+  another region can be stopped by a call there, which this watch (in
+  `us-east-1`) doesn't see. An organization trail can be stopped from
+  the management account, also outside this watch.
+- EventBridge retries a failed delivery for up to 24 hours before it
+  goes to the dead letters, so the feed alarm can come that late. While
+  any dead letter remains, the feed alarm stays in ALARM: read them, then
+  purge the queue (a watched call).
+- **A known limit (staging):** the watch is in the same account as the
+  keys, so an administrator of the account who cuts every path in one
+  CloudFormation update, or in calls quicker than the watch reports (a
+  filter policy on a subscription, then disabling the alarms' actions),
+  can sign unseen until the change is noticed. Each list is logged in
+  Rekor (task 3 of GC #12646), and the monitor checks hourly, from
+  outside AWS, that the current list and every kept version from the
+  first logged one on have their entries at the time of the check
+  (VOTES-SITE §7). It doesn't catch a list served between two runs and
+  then removed with no kept copy, nor a bundle made after the fact by
+  someone who can sign with the list anchor key (its Rekor time isn't
+  compared with when the list was served). A list signed and logged but served somewhere other than
+  this site needs a search of Rekor under the list anchor key, which is
+  its own task, designed first (GC #12980). **Production waits for
+  the cross-account forward** (the owner's choice c, GC #12690): every
+  watched event also sent to the management account, where the staging
+  or production account's administrators can't silence it, before a
+  production key signs anything. The heartbeat (above) proves hourly that
+  the feed is alive; a feed cut for less than three hours and then
+  restored doesn't raise it.
+- **The publisher is a permission set of its own** (GC #12713). Before
+  the first deploy, the owner creates in IAM Identity Center a permission
+  set (for example `VettIDVotesPublisher`) whose only permission is an
+  inline policy allowing `sts:AssumeRole` on
+  `arn:aws:iam::<account>:role/vettid-votes-<env>-publish`, and assigns it
+  in this account to their own user alone: **its assignment list is the
+  access list** (every user or group assigned it shares its role).
+  `publisherPrincipalArn` is that set's role in this account
+  (`aws iam list-roles --path-prefix /aws-reserved/sso.amazonaws.com/`,
+  the role named `AWSReservedSSO_VettIDVotesPublisher_<hash>`); the stack
+  refuses any other kind of role. No name or address of the owner goes
+  in the template. If the set is reprovisioned, the trust no longer
+  matches (the publish role can't be assumed, which fails closed): deploy
+  again with the new role's ARN. MFA is enforced by Identity Center at
+  sign-in; the trust policy can't test it for those sessions.
+- **A first deploy that rolls back** leaves the two keys (they are
+  retained) with their aliases gone: schedule their deletion as the root
+  user, or leave them, disabled, before deploying again.
+- **After the first deploy of an environment, check** (with the owner):
+  a trail as above is logging (its home region, or that it is an
+  organization trail); both subscriptions' `ConfirmationWasAuthenticated`
+  is `true`; a test `UpdateEventBus` on the default bus (its description,
+  say) is emailed; so is a call that only a nested match catches (a
+  `SetSubscriptionAttributes` on a watch subscription, putting back the
+  value it had, or a `PutRule` that rewrites a `-b` rule's description
+  as it was), which shows EventBridge took the nested patterns; a test signature with the publish role
+  is logged twice, emailed four times and raises the alarm, and names the
+  role and no session; whether a refused `Sign` by another principal is
+  logged (note it if not); that the log resource policy's `aws:SourceArn`
+  condition lets the rules write (the lines arrive at all); that breaking
+  the feed (for example, removing the log resource policy for a moment)
+  is emailed and raises the feed alarm; and that `GetObject` of a missing
+  `v1/services/<n>.json` under the publish role is a 404.
 
 ### Clearing a stray version copy
 
@@ -179,7 +566,7 @@ with the owner's go for each step:
    `If-None-Match`.
 2. Delete only the stray keys, e.g.
    `aws s3api delete-object --bucket <BucketName> --key v1/services/<n>.json`
-   (and `.sig`). This leaves a delete marker; the stray stays in the
+   (and `.sig`; or `v1/services/<n>.bundle`, for a stray bundle). This leaves a delete marker; the stray stays in the
    bucket's version history. A wrong key hides a good copy, which
    `publish-services` doesn't rewrite unless it is the current version's:
    restore one with `get-object --version-id <its version>` and
